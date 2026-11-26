@@ -79,7 +79,7 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(config.runners.first?.provisioner.github?.organization, "acme")
         XCTAssertEqual(config.runners.first?.provisioner.github?.repository, "repo")
         XCTAssertEqual(config.runners.first?.provisioner.github?.extraLabels ?? [], ["fast", "arm64"])
-        XCTAssertTrue(config.runners.first?.provisioner.github?.privateKeyPath.hasPrefix(home) ?? false)
+        XCTAssertTrue(config.runners.first?.provisioner.github?.privateKeyPath?.hasPrefix(home) ?? false)
         XCTAssertTrue(config.runners.first?.preRun?.contains("pre-run") ?? false)
         XCTAssertTrue(config.runners.first?.postRun?.contains("post-run") ?? false)
         XCTAssertEqual(config.runners.first?.healthCheck?.command, "pgrep -f run.sh")
@@ -207,4 +207,26 @@ final class ConfigTests: XCTestCase {
             XCTAssertNoThrow(try Config.load(path: fixtures.appendingPathComponent(file).path), file)
         }
     }
+    func testKeychainGitHubProvisionerDecodesWithoutPEM() throws {
+        let yaml = """
+        runners:
+          - name: mac-runner
+            vm:
+              source:
+                type: local
+                name: golden
+            provisioner:
+              type: github
+              config:
+                appId: 123
+                organization: example
+                privateKeyKeychainLabel: sand-github-app
+                runnerName: mac-runner
+        """
+        let config = try Config.load(path: writeTempFile(contents: yaml).path)
+        let github = try XCTUnwrap(config.runners.first?.provisioner.github)
+        XCTAssertNil(github.privateKeyPath)
+        XCTAssertEqual(github.privateKeyKeychainLabel, "sand-github-app")
+    }
+
 }

@@ -161,11 +161,22 @@ final class ConfigValidator {
             if github.runnerName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 issues.append(.init(severity: .error, message: "provisioner.config.runnerName must not be empty."))
             }
-            let keyPath = github.privateKeyPath.trimmingCharacters(in: .whitespacesAndNewlines)
-            if keyPath.isEmpty {
-                issues.append(.init(severity: .error, message: "provisioner.config.privateKeyPath must not be empty."))
-            } else if !FileManager.default.fileExists(atPath: keyPath) {
-                issues.append(.init(severity: .error, message: "Private key not found at \(keyPath)."))
+            switch (github.privateKeyPath, github.privateKeyKeychainLabel) {
+            case (let path?, nil):
+                if path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    issues.append(.init(severity: .error, message: "provisioner.config.privateKeyPath must not be empty."))
+                } else if !FileManager.default.fileExists(atPath: path) {
+                    issues.append(.init(severity: .error, message: "Private key not found at \(path)."))
+                }
+            case (nil, let label?):
+                if label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    issues.append(.init(severity: .error, message: "provisioner.config.privateKeyKeychainLabel must not be empty."))
+                }
+            default:
+                issues.append(.init(
+                    severity: .error,
+                    message: "provisioner.config requires exactly one of privateKeyPath or privateKeyKeychainLabel."
+                ))
             }
             if let repository = github.repository, repository.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 issues.append(.init(severity: .warning, message: "provisioner.config.repository is set but empty."))

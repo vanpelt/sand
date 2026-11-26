@@ -62,6 +62,7 @@ runners:
         organization: my-org
         repository: null
         privateKeyPath: ~/my-app.private-key.pem
+        privateKeyKeychainLabel: null
         runnerName: runner-2
         extraLabels: null
         runnerGroup: null

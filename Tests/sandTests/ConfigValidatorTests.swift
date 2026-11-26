@@ -206,4 +206,42 @@ final class ConfigValidatorTests: XCTestCase {
             message: "runner runner-1: provisioner.config.runnerGroup requires organization-level registration; remove provisioner.config.repository."
         )))
     }
+    func testGitHubKeySourceValidation() throws {
+        let keyURL = try writeTempFile(contents: "key", suffix: ".pem")
+        func issues(path: String?, label: String?) -> [ConfigValidationIssue] {
+            let github = GitHubProvisionerConfig(
+                appId: 1,
+                organization: "acme",
+                repository: nil,
+                privateKeyPath: path,
+                privateKeyKeychainLabel: label,
+                runnerName: "mac",
+                extraLabels: nil
+            )
+            let runner = Config.RunnerConfig(
+                name: "mac",
+                vm: Config.VM(
+                    source: Config.VMSource(type: .oci, image: "ghcr.io/acme/vm:latest", name: nil),
+                    hardware: nil, mounts: [], cache: nil, run: .default,
+                    diskSizeGb: nil, ssh: .standard
+                ),
+                provisioner: Config.Provisioner(type: .github, script: nil, github: github),
+                preRun: nil, postRun: nil, stopAfter: nil, healthCheck: nil
+            )
+            return ConfigValidator().validate(Config(runners: [runner]))
+        }
+
+        XCTAssertTrue(issues(path: nil, label: "sand-github-app").isEmpty)
+        XCTAssertTrue(issues(path: keyURL.path, label: nil).isEmpty)
+        XCTAssertTrue(issues(path: nil, label: nil).contains(where: {
+            $0.message.contains("requires exactly one")
+        }))
+        XCTAssertTrue(issues(path: keyURL.path, label: "sand-github-app").contains(where: {
+            $0.message.contains("requires exactly one")
+        }))
+        XCTAssertTrue(issues(path: nil, label: " ").contains(where: {
+            $0.message.contains("privateKeyKeychainLabel must not be empty")
+        }))
+    }
+
 }

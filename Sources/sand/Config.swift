@@ -409,7 +409,8 @@ extension Config.Provisioner {
                 appId: github.appId,
                 organization: github.organization,
                 repository: github.repository,
-                privateKeyPath: Config.expandPath(github.privateKeyPath),
+                privateKeyPath: github.privateKeyPath.map { Config.expandPath($0) },
+                privateKeyKeychainLabel: github.privateKeyKeychainLabel,
                 runnerName: github.runnerName,
                 extraLabels: github.extraLabels,
                 runnerGroup: github.runnerGroup

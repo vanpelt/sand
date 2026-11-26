@@ -2,7 +2,8 @@ struct GitHubProvisionerConfig: Decodable, Sendable {
     let appId: Int
     let organization: String
     let repository: String?
-    let privateKeyPath: String
+    let privateKeyPath: String?
+    let privateKeyKeychainLabel: String?
     let runnerName: String
     let extraLabels: [String]?
     let runnerGroup: String?
@@ -11,7 +12,8 @@ struct GitHubProvisionerConfig: Decodable, Sendable {
         appId: Int,
         organization: String,
         repository: String?,
-        privateKeyPath: String,
+        privateKeyPath: String? = nil,
+        privateKeyKeychainLabel: String? = nil,
         runnerName: String,
         extraLabels: [String]?,
         runnerGroup: String? = nil
@@ -20,6 +22,7 @@ struct GitHubProvisionerConfig: Decodable, Sendable {
         self.organization = organization
         self.repository = repository
         self.privateKeyPath = privateKeyPath
+        self.privateKeyKeychainLabel = privateKeyKeychainLabel
         self.runnerName = runnerName
         self.extraLabels = extraLabels
         self.runnerGroup = runnerGroup
