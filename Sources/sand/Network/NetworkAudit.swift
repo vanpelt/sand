@@ -7,14 +7,27 @@ struct NetworkAuditEvent: Sendable, Equatable {
 
     /// `network.connect decision=deny host=example.com port=443 reason=not-allowlisted`
     var line: String {
-        ([name] + fields.keys.sorted().map { "\($0)=\(Self.sanitize(fields[$0] ?? ""))" }).joined(separator: " ")
+        ([name] + fields.keys.sorted().map { "\($0)=\(Self.render(fields[$0] ?? ""))" }).joined(separator: " ")
     }
 
+    /// Plain ASCII without newlines or control characters, at most 300 characters.
     static func sanitize(_ value: String) -> String {
         let cleaned = value.map { character -> Character in
-            character.isWhitespace || character == "=" || !character.isASCII ? "_" : character
+            character == " " ? " " : (character.isWhitespace || !character.isASCII || character.asciiValue.map { $0 < 0x20 || $0 == 0x7f } == true ? "_" : character)
         }
         return String(cleaned.prefix(300))
+    }
+
+    /// A value as it appears in the text line: bare when it is a simple token,
+    /// otherwise double-quoted with `"` and `\` escaped, so values such as
+    /// `--net-softnet-block=0.0.0.0/0 --net-host` survive intact and one field can
+    /// never forge another.
+    static func render(_ value: String) -> String {
+        let clean = sanitize(value)
+        guard clean.isEmpty || clean.contains(where: { $0 == " " || $0 == "=" || $0 == "\"" || $0 == "\\" }) else {
+            return clean
+        }
+        return "\"" + clean.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
     }
 }
 
