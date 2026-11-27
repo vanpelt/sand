@@ -39,6 +39,12 @@ final class KeychainSigningTests: XCTestCase {
         XCTAssertEqual(parts.count, 3)
         guard parts.count == 3 else { return }
 
+        // Verify that GitHub receives a standards-compliant RS256 JWT header.
+        let headerData = try base64URLDecode(String(parts[0]))
+        let header = try XCTUnwrap(JSONSerialization.jsonObject(with: headerData) as? [String: String])
+        XCTAssertEqual(header["alg"], "RS256")
+        XCTAssertEqual(header["typ"], "JWT")
+
         let claims = try decodeJWTClaims(jwt)
         XCTAssertEqual(claims["iss"] as? String, "123")
         XCTAssertEqual((claims["iat"] as? NSNumber)?.intValue, 990)
