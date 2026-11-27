@@ -137,7 +137,24 @@ struct Tart: Sendable {
             arguments.append(mount.runArgument)
         }
         logger.debug("tart \(arguments.joined(separator: " "))")
-        return try processRunner.start(executable: "tart", arguments: arguments)
+        return try processRunner.start(executable: "tart", arguments: arguments, environment: Self.scrubbedEnvironment())
+    }
+
+    /// Variables Tart forwards to Sentry crash reporting; never hand them VM context.
+    static let scrubbedVariables = ["SENTRY_DSN", "CIRRUS_SENTRY_TAGS"]
+
+    static func scrubbedEnvironment(_ base: [String: String] = ProcessInfo.processInfo.environment) -> [String: String] {
+        base.filter { !scrubbedVariables.contains($0.key) }
+    }
+
+    /// `tart run --help` mentions the stateful softnet allow flag.
+    func supportsSoftnetAllow() async -> Bool {
+        let help = (try? await run(arguments: ["run", "--help"], wait: true))?.stdout ?? ""
+        return help.contains("--net-softnet-allow")
+    }
+
+    func version() async -> String {
+        ((try? await run(arguments: ["--version"], wait: true))?.stdout ?? "unknown").trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     func ip(name: String, wait: Int) async throws -> String {
@@ -218,6 +235,6 @@ struct Tart: Sendable {
 
     private func run(arguments: [String], wait: Bool) async throws -> ProcessResult? {
         logger.debug("tart \(arguments.joined(separator: " "))")
-        return try await processRunner.run(executable: "tart", arguments: arguments, wait: wait)
+        return try await processRunner.run(executable: "tart", arguments: arguments, wait: wait, environment: Self.scrubbedEnvironment())
     }
 }

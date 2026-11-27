@@ -44,6 +44,24 @@ struct SSHClient {
         )
     }
 
+    /// `ssh -N -R 127.0.0.1:<remotePort>:127.0.0.1:<localPort>`: the guest's
+    /// loopback port forwards to the host-side egress proxy over this session.
+    /// Options here come before the shared ones because ssh keeps the first value.
+    func startReverseTunnel(remotePort: Int, localPort: UInt16) throws -> ProcessHandle {
+        try processRunner.start(executable: "sshpass", arguments: reverseTunnelArguments(remotePort: remotePort, localPort: localPort))
+    }
+
+    func reverseTunnelArguments(remotePort: Int, localPort: UInt16) -> [String] {
+        ["-p", config.password, "ssh", "-N",
+         "-o", "ExitOnForwardFailure=yes",
+         "-o", "ServerAliveInterval=15",
+         "-o", "ServerAliveCountMax=2",
+         "-R", "127.0.0.1:\(remotePort):127.0.0.1:\(localPort)"] + Self.connectionOptions + [
+            "-p", String(config.port),
+            "\(config.user)@\(host)"
+        ]
+    }
+
     func checkConnection() async throws {
         _ = try await exec(command: "true")
     }
