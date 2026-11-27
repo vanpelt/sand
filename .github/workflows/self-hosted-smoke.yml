@@ -1,0 +1,28 @@
+name: Self-hosted macOS smoke test
+
+# Deliberately scoped to the Sand feature branch: do not run untrusted PR
+# submissions on a self-hosted runner.
+on:
+  push:
+    branches:
+      - feature/keychain-github-app-signing
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Sand ephemeral macOS runner
+    runs-on: [self-hosted, macOS, ARM64, sand]
+    timeout-minutes: 20
+    steps:
+      - name: Show runner environment
+        run: |
+          echo "Runner: $RUNNER_NAME"
+          sw_vers
+          uname -m
+          swift --version
+      - name: Check out this PR branch
+        uses: actions/checkout@v7
+      - name: Run Swift tests
+        run: swift test
