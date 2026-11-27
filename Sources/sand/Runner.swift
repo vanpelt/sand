@@ -171,7 +171,7 @@ struct Runner: Sendable {
         logger.info("VM IP \(ip)")
         await logVMStatusAfterBoot(name: name)
         let ssh = SSHClient(processRunner: tart.processRunner, host: ip, config: vm.ssh)
-        guard await waitForSSH(ssh: ssh) else {
+        guard await waitForSSH(ssh: ssh, tartRun: tartRun) else {
             logger.debug("waitForSSH failed; scheduling restart")
             await scheduleRestart(reason: .sshNotReady)
             await shutdownCoordinator.cleanup(reason: "ssh not ready")
@@ -382,7 +382,7 @@ struct Runner: Sendable {
         return platform
     }
 
-    private func waitForSSH(ssh: SSHClient) async -> Bool {
+    private func waitForSSH(ssh: SSHClient, tartRun: ProcessHandle) async -> Bool {
         var attempt = 0
         var stoppedChecks = 0
         let maxRetries = ssh.config.connectMaxRetries
@@ -399,6 +399,10 @@ struct Runner: Sendable {
                 return false
             }
             attempt += 1
+            if await tartRun.hasExited() {
+                logger.error("Tart process exited before VM \(vmName) became SSH-ready; aborting startup")
+                return false
+            }
             do {
                 let status = try await tart.status(name: vmName)
                 lastStatus = status
@@ -475,7 +479,7 @@ struct Runner: Sendable {
             logIfNonEmpty(label: "tart run stderr", text: result.stderr)
             logger.info("tart run for \(name) exited with code 0")
         } catch {
-            logger.warning("tart run for \(name) exited: \(String(describing: error))")
+            logger.error("tart run for \(name) exited: \(String(describing: error))")
         }
     }
 

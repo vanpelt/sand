@@ -123,6 +123,11 @@ actor ProcessHandle {
         })
     }
 
+    func hasExited() -> Bool {
+        if let process { return !process.isRunning }
+        return cachedResult != nil
+    }
+
     func terminate() {
         if let terminateBlock {
             terminateBlock()

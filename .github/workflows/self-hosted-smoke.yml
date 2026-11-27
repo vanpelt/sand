@@ -1,0 +1,41 @@
+name: Self-hosted macOS smoke test
+
+# Deliberately scoped to the Sand feature branch: do not run untrusted PR
+# submissions on a self-hosted runner.
+on:
+  push:
+    branches:
+      - feature/keychain-github-app-signing
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Sand ephemeral macOS runner
+    runs-on: [self-hosted, macOS, ARM64, sand]
+    timeout-minutes: 20
+    steps:
+      - name: Show runner environment
+        run: |
+          echo "Runner: $RUNNER_NAME"
+          sw_vers
+          uname -m
+          swift --version
+      - name: Check out this PR branch
+        uses: actions/checkout@v7
+      - name: Create unlocked Keychain and run Swift tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Headless Tart guests may have a locked/missing login Keychain.
+          # Use a fresh Keychain so the persistent RSA signing test can run
+          # without prompting for interactive authorization.
+          KEYCHAIN="$RUNNER_TEMP/sand-smoke.keychain-db"
+          PASSWORD="$(openssl rand -hex 32)"
+          security create-keychain -p "$PASSWORD" "$KEYCHAIN"
+          security unlock-keychain -p "$PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN"
+          security default-keychain -d user -s "$KEYCHAIN"
+          swift test

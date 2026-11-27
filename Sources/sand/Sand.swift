@@ -130,7 +130,11 @@ struct Run: AsyncParsableCommand {
         guard let provisioner, provisioner.type == .github, let githubConfig = provisioner.github else {
             return nil
         }
-        let auth = try GitHubAuth(appId: githubConfig.appId, privateKeyPath: githubConfig.privateKeyPath)
+        let auth = try GitHubAuth(
+            appId: githubConfig.appId,
+            privateKeyPath: githubConfig.privateKeyPath,
+            privateKeyKeychainLabel: githubConfig.privateKeyKeychainLabel
+        )
         return GitHubService(
             auth: auth,
             session: URLSession.shared,

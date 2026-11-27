@@ -1,4 +1,6 @@
 import ArgumentParser
+import Darwin
+import Foundation
 import os
 
 enum LogLevel: String, ExpressibleByArgument, CaseIterable, Comparable, Sendable {
@@ -35,6 +37,7 @@ enum LogLevel: String, ExpressibleByArgument, CaseIterable, Comparable, Sendable
 }
 
 struct Logger: Sendable {
+    private static let terminalLock = NSLock()
     private let logger: os.Logger
     private let minimumLevel: LogLevel
     private let fileSink: LogFileSink?
@@ -96,5 +99,13 @@ struct Logger: Sendable {
             logger.fault("\(message, privacy: .public)")
         }
         fileSink?.write(level: level, label: label, message: message)
+        // Show progress and errors in an interactive terminal, without changing
+        // background service behavior or the macOS unified log.
+        if isatty(STDERR_FILENO) != 0 {
+            let singleLine = message.replacingOccurrences(of: "\n", with: "\\n")
+            Self.terminalLock.withLock {
+                FileHandle.standardError.write(Data("[\(level.rawValue)] \(label): \(singleLine)\n".utf8))
+            }
+        }
     }
 }

@@ -102,7 +102,7 @@ For `local` sources sand skips the registry pull and clones the named VM directl
 
 1) Create a GitHub App and grant `Self-hosted runners` permission set to `Read & Write` at the organization level. https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app
 2) Install the app on the organization or the specific repository you want to run against.
-3) Download the private key and set `appId`, `organization`, `repository` (optional), and `privateKeyPath` in your config.
+3) Configure `appId`, `organization`, `repository` (optional), and exactly one of `privateKeyPath` or `privateKeyKeychainLabel` in your config.
 4) Optionally set `runnerGroup` to register organization-level runners into a runner group (requires omitting `repository`).
 
 Each VM boot registers the runner as `<runnerName>-<5 hex chars>` so a VM killed mid-session never collides with the next boot's GitHub session. Sand deletes that registration from GitHub when it tears the VM down.
@@ -130,6 +130,35 @@ runners:
       interval: 30
       delay: 60
 ```
+
+### macOS Keychain signing (optional)
+
+Instead of a PEM path, sand can sign GitHub App JWTs using an RSA private key held in the macOS Keychain. This uses Security.framework's SecKeyCreateSignature and does not export the private key into sand's process.
+
+1. Import the GitHub App's existing RSA private key into your login Keychain. Substitute the actual path to your installed sand executable:
+
+   ```bash
+   security import github-app.pem \
+     -k ~/Library/Keychains/login.keychain-db \
+     -t priv -x -T /absolute/path/to/sand
+   ```
+
+2. In Keychain Access, find the imported private key and give it a unique name, such as sand-github-app. The configured label must match the key's actual Keychain label.
+3. Replace privateKeyPath with privateKeyKeychainLabel:
+
+   ```yaml
+   provisioner:
+     type: github
+     config:
+       appId: 123456
+       organization: my-org
+       privateKeyKeychainLabel: sand-github-app
+       runnerName: runner-1
+   ```
+
+4. Verify signing works under the **same macOS user and launchd context** that will run sand before deleting the original PEM and any backups. Unattended operation requires that the Keychain be unlocked and the signing operation be authorized; an access prompt or a locked login Keychain can otherwise prevent jobs from starting.
+
+The imported RSA key is not a Secure Enclave key (the Secure Enclave cannot sign RS256). Marking the key non-extractable with -x blocks normal Keychain export but does not make the key hardware-backed. This feature does not prevent an authorized or compromised sand process from requesting signatures.
 
 Sand downloads the Actions runner on the host, checks it against the SHA-256 digest GitHub publishes for the release, and copies the verified tarball into each VM over `scp`. The guest never downloads the runner and never gets write access to the cache, so a job cannot tamper with the runner used by later VMs.
 
