@@ -10,13 +10,18 @@ enum NetworkEnforcementError: Error, CustomStringConvertible {
     case backendFailed(reason: String, detail: String)
     /// The CA bundle for a trusted inspection CA could not be built in the guest.
     case inspectionTrustFailed(String)
+    /// An enforcement component died while a job ran under `stopAfter`: the
+    /// interrupted job cannot be retried, so `sand run` exits 78.
+    case enforcementLost(component: String)
     /// Too many consecutive enforcement failures: `sand run` exits 78.
     case gaveUp(attempts: Int, last: String)
 
     /// Failures that end `sand run` with exit 78 instead of another retry.
     var isFatal: Bool {
-        if case .gaveUp = self { return true }
-        return false
+        switch self {
+        case .gaveUp, .enforcementLost: return true
+        default: return false
+        }
     }
 
     var description: String {
@@ -28,6 +33,8 @@ enum NetworkEnforcementError: Error, CustomStringConvertible {
             return "network enforcement backend failed (\(reason)): \(detail)"
         case let .inspectionTrustFailed(detail):
             return "could not trust the host TLS-inspection CA in the guest: \(detail)"
+        case let .enforcementLost(component):
+            return "network enforcement was lost while the job ran (\(component)); the VM was stopped and deleted and the job is not retried under stopAfter"
         case let .gaveUp(attempts, last):
             return "network enforcement failed \(attempts) time(s) in a row; giving up (sand never falls back to shared networking). Last failure: \(last)"
         case let .preflightFailed(checks):
@@ -60,6 +67,14 @@ struct RunnerNetworkDependencies: Sendable {
     var bridgeAddresses: @Sendable (String) -> [IPAddress] = { _ in [] }
     /// Intercepting host CAs detected at startup, installed under `tlsInspection: trustHostCA`.
     var inspectionCAs: [InspectionCA] = []
+    /// The backend `backend: auto` resolved to (and was preflighted with) at
+    /// startup. Every later VM uses it: a lost softnet privilege then fails the
+    /// per-VM preflight instead of silently downgrading to hostOnly.
+    var pinnedBackend: EnforcementBackend?
+    /// The host's DNS servers (hostOnly adversarial verifier targets).
+    var hostResolvers: @Sendable () async -> [String] = { [] }
+    /// Host IP forwarding (hostOnly): checked per VM and by the watchdog.
+    var ipForwarding: @Sendable () -> IPForwardingState = { IPForwardingState.current() }
 
     static func live(processRunner: ProcessRunning, audit: NetworkAudit) -> RunnerNetworkDependencies {
         var dependencies = RunnerNetworkDependencies(
@@ -74,6 +89,7 @@ struct RunnerNetworkDependencies: Sendable {
         )
         dependencies.hostListeners = { addresses in await HostListenerInspector(processRunner: processRunner).inspect(bridgeAddresses: addresses) }
         dependencies.bridgeAddresses = { HostListenerInspector.bridgeAddresses(forVMIP: $0) }
+        dependencies.hostResolvers = { await HostDNSServers.current(processRunner: processRunner) }
         return dependencies
     }
 }
@@ -133,6 +149,9 @@ final class VMNetworkSession: @unchecked Sendable {
     /// destroy the VM and must not register a runner.
     func establish(ssh: SSHClient, vmIP: String) async throws {
         let facts = dependencies.hostFacts().withVMSubnet(RouteInspector.vmSubnet(for: vmIP))
+        if policy.isHostOnly {
+            try checkIPForwarding()
+        }
         if let egress = policy.egress {
             let routes = await dependencies.routes()
             let steeredInterfaces = await DestinationGuard.learnSteeredInterfaces(names: egress.steeredNames, resolver: dependencies.resolver, routes: routes)
@@ -151,8 +170,10 @@ final class VMNetworkSession: @unchecked Sendable {
             audit.emit("network.guest.verified", level: .warning, ["verify": "off", "backend": policy.backend?.rawValue ?? "none", "policy_hash": policy.policyHash])
             return
         }
-        let gateway = policy.isHostOnly ? dependencies.bridgeAddresses(vmIP).first(where: \.isIPv4)?.description : nil
-        let verifier = await makeVerifier(facts: facts, hostServicePorts: listeners.filter { $0.proto == .tcp }.map(\.port), gateway: gateway)
+        let bridge = policy.isHostOnly ? dependencies.bridgeAddresses(vmIP) : []
+        let gateway = bridge.first(where: \.isIPv4)?.description
+        let gatewayV6 = bridge.first(where: \.isLinkLocalV6).map { $0.withoutEmbeddedScope.description }
+        let verifier = await makeVerifier(facts: facts, hostServicePorts: listeners.filter { $0.proto == .tcp }.map(\.port), gateway: gateway, gatewayV6: gatewayV6)
         let output = (try await ssh.exec(command: verifier.script))?.stdout ?? ""
         let results = verifier.evaluate(output)
         let failed = results.filter { !$0.passed }
@@ -175,17 +196,45 @@ final class VMNetworkSession: @unchecked Sendable {
         if !reached.isEmpty {
             fields["host_services_reachable"] = reached.joined(separator: ",")
         }
-        audit.emit("network.guest.verified", level: reached.isEmpty ? .info : .warning, fields)
+        let routedOpen = verifier.routedReachable(results)
+        if !routedOpen.isEmpty {
+            // Only passes under ipForwarding: accept.
+            fields["routed_reachable"] = routedOpen.map { id in results.first { $0.id == id }?.detail ?? id }.joined(separator: "; ")
+            logger.warning("hostOnly: with a guest route via the host, the VM reached: \(fields["routed_reachable"] ?? "") (accepted by ipForwarding: accept)")
+        }
+        if verifier.routed != nil {
+            fields["routed_probes"] = String(results.filter { $0.id.hasPrefix("R") }.count)
+        }
+        audit.emit("network.guest.verified", level: reached.isEmpty && routedOpen.isEmpty ? .info : .warning, fields)
     }
 
-    /// hostOnly only: host sockets a guest can reach on the bridge (bound to all
-    /// interfaces or to the bridge address). Loopback sockets, including this
+    /// hostOnly: forwarding may have been turned on since the per-VM preflight.
+    /// Under `ipForwarding: accept` the exposure is logged and audited per VM.
+    private func checkIPForwarding() throws {
+        let state = dependencies.ipForwarding()
+        guard !state.isOff else { return }
+        let fields = ["state": state.summary, "policy": policy.options.ipForwarding.rawValue, "policy_hash": policy.policyHash]
+        guard policy.options.ipForwarding == .accept else {
+            audit.emit("network.host.forwarding", level: .error, fields.merging(["result": "denied"]) { $1 })
+            throw NetworkEnforcementError.preflightFailed([PreflightCheck(
+                "P11 host IP forwarding", .failed,
+                "host IP forwarding turned on (\(state.summary))", remediation: NetworkPreflight.ipForwardingRemediation
+            )])
+        }
+        audit.emit("network.host.forwarding", level: .warning, fields.merging(["result": "accepted", "risk": "guest root can route through the host"]) { $1 })
+        logger.warning("hostOnly: host IP forwarding is on (\(state.summary)) and accepted (ipForwarding: accept): a job with root in the guest can route through the host to anything the host forwards to with a return path")
+    }
+
+    /// hostOnly only: host sockets a guest can reach (bound to all interfaces,
+    /// to the bridge address, or to any other non-loopback host address, which a
+    /// guest reaches by routing via the bridge). Loopback sockets, including this
     /// VM's own egress proxy, are never reachable and never reported. Reported
     /// under `hostListeners: warn`; `deny` refuses the VM.
     private func checkHostListeners(vmIP: String) async throws -> [HostListener] {
         guard policy.isHostOnly else { return [] }
         let bridge = dependencies.bridgeAddresses(vmIP)
-        let inspected = await dependencies.hostListeners(bridge)
+        let reachable = HostListenerInspector.reachableAddresses(bridge: bridge, host: dependencies.hostFacts().interfaceAddresses)
+        let inspected = await dependencies.hostListeners(reachable)
         let report = HostListenerReport(
             reachable: inspected.listeners,
             policy: policy.options.hostListeners,
@@ -197,6 +246,7 @@ final class VMNetworkSession: @unchecked Sendable {
             "count": String(report.reachable.count),
             "listeners": report.reachable.prefix(40).map(\.description).joined(separator: ","),
             "bridge": bridge.filter(\.isIPv4).map(\.description).joined(separator: ","),
+            "addresses": String(reachable.count),
             "policy_hash": policy.policyHash
         ]
         if !report.accepted.isEmpty {
@@ -229,8 +279,16 @@ final class VMNetworkSession: @unchecked Sendable {
         }
         let (proxy, tunnel) = lock.withLock { (self.proxy, self.tunnel) }
         let backendName = policy.backend?.rawValue ?? "none"
+        var forwarding: (@Sendable () -> String?)?
+        if policy.isHostOnly, policy.options.ipForwarding == .deny {
+            let read = dependencies.ipForwarding
+            forwarding = {
+                let state = read()
+                return state.isOff ? nil : state.summary
+            }
+        }
         let watchdog = NetworkWatchdog(
-            components: .init(tartRun: tartRun, tunnel: tunnel, proxy: proxy, checkSoftnet: policy.usesSoftnet, routeOverlap: overlap),
+            components: .init(tartRun: tartRun, tunnel: tunnel, proxy: proxy, checkSoftnet: policy.usesSoftnet, routeOverlap: overlap, ipForwarding: forwarding),
             interval: dependencies.watchdogInterval,
             processRunner: processRunner
         ) { [audit] component in
@@ -290,12 +348,24 @@ final class VMNetworkSession: @unchecked Sendable {
         throw NetworkEnforcementError.tunnelFailed("guest 127.0.0.1:\(NetworkPolicy.guestProxyPort) not reachable after \(Int(dependencies.tunnelReadyTimeout))s")
     }
 
-    private func makeVerifier(facts: HostFacts, hostServicePorts: [Int], gateway: String?) async -> GuestEgressVerifier {
+    private func makeVerifier(facts: HostFacts, hostServicePorts: [Int], gateway: String?, gatewayV6: String?) async -> GuestEgressVerifier {
         let github = (try? await dependencies.resolver.resolve("github.com")) ?? []
         let direct = github.first(where: \.isIPv4)?.description ?? "140.82.112.3"
         var targets = GuestEgressVerifier.StrictTargets()
-        if policy.verify == .strict {
-            targets = .derive(facts: facts, routes: await dependencies.routes())
+        var routed: GuestEgressVerifier.RoutedTargets?
+        if policy.verify == .strict || policy.isHostOnly {
+            let derived = GuestEgressVerifier.StrictTargets.derive(facts: facts, routes: await dependencies.routes())
+            if policy.verify == .strict {
+                targets = derived
+            }
+            if policy.isHostOnly {
+                routed = GuestEgressVerifier.RoutedTargets(
+                    hostGatewayV6: gatewayV6,
+                    resolvers: await dependencies.hostResolvers(),
+                    tunnelTargets: derived.tunnelTargets,
+                    forwardingAccepted: policy.options.ipForwarding == .accept
+                )
+            }
         }
         return GuestEgressVerifier(
             level: policy.verify, directGitHubAddress: direct, strictTargets: targets, expectsProxy: policy.egress != nil,
@@ -303,7 +373,8 @@ final class VMNetworkSession: @unchecked Sendable {
             hostListenerPolicy: policy.options.hostListeners,
             acceptedHostListeners: policy.options.acceptedHostListeners,
             hostServicePorts: Array(Set(hostServicePorts)).sorted(),
-            hostGateway: gateway
+            hostGateway: gateway,
+            routed: routed
         )
     }
 }

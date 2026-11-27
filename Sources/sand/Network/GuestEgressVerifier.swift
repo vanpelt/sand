@@ -14,6 +14,22 @@ struct GuestEgressVerifier: Sendable {
         /// A host service on the VM bridge (hostOnly only): OPEN is reported, and
         /// fails only under `hostListeners: deny` for an unaccepted port.
         case hostService(port: Int)
+        /// hostOnly, adversarial: the guest first adds a host route via the host's
+        /// bridge address (what a job with root can do). Must stay closed unless
+        /// host IP forwarding was explicitly accepted, in which case OPEN is reported.
+        case routedClosed
+    }
+
+    /// hostOnly: targets probed again after the guest routes them via the host.
+    struct RoutedTargets: Sendable, Equatable {
+        /// The host's IPv6 link-local address on the bridge, for an IPv6 route.
+        var hostGatewayV6: String?
+        /// The host's DNS servers (scutil --dns), e.g. a VPN or tailnet resolver.
+        var resolvers: [String] = []
+        /// First address of every VPN (utun) route.
+        var tunnelTargets: [String] = []
+        /// `ipForwarding: accept`: routed OPEN results are reported, not failed.
+        var forwardingAccepted = false
     }
 
     struct Probe: Sendable, Equatable {
@@ -75,6 +91,8 @@ struct GuestEgressVerifier: Sendable {
     /// The host's address on the VM network, used when the guest has no default
     /// route (host-only networks have none): gateway probes then target the host.
     let hostGateway: String?
+    /// nil: no adversarial routed probes (softnet, or hostOnly without a known bridge address).
+    let routed: RoutedTargets?
 
     init(
         level: VerifyLevel,
@@ -86,7 +104,8 @@ struct GuestEgressVerifier: Sendable {
         hostListenerPolicy: NetworkConfig.HostListenerPolicy = .warn,
         acceptedHostListeners: [HostListenerPattern] = [],
         hostServicePorts: [Int] = [],
-        hostGateway: String? = nil
+        hostGateway: String? = nil,
+        routed: RoutedTargets? = nil
     ) {
         self.level = level
         self.directGitHubAddress = directGitHubAddress
@@ -98,7 +117,18 @@ struct GuestEgressVerifier: Sendable {
         self.acceptedHostListeners = acceptedHostListeners
         self.hostServicePorts = hostServicePorts
         self.hostGateway = hostGateway.flatMap { IPAddress($0) != nil ? $0 : nil }
+        if backend == .hostOnly, var routed {
+            routed.hostGatewayV6 = routed.hostGatewayV6.flatMap { IPAddress($0)?.isIPv4 == false ? $0 : nil }
+            routed.resolvers = routed.resolvers.filter { IPAddress($0)?.isIPv4 == true }
+            routed.tunnelTargets = routed.tunnelTargets.filter { IPAddress($0)?.isIPv4 == true }
+            self.routed = routed
+        } else {
+            self.routed = nil
+        }
     }
+
+    /// The tailnet (MagicDNS) resolver: a host with forwarding on answers it for the guest.
+    static let tailnetResolver = "100.100.100.100"
 
     /// Under softnet every host port is blocked; under hostOnly a host service is reported.
     private func gatewayExpectation(port: Int) -> Expectation {
@@ -128,6 +158,9 @@ struct GuestEgressVerifier: Sendable {
                 probes.append(Probe(id: "H\(index + 1)", expectation: .hostService(port: port), summary: "host service on the bridge :\(port)", command: "tcp H\(index + 1) \"$GW\" \(port)"))
             }
         }
+        if let routed {
+            probes.append(contentsOf: routedProbes(routed))
+        }
         guard level == .strict else { return probes }
         if let gateway = strictTargets.lanGateway {
             probes.append(Probe(id: "S1", expectation: .closed, summary: "host LAN gateway :80", command: "tcp S1 \(Self.quote(gateway)) 80"))
@@ -147,6 +180,65 @@ struct GuestEgressVerifier: Sendable {
         }
         return probes
     }
+
+    /// The direct probes again, each after `route add -host <target> <bridge>`.
+    private func routedProbes(_ routed: RoutedTargets) -> [Probe] {
+        var probes: [Probe] = [
+            Probe(id: "R1", expectation: .routedClosed, summary: "routed via host: 1.1.1.1:443", command: "routed R1 tcp 1.1.1.1 443"),
+            Probe(id: "R2", expectation: .routedClosed, summary: "routed via host: direct GitHub/VPN front :443", command: "routed R2 tcp \(Self.quote(directGitHubAddress)) 443"),
+            Probe(id: "R3", expectation: .routedClosed, summary: "routed via host: DNS 8.8.8.8", command: "routed R3 dnsq 8.8.8.8"),
+            Probe(id: "R4", expectation: .routedClosed, summary: "routed via host: tailnet DNS \(Self.tailnetResolver)", command: "routed R4 dnsq \(Self.tailnetResolver)"),
+            Probe(id: "R5", expectation: .routedClosed, summary: "routed via host: \(Self.tailnetResolver):53/tcp", command: "routed R5 tcp \(Self.tailnetResolver) 53"),
+        ]
+        var seen: Set<String> = ["8.8.8.8", Self.tailnetResolver]
+        for resolver in routed.resolvers where seen.insert(resolver).inserted && probes.count < 11 {
+            let id = "RD\(probes.count - 4)"
+            probes.append(Probe(id: id, expectation: .routedClosed, summary: "routed via host: host DNS server \(resolver)", command: "routed \(id) dnsq \(Self.quote(resolver))"))
+        }
+        for (index, target) in routed.tunnelTargets.filter({ !seen.contains($0) }).prefix(6).enumerated() {
+            probes.append(Probe(id: "RT\(index + 1)", expectation: .routedClosed, summary: "routed via host: VPN route \(target):443", command: "routed RT\(index + 1) tcp \(Self.quote(target)) 443"))
+        }
+        if let v6 = routed.hostGatewayV6 {
+            probes.append(Probe(id: "R6", expectation: .routedClosed, summary: "routed via host: IPv6 internet", command: "routed6 R6 \(Self.quote(v6))"))
+        }
+        return probes
+    }
+
+    /// Guest-side helpers for the routed probes. Routes are host routes (never the
+    /// default route) and are removed after each probe and on exit.
+    private static let routedPrelude = #"""
+    SAND_ROUTED=
+    if [ "$(uname -s)" = Darwin ]; then
+      radd() { sudo -n /sbin/route -n add -host "$1" "$HGW" >/dev/null 2>&1; }
+      rdel() { sudo -n /sbin/route -n delete -host "$1" >/dev/null 2>&1; }
+      gwif() { route -n get "$HGW" 2>/dev/null | awk '/interface:/{print $2; exit}'; }
+      radd6() { sudo -n /sbin/route -n add -inet6 -host "$1" "$2%$(gwif)" >/dev/null 2>&1; }
+      rdel6() { sudo -n /sbin/route -n delete -inet6 -host "$1" >/dev/null 2>&1; }
+    else
+      radd() { sudo -n ip route replace "$1/32" via "$HGW" >/dev/null 2>&1; }
+      rdel() { sudo -n ip route del "$1/32" >/dev/null 2>&1; }
+      gwif() { ip route get "$HGW" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'; }
+      radd6() { sudo -n ip -6 route replace "$1/128" via "$2" dev "$(gwif)" >/dev/null 2>&1; }
+      rdel6() { sudo -n ip -6 route del "$1/128" >/dev/null 2>&1; }
+    fi
+    sand_unroute() { if [ -n "$SAND_ROUTED" ]; then rdel "$SAND_ROUTED"; fi; rdel6 2606:4700:4700::1111; }
+    trap sand_unroute EXIT
+    routed() {
+      rid=$1; kind=$2; target=$3; shift 3
+      if [ -z "$HGW" ] || [ -z "$target" ]; then echo "SANDPROBE $rid NOTARGET empty-target"; return; fi
+      if ! sudo -n true >/dev/null 2>&1; then echo "SANDPROBE $rid INCONCLUSIVE no-guest-root"; return; fi
+      if ! radd "$target"; then echo "SANDPROBE $rid INCONCLUSIVE route-add-failed"; return; fi
+      SAND_ROUTED=$target
+      "$kind" "$rid" "$target" "$@"
+      rdel "$target"; SAND_ROUTED=
+    }
+    routed6() {
+      if ! sudo -n true >/dev/null 2>&1; then echo "SANDPROBE $1 INCONCLUSIVE no-guest-root"; return; fi
+      if ! radd6 2606:4700:4700::1111 "$2"; then echo "SANDPROBE $1 INCONCLUSIVE route-add-failed"; return; fi
+      v6 "$1"
+      rdel6 2606:4700:4700::1111
+    }
+    """#
 
     /// The bash script run over `ssh exec`. Every negative probe runs with the
     /// proxy variables unset so it tests the direct path.
@@ -187,7 +279,9 @@ struct GuestEgressVerifier: Sendable {
         """#
         // No default route (host-only): probe the host's bridge address instead.
         let fallback = hostGateway.map { [#"[ -n "$GW" ] || GW=\#(Self.quote($0))"#] } ?? []
-        return ([prelude] + fallback + probes.map(\.command) + ["exit 0"]).joined(separator: "\n")
+        // Routed probes always go via the host's own bridge address, never the guest's idea of a gateway.
+        let routedSetup = routed == nil ? [] : ["HGW=\(hostGateway.map(Self.quote) ?? "''")", Self.routedPrelude]
+        return ([prelude] + fallback + routedSetup + probes.map(\.command) + ["exit 0"]).joined(separator: "\n")
     }
 
     func evaluate(_ output: String) -> [ProbeResult] {
@@ -208,6 +302,8 @@ struct GuestEgressVerifier: Sendable {
                 let accepted = hostListenerPolicy == .warn
                     || acceptedHostListeners.contains { $0.matches(HostListener(proto: .tcp, port: port, boundTo: "*")) }
                 passed = outcome == "CLOSED" || (outcome == "OPEN" && accepted)
+            case .routedClosed:
+                passed = outcome == "CLOSED" || outcome == "INCONCLUSIVE" || (outcome == "OPEN" && routed?.forwardingAccepted == true)
             }
             return ProbeResult(id: probe.id, outcome: outcome, detail: "\(probe.summary): \(detail)", passed: passed)
         }
@@ -219,6 +315,15 @@ struct GuestEgressVerifier: Sendable {
         return results.compactMap { result in
             guard result.outcome == "OPEN", case let .hostService(port)? = byID[result.id]?.expectation else { return nil }
             return "tcp/\(port)"
+        }
+    }
+
+    /// Routed probes that connected (only possible to pass under `ipForwarding: accept`).
+    func routedReachable(_ results: [ProbeResult]) -> [String] {
+        let byID = Dictionary(uniqueKeysWithValues: probes.map { ($0.id, $0) })
+        return results.compactMap { result in
+            guard result.outcome == "OPEN", byID[result.id]?.expectation == .routedClosed else { return nil }
+            return result.id
         }
     }
 

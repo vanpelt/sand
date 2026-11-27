@@ -37,6 +37,33 @@ protocol PreflightFileSystem: Sendable {
     /// (owner uid, mode bits) of a path.
     func ownerAndMode(_ path: String) -> (uid: UInt32, mode: UInt16)?
     func freeBytes(atPath path: String) -> Int64?
+    /// An integer sysctl (readable without root), nil when it cannot be read.
+    func sysctlInt(_ name: String) -> Int?
+}
+
+/// The host's IPv4/IPv6 forwarding switches (nil: unreadable).
+struct IPForwardingState: Sendable, Equatable {
+    static let ipv4Name = "net.inet.ip.forwarding"
+    static let ipv6Name = "net.inet6.ip6.forwarding"
+
+    var ipv4: Int?
+    var ipv6: Int?
+
+    static func read(_ sysctl: (String) -> Int?) -> IPForwardingState {
+        IPForwardingState(ipv4: sysctl(ipv4Name), ipv6: sysctl(ipv6Name))
+    }
+
+    static func current() -> IPForwardingState {
+        read(SystemPreflightFileSystem.sysctlInt)
+    }
+
+    /// Fail closed: an unreadable switch counts as on.
+    var isOff: Bool { ipv4 == 0 && ipv6 == 0 }
+
+    /// `net.inet.ip.forwarding=1 net.inet6.ip6.forwarding=1`
+    var summary: String {
+        "\(Self.ipv4Name)=\(ipv4.map(String.init) ?? "unreadable") \(Self.ipv6Name)=\(ipv6.map(String.init) ?? "unreadable")"
+    }
 }
 
 struct SystemPreflightFileSystem: PreflightFileSystem {
@@ -70,6 +97,17 @@ struct SystemPreflightFileSystem: PreflightFileSystem {
         var info = statfs()
         guard statfs(path, &info) == 0 else { return nil }
         return Int64(info.f_bavail) * Int64(info.f_bsize)
+    }
+
+    func sysctlInt(_ name: String) -> Int? {
+        Self.sysctlInt(name)
+    }
+
+    static func sysctlInt(_ name: String) -> Int? {
+        var value: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        guard sysctlbyname(name, &value, &size, nil, 0) == 0, size == MemoryLayout<Int32>.size else { return nil }
+        return Int(value)
     }
 }
 
@@ -196,6 +234,7 @@ struct NetworkPreflight: Sendable {
             checks.append(contentsOf: await checkSoftnet())
         } else {
             checks.append(PreflightCheck("P3 softnet privilege", .ok, "not needed: the hostOnly backend runs without root"))
+            checks.append(checkIPForwarding(policy))
         }
         if let egress = policy.egress {
             checks.append(checkDirectCIDROverlap(egress))
@@ -273,9 +312,13 @@ struct NetworkPreflight: Sendable {
         }
     }
 
-    /// Compiles a runner's policy, resolving `backend: auto` on this host.
-    func compile(_ config: NetworkConfig, sshPort: Int) async throws -> NetworkPolicy {
-        try config.compile(sshPort: sshPort, autoBackend: await resolveBackend(config))
+    /// Compiles a runner's policy, resolving `backend: auto` on this host unless
+    /// a backend was already pinned (at startup) for this runner.
+    func compile(_ config: NetworkConfig, sshPort: Int, pinnedBackend: EnforcementBackend? = nil) async throws -> NetworkPolicy {
+        if let pinnedBackend, config.backendChoice == .auto {
+            return try config.compile(sshPort: sshPort, autoBackend: pinnedBackend)
+        }
+        return try config.compile(sshPort: sshPort, autoBackend: await resolveBackend(config))
     }
 
     /// Cheap re-check before every clone: privilege can be reset by `brew upgrade`.
@@ -284,6 +327,10 @@ struct NetworkPreflight: Sendable {
         var checks: [PreflightCheck] = []
         if policy.usesSoftnet {
             checks.append(await checkSoftnetPrivilege())
+        }
+        if policy.isHostOnly {
+            // VPN clients and Internet Sharing toggle forwarding at runtime.
+            checks.append(checkIPForwarding(policy))
         }
         if let egress = policy.egress {
             checks.append(checkDirectCIDROverlap(egress))
@@ -365,6 +412,32 @@ struct NetworkPreflight: Sendable {
             checks.append(PreflightCheck("P4 GitHub egress", .failed, "TLS handshake to api.github.com:443 failed: \(error)", remediation: "The host itself cannot reach GitHub; fix host connectivity first."))
         }
         return checks
+    }
+
+    static let ipForwardingRemediation = """
+    Under the hostOnly backend a guest with root (CI jobs usually have passwordless sudo) can add a route via the
+    host's bridge address; with host IP forwarding on, the host then forwards its packets to the LAN, VPN and
+    tailnet (for example a tailnet DNS resolver answers), outside the proxy, the allowlist and the audit log.
+    Either turn forwarding off in your own terminal (sand never does this; a VPN client or Internet Sharing may turn it back on):
+      sudo sysctl -w net.inet.ip.forwarding=0 net.inet6.ip6.forwarding=0
+    or use backend: softnet (privileged softnet filters guest packets before the host routes them),
+    or accept the exposure explicitly: vm.run.network.ipForwarding: accept (every VM logs and audits it).
+    """
+
+    /// P11 (hostOnly): host IP forwarding must be off unless explicitly accepted.
+    func checkIPForwarding(_ policy: NetworkPolicy) -> PreflightCheck {
+        let state = IPForwardingState.read(fileSystem.sysctlInt)
+        if state.isOff {
+            return PreflightCheck("P11 host IP forwarding", .ok, "off (\(state.summary)): a guest route via the bridge reaches only the host itself")
+        }
+        if policy.options.ipForwarding == .accept {
+            return PreflightCheck("P11 host IP forwarding", .warning, "on (\(state.summary)) and accepted by ipForwarding: accept: a guest with root can route through the host")
+        }
+        return PreflightCheck(
+            "P11 host IP forwarding", .failed,
+            "host IP forwarding is on or unreadable (\(state.summary)); a guest with root could route through the host and bypass the proxy",
+            remediation: Self.ipForwardingRemediation
+        )
     }
 
     /// P9: a reviewed `allowedCIDRs` entry must never cover the host itself or

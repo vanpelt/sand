@@ -13,6 +13,8 @@ actor NetworkWatchdog {
         var checkSoftnet: Bool
         /// Returns a description of a new host-route overlap with the VM subnet, or nil.
         var routeOverlap: (@Sendable () async -> String?)?
+        /// hostOnly with `ipForwarding: deny`: a description when host IP forwarding turned on.
+        var ipForwarding: (@Sendable () -> String?)?
     }
 
     private let components: Components
@@ -74,6 +76,9 @@ actor NetworkWatchdog {
         }
         if let routeOverlap = components.routeOverlap, let overlap = await routeOverlap() {
             return "route-overlap(\(overlap))"
+        }
+        if let ipForwarding = components.ipForwarding, let state = ipForwarding() {
+            return "ip-forwarding(\(state))"
         }
         return nil
     }

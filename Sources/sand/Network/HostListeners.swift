@@ -66,8 +66,10 @@ struct HostListener: Sendable, Hashable, Comparable, CustomStringConvertible {
 }
 
 /// Finds host TCP listeners and unconnected UDP sockets that a guest on the
-/// host-only bridge can reach: bound to all interfaces, or to an address of the
-/// bridge interface. Loopback sockets (including Sand's own egress proxy) are
+/// host-only bridge can reach: bound to all interfaces, or to any non-loopback
+/// host address (`reachableAddresses`: the bridge plus, because macOS is
+/// weak-host, the LAN/VPN/utun addresses a guest reaches by routing via the
+/// bridge; the `bridgeAddresses` parameters below take that list). Loopback sockets (including Sand's own egress proxy) are
 /// never reachable from the guest and are always ignored.
 ///
 /// Sources, all unprivileged:
@@ -107,7 +109,19 @@ struct HostListenerInspector: Sendable {
     }
 
     static func netstatSeesInternetSockets(_ output: String) -> Bool {
-        output.split(whereSeparator: \.isNewline).contains { $0.hasPrefix("tcp4") || $0.hasPrefix("tcp6") || $0.hasPrefix("tcp46") }
+        output.split(whereSeparator: \.isNewline).contains { $0.hasPrefix("tcp4") || $0.hasPrefix("tcp6") || $0.hasPrefix("udp4") || $0.hasPrefix("udp6") }
+    }
+
+    /// Every host address a guest can reach once it routes via the bridge: macOS
+    /// is a weak-host system, so a socket bound to the LAN, VPN or utun address
+    /// answers on the bridge too. Loopback is never reachable; another
+    /// interface's IPv6 link-local address is unusable from the bridge.
+    static func reachableAddresses(bridge: [IPAddress], host: [IPAddress]) -> [IPAddress] {
+        var result: [IPAddress] = []
+        for address in bridge.map(\.withoutEmbeddedScope) + host.filter({ !$0.isLinkLocalV6 }) where !address.isLoopback && !result.contains(address) {
+            result.append(address)
+        }
+        return result
     }
 
     /// `lsof -F`-free parse of the default table: `COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME`,
@@ -227,7 +241,7 @@ struct HostListenerInspector: Sendable {
         guard getifaddrs(&head) == 0, let first = head else { return [] }
         defer { freeifaddrs(head) }
         var byInterface: [String: [IPAddress]] = [:]
-        var bridge: String?
+        var candidates: [String] = []
         var cursor: UnsafeMutablePointer<ifaddrs>? = first
         while let entry = cursor {
             defer { cursor = entry.pointee.ifa_next }
@@ -238,10 +252,15 @@ struct HostListenerInspector: Sendable {
                case let .v4(bits) = mask,
                let network = IPNetwork(address: address, prefixLength: bits.nonzeroBitCount),
                address.isIPv4, network.contains(vm), address != vm {
-                bridge = name
+                candidates.append(name)
             }
         }
-        return bridge.flatMap { byInterface[$0] } ?? []
+        // Prefer the vmnet bridge: a VPN utun with a wide netmask can also "contain" the VM IP.
+        return pickBridge(candidates).flatMap { byInterface[$0] } ?? []
+    }
+
+    static func pickBridge(_ candidates: [String]) -> String? {
+        candidates.first { $0.hasPrefix("bridge") } ?? candidates.first { !$0.hasPrefix("utun") } ?? candidates.last
     }
 }
 

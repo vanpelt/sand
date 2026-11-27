@@ -34,6 +34,17 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
         case deny
     }
 
+    /// Host IP forwarding under hostOnly. With forwarding on, a guest with root
+    /// can route through the host's bridge address and reach whatever the host
+    /// forwards to with a return path (a tailnet resolver, a NATing VPN, pf NAT,
+    /// Internet Sharing), outside the proxy, the allowlist and the audit log.
+    enum IPForwardingPolicy: String, Sendable, CaseIterable {
+        /// Fail preflight (and stop a running VM) while forwarding is on.
+        case deny
+        /// Run anyway; every VM logs and audits the exposure.
+        case accept
+    }
+
     /// What to do when the host's upstream TLS to allowlisted hosts is intercepted
     /// (for example by an endpoint agent such as Netskope).
     enum TLSInspectionMode: String, Sendable, CaseIterable {
@@ -79,6 +90,8 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
     /// `tcp/7000`, `udp/5353`, `udp/*`: host listeners accepted under `hostListeners: deny`.
     let acceptedHostListeners: [String]
     let tlsInspection: TLSInspectionMode?
+    /// nil means deny.
+    let ipForwarding: IPForwardingPolicy?
     /// Consecutive network enforcement failures before `sand run` exits 78.
     let maxEnforcementFailures: Int?
 
@@ -99,6 +112,7 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
         hostListeners: HostListenerPolicy? = nil,
         acceptedHostListeners: [String] = [],
         tlsInspection: TLSInspectionMode? = nil,
+        ipForwarding: IPForwardingPolicy? = nil,
         maxEnforcementFailures: Int? = nil
     ) {
         self.selection = selection
@@ -113,6 +127,7 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
         self.hostListeners = hostListeners
         self.acceptedHostListeners = acceptedHostListeners
         self.tlsInspection = tlsInspection
+        self.ipForwarding = ipForwarding
         self.maxEnforcementFailures = maxEnforcementFailures
     }
 
@@ -182,6 +197,7 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
         hostListeners = try Self.decodeEnum(HostListenerPolicy.self, key: .hostListeners, in: container)
         acceptedHostListeners = try container.decodeIfPresent([String].self, forKey: .acceptedHostListeners) ?? []
         tlsInspection = try Self.decodeEnum(TLSInspectionMode.self, key: .tlsInspection, in: container)
+        ipForwarding = try Self.decodeEnum(IPForwardingPolicy.self, key: .ipForwarding, in: container)
         maxEnforcementFailures = try container.decodeIfPresent(Int.self, forKey: .maxEnforcementFailures)
     }
 
@@ -198,7 +214,7 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case profile, mode, presets, allowedDomains, allowedCIDRs, allowCIDRs, verify, allowGitHubSSH, transport
-        case backend, hostListeners, acceptedHostListeners, tlsInspection, maxEnforcementFailures
+        case backend, hostListeners, acceptedHostListeners, tlsInspection, ipForwarding, maxEnforcementFailures
     }
 
     var profile: Profile? {
@@ -260,6 +276,7 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
             hostListeners: hostListeners ?? .warn,
             acceptedHostListeners: try acceptedHostListeners.map(HostListenerPattern.parse),
             tlsInspection: tlsInspection ?? .fail,
+            ipForwarding: ipForwarding ?? .deny,
             maxEnforcementFailures: effectiveMaxEnforcementFailures
         )
         switch selection {

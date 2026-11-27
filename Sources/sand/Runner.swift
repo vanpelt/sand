@@ -42,7 +42,8 @@ struct Runner: Sendable {
         logSink: LogFileSink?,
         network: RunnerNetworkDependencies? = nil,
         audit: NetworkAudit? = nil,
-        inspectionCAs: [InspectionCA] = []
+        inspectionCAs: [InspectionCA] = [],
+        pinnedBackend: EnforcementBackend? = nil
     ) {
         self.tart = tart
         self.github = github
@@ -60,6 +61,9 @@ struct Runner: Sendable {
         if !inspectionCAs.isEmpty {
             dependencies.inspectionCAs = inspectionCAs
         }
+        if let pinnedBackend {
+            dependencies.pinnedBackend = pinnedBackend
+        }
         self.network = dependencies
     }
 
@@ -68,9 +72,16 @@ struct Runner: Sendable {
             guard stopAfter > 0 else {
                 return
             }
-            for _ in 0..<stopAfter {
+            // A network enforcement retry (backend died, verification failed, ...) is
+            // not a finished iteration: it is retried up to maxEnforcementFailures and
+            // then ends sand with exit 78, never with a silent exit 0.
+            var completed = 0
+            while completed < stopAfter {
+                try Task.checkCancellation()
                 do {
-                    try await runOnce()
+                    if try await runOnce() == .completed {
+                        completed += 1
+                    }
                 } catch where error is CancellationError || Task.isCancelled {
                     throw CancellationError()
                 } catch {
@@ -84,7 +95,7 @@ struct Runner: Sendable {
             // A finished run can schedule a zero backoff, so the backoff sleep alone doesn't see cancellation.
             try Task.checkCancellation()
             do {
-                try await runOnce()
+                _ = try await runOnce()
             } catch where error is CancellationError || Task.isCancelled {
                 // A cancelled tart or GitHub call can surface as its own error type; report it as cancellation, not a failure.
                 throw CancellationError()
@@ -104,17 +115,47 @@ struct Runner: Sendable {
         }
     }
 
-    private func runOnce() async throws {
+    enum IterationOutcome: Equatable {
+        /// The VM ran (or could not boot for a reason unrelated to network enforcement).
+        case completed
+        /// A counted network enforcement failure; the VM was destroyed and will be recreated.
+        case enforcementRetry
+    }
+
+    /// Thrown by `recordEnforcementFailure` below the limit: unwinds to `runOnce`,
+    /// which reports `.enforcementRetry`.
+    private struct EnforcementRetry: Error {}
+
+    private func runOnce() async throws -> IterationOutcome {
         let stopAfterLabel = config.stopAfter.map(String.init) ?? "nil"
         logger.debug("runOnce start (vm=\(vmName), stopAfter=\(stopAfterLabel))")
         try await applyRestartBackoffIfNeeded()
+        // Compile and re-check the network policy before touching any VM, so an
+        // unprepared host never clones or boots (and never falls back to shared NAT).
+        // The backend is pinned to the one sand resolved and preflighted at startup.
+        let networkPolicy = try await network.preflight.compile(config.vm.run.network, sshPort: config.vm.ssh.port, pinnedBackend: network.pinnedBackend)
+        do {
+            try await runIteration(networkPolicy: networkPolicy)
+            return .completed
+        } catch is EnforcementRetry {
+            return .enforcementRetry
+        } catch let error as NetworkEnforcementError where !error.isFatal && networkPolicy.isIsolated {
+            // Every enforcement error counts toward maxEnforcementFailures, even one
+            // thrown from a path that did not record it itself.
+            await shutdownCoordinator.cleanup(reason: "network enforcement failed")
+            do {
+                try await recordEnforcementFailure(policy: networkPolicy, stage: "run", reason: Self.enforcementReason(error), detail: String(describing: error))
+            } catch is EnforcementRetry {
+                return .enforcementRetry
+            }
+        }
+    }
+
+    private func runIteration(networkPolicy: NetworkPolicy) async throws {
         let name = vmName
         let vm = config.vm
         let provisionerConfig = config.provisioner
         let source = vm.source.resolvedSource
-        // Compile and re-check the network policy before touching any VM, so an
-        // unprepared host never clones or boots (and never falls back to shared NAT).
-        let networkPolicy = try await network.preflight.compile(vm.run.network, sshPort: vm.ssh.port)
         if networkPolicy.isIsolated {
             let failures = NetworkPreflight.failures(await network.preflight.perVM(policy: networkPolicy))
             if !failures.isEmpty {
@@ -122,7 +163,11 @@ struct Runner: Sendable {
                     "stage": "per-vm",
                     "checks": failures.map(\.name).joined(separator: ",")
                 ])
-                throw NetworkEnforcementError.preflightFailed(failures)
+                logger.error("\(NetworkEnforcementError.preflightFailed(failures))")
+                try await recordEnforcementFailure(
+                    policy: networkPolicy, stage: "per-vm-preflight", reason: "preflight",
+                    detail: failures.map { "\($0.name): \($0.detail)" }.joined(separator: "; ")
+                )
             }
         } else {
             network.audit.emit("network.shared.unrestricted", level: .warning, ["vm": name])
@@ -171,7 +216,7 @@ struct Runner: Sendable {
                 logger.warning("VM subnet conflict (attempt \(bootAttempt)/\(network.maxSubnetAttempts)): \(conflict); recreating VM")
                 await shutdownCoordinator.cleanup(reason: "VM subnet overlaps a host route")
                 if bootAttempt >= network.maxSubnetAttempts {
-                    throw NetworkEnforcementError.subnetOverlap(conflict)
+                    try await recordEnforcementFailure(policy: networkPolicy, stage: "boot", reason: "subnet-overlap", detail: conflict)
                 }
                 continue
             }
@@ -187,29 +232,45 @@ struct Runner: Sendable {
                 await session.teardown()
                 await shutdownCoordinator.cleanup(reason: "network enforcement not verified")
                 try await recordEnforcementFailure(policy: networkPolicy, stage: "establish", reason: Self.enforcementReason(error), detail: String(describing: error))
-                throw error
             }
-            await enforcementFailures.reset()
         }
         // From here until teardown, losing any enforcement component (or tart itself)
         // ends the job: stop and delete the VM and deregister the runner at once.
+        let lost = LostEnforcement()
         await session.startWatchdog(tartRun: tartRun, vmIP: ip) { [logger, control, shutdownCoordinator] component in
             guard await !shutdownCoordinator.isCleaningUp() else { return false }
+            // Recorded first: the provisioner returns as soon as it is terminated below.
+            lost.set(component)
             logger.error("network enforcement lost (\(component)); stopping VM")
             await healthCheckState.markFailed(message: "network enforcement lost: \(component)")
             await control.terminateProvisioning()
             await shutdownCoordinator.cleanup(reason: "network enforcement lost: \(component)")
             return true
         }
-        do {
-            if let env = session.guestEnv {
-                logger.info("configure guest proxy settings (usability only; enforcement is host-side)")
+        if let env = session.guestEnv {
+            logger.info("configure guest proxy settings (usability only; enforcement is host-side)")
+            do {
                 let result = try await execWithRetry(command: env.guestSetupCommand, ssh: ssh, stage: "guest proxy setup")
                 logIfNonEmpty(label: "guest proxy setup", text: result?.stdout ?? "")
+            } catch {
+                await session.teardown()
+                await shutdownCoordinator.cleanup(reason: "guest proxy setup failed")
+                try await recordLossIfAny(lost, policy: networkPolicy)
+                throw error
             }
-            if !session.inspectionCAs.isEmpty {
+        }
+        if !session.inspectionCAs.isEmpty {
+            do {
                 try await installInspectionTrust(session.inspectionCAs, ssh: ssh, policy: networkPolicy)
+            } catch {
+                logger.error("\(String(describing: error)); destroying VM without registering a runner")
+                await session.teardown()
+                await shutdownCoordinator.cleanup(reason: "inspection CA trust failed")
+                try await recordLossIfAny(lost, policy: networkPolicy)
+                try await recordEnforcementFailure(policy: networkPolicy, stage: "inspection-ca", reason: Self.enforcementReason(error), detail: String(describing: error))
             }
+        }
+        do {
             try await runStages(
                 name: name, vm: vm, provisionerConfig: provisionerConfig, ssh: ssh,
                 healthCheckState: healthCheckState, egress: session.guestEnv
@@ -217,13 +278,34 @@ struct Runner: Sendable {
         } catch {
             await session.teardown()
             await shutdownCoordinator.cleanup(reason: "runOnce failed")
+            try await recordLossIfAny(lost, policy: networkPolicy)
             throw error
         }
         await session.teardown()
+        try await recordLossIfAny(lost, policy: networkPolicy)
+        // Consecutive: only a job that ran to the end with enforcement intact resets
+        // the count, so a component that dies during every job still reaches the limit.
+        if networkPolicy.isIsolated {
+            await enforcementFailures.reset()
+        }
+    }
+
+    /// Enforcement lost while the job ran (the watchdog already stopped and deleted
+    /// the VM). Counted like any other enforcement failure; with `stopAfter` the
+    /// interrupted job cannot be retried, so sand exits 78 at once.
+    private func recordLossIfAny(_ lost: LostEnforcement, policy: NetworkPolicy) async throws {
+        guard let component = lost.component, !Task.isCancelled else { return }
+        try await recordEnforcementFailure(
+            policy: policy, stage: "job", reason: "lost-\(component)",
+            detail: "network enforcement component \(component) failed while the job ran",
+            fatal: config.stopAfter != nil ? .enforcementLost(component: component) : nil
+        )
     }
 
     /// Clone and boot the VM, then wait for its IP and SSH. Returns nil (after
-    /// scheduling a restart and cleaning up) when the VM never became reachable.
+    /// scheduling a restart and cleaning up) when the VM never became reachable
+    /// for a reason unrelated to network enforcement; a network backend failure
+    /// is counted (and unwinds) instead.
     private func bootVM(name: String, source: String, vm: Config.VM, runOptions: Tart.RunOptions, session: VMNetworkSession) async throws -> (tartRun: ProcessHandle, ip: String, ssh: SSHClient)? {
         // Leftover from a crash or a failed clone: tart clone refuses to overwrite it.
         do {
@@ -270,6 +352,10 @@ struct Runner: Sendable {
             await shutdownCoordinator.cleanup(reason: "resolve VM IP failed")
             if exitedEarly {
                 try await recordEarlyTartExit(tartRun, policy: runOptions.network, stage: "before-ip")
+            } else if runOptions.network.isIsolated, !(error is CancellationError), !Task.isCancelled {
+                // tart kept running but the isolated network never leased an address
+                // (e.g. --net-host without DHCP): an enforcement failure, not a retry forever.
+                try await recordEnforcementFailure(policy: runOptions.network, stage: "before-ip", reason: "no-ip", detail: String(describing: error))
             }
             await scheduleRestart(reason: .ipNotReady)
             return nil
@@ -309,11 +395,15 @@ struct Runner: Sendable {
         try await recordEnforcementFailure(policy: policy, stage: stage, reason: reason, detail: detail)
     }
 
-    /// Counts consecutive enforcement failures; throws `gaveUp` at the limit.
-    private func recordEnforcementFailure(policy: NetworkPolicy, stage: String, reason: String, detail: String) async throws {
+    /// The single place enforcement failures are counted. Never returns: below the
+    /// limit it schedules a backoff and throws `EnforcementRetry` (the VM is
+    /// recreated with the same policy); at the limit, or when `fatal` is given, it
+    /// throws a fatal `NetworkEnforcementError` (exit 78). The caller must already
+    /// have destroyed the VM.
+    private func recordEnforcementFailure(policy: NetworkPolicy, stage: String, reason: String, detail: String, fatal: NetworkEnforcementError? = nil) async throws -> Never {
         let attempt = await enforcementFailures.record()
         let limit = max(1, policy.options.maxEnforcementFailures)
-        let final = attempt >= limit
+        let final = fatal != nil || attempt >= limit
         network.audit.emit("network.enforcement.failed", level: .error, [
             "vm": vmName,
             "stage": stage,
@@ -325,10 +415,15 @@ struct Runner: Sendable {
             "detail": detail,
             "policy_hash": policy.policyHash
         ])
+        if let fatal {
+            throw fatal
+        }
         if final {
             throw NetworkEnforcementError.gaveUp(attempts: attempt, last: "\(stage) \(reason): \(detail)")
         }
         logger.warning("network enforcement failure \(attempt)/\(limit) (\(reason)); retrying with the same policy")
+        await scheduleRestart(reason: .stageFailed("network enforcement"))
+        throw EnforcementRetry()
     }
 
     static func enforcementReason(_ error: Error) -> String {
@@ -341,6 +436,7 @@ struct Runner: Sendable {
         case .hostListenersDenied: return "host-listeners"
         case let .backendFailed(reason, _): return reason
         case .inspectionTrustFailed: return "inspection-ca"
+        case let .enforcementLost(component): return "lost-\(component)"
         case .gaveUp: return "gave-up"
         }
     }
@@ -1255,6 +1351,20 @@ private actor HealthCheckState {
 }
 
 /// Consecutive network enforcement failures for one runner slot.
+/// The enforcement component the watchdog lost during one VM's job, if any.
+private final class LostEnforcement: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lost: String?
+
+    var component: String? { lock.withLock { lost } }
+
+    func set(_ component: String) {
+        lock.withLock {
+            if lost == nil { lost = component }
+        }
+    }
+}
+
 private actor EnforcementFailureCounter {
     private var count = 0
 

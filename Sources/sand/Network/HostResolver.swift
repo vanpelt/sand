@@ -66,3 +66,24 @@ struct StaticHostResolver: HostResolving {
         return addresses
     }
 }
+
+/// The host's DNS servers, from `scutil --dns` (unprivileged). Used only as
+/// adversarial verifier targets: a guest must not reach them by routing via the host.
+enum HostDNSServers {
+    static func parse(scutil output: String) -> [String] {
+        var servers: [String] = []
+        for line in output.split(whereSeparator: \.isNewline) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("nameserver["), let colon = trimmed.firstIndex(of: ":") else { continue }
+            let value = trimmed[trimmed.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            guard let address = IPAddress(value), !address.isLoopback, !servers.contains(value) else { continue }
+            servers.append(value)
+        }
+        return servers
+    }
+
+    static func current(processRunner: ProcessRunning) async -> [String] {
+        let output = (try? await processRunner.run(executable: "scutil", arguments: ["--dns"], wait: true))?.stdout ?? ""
+        return parse(scutil: output)
+    }
+}

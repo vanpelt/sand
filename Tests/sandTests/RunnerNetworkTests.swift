@@ -38,10 +38,13 @@ final class FakeVMHost: ProcessRunning, @unchecked Sendable {
     var booted = false
     var tartRunState = LiveHandleState()
     var tartRun: LiveHandleState { lock.withLock { tartRunState } }
-    let tunnel = LiveHandleState()
+    private var tunnelState = LiveHandleState()
+    var tunnel: LiveHandleState { lock.withLock { tunnelState } }
     /// When set, every `tart run` exits at once with this stderr (a dead network backend).
     var tartExitStderr: String?
     var tartRunArguments: [[String]] = []
+    /// When set, the inspection-CA install prints this instead of the OK marker.
+    var inspectionInstallOutput: String?
 
     func run(executable: String, arguments: [String], wait: Bool) async throws -> ProcessResult? {
         let ok = ProcessResult(stdout: "", stderr: "", exitCode: 0)
@@ -72,16 +75,23 @@ final class FakeVMHost: ProcessRunning, @unchecked Sendable {
             let command = arguments.last ?? ""
             lock.withLock { executed.append(command) }
             if command.contains(GuestInspectionTrust.okMarker) {
-                return ProcessResult(stdout: "\(GuestInspectionTrust.okMarker)\n", stderr: "", exitCode: 0)
+                let output = lock.withLock { inspectionInstallOutput } ?? "\(GuestInspectionTrust.okMarker)\n"
+                return ProcessResult(stdout: output, stderr: "", exitCode: 0)
             }
             if command.contains("SAND_TUNNEL_OK") {
                 return ProcessResult(stdout: tunnelReady ? "SAND_TUNNEL_OK\n" : "", stderr: "", exitCode: 0)
             }
             if command.contains("SANDPROBE") {
                 let overrides = lock.withLock { probeOverrides }
-                let ids = ["N1", "N2", "N3a", "N3b", "N3c", "N4a", "N4b", "N5"]
-                var lines = ids.map { "SANDPROBE \($0) \(overrides[$0] ?? "CLOSED x")" }
-                lines.append("SANDPROBE P1 \(overrides["P1"] ?? "OK http=200")")
+                // Answer every probe line the verifier script asked for.
+                let verbs: Set<String> = ["tcp", "dnsq", "v6", "proxied", "denied", "routed", "routed6"]
+                var ids: [String] = []
+                for line in command.split(separator: "\n") {
+                    let fields = line.split(separator: " ")
+                    guard fields.count >= 2, verbs.contains(String(fields[0])), fields[1].first?.isUppercase == true else { continue }
+                    ids.append(String(fields[1]))
+                }
+                let lines = ids.map { id in "SANDPROBE \(id) \(overrides[id] ?? (id == "P1" ? "OK http=200" : "CLOSED x"))" }
                 return ProcessResult(stdout: lines.joined(separator: "\n"), stderr: "", exitCode: 0)
             }
         }
@@ -105,9 +115,14 @@ final class FakeVMHost: ProcessRunning, @unchecked Sendable {
             return state.handle()
         }
         if arguments.contains("-N") {
-            lock.withLock { started.append("tunnel") }
-            if tunnelExitsImmediately { tunnel.finish() }
-            return tunnel.handle()
+            // A fresh ssh -R per VM, like the real tunnel.
+            let state = LiveHandleState()
+            lock.withLock {
+                started.append("tunnel")
+                tunnelState = state
+            }
+            if tunnelExitsImmediately { state.finish() }
+            return state.handle()
         }
         lock.withLock { started.append(arguments.last ?? "") }
         return ProcessHandle(waitAsync: { ProcessResult(stdout: "", stderr: "", exitCode: 0) }, terminate: {})
@@ -169,6 +184,8 @@ func dependencies(
     )
     deps.watchdogInterval = 0.05
     deps.tunnelReadyTimeout = 1
+    deps.ipForwarding = { IPForwardingState(ipv4: 0, ipv6: 0) }
+    deps.bridgeAddresses = { _ in [IPAddress("192.168.64.1")!] }
     return deps
 }
 
@@ -242,9 +259,13 @@ func makeRunner(host: ProcessRunning, network: RunnerNetworkDependencies, run: S
         let host = FakeVMHost()
         let routes = RouteInspector(netstatOutput: "192.168.64/24      link#31            UCS                 utun9")
         let recorder = AuditRecorder()
-        let runner = makeRunner(host: host, network: dependencies(host: host, proxy: FakeProxy(), routes: routes, recorder: recorder))
+        let runner = makeRunner(host: host, network: dependencies(host: host, proxy: FakeProxy(), routes: routes, recorder: recorder), policy: NetworkConfig(selection: .profile(.github), maxEnforcementFailures: 2))
         await #expect(throws: NetworkEnforcementError.self) { try await runner.run() }
-        #expect(host.clones == 3)
+        // Three recreations per attempt, and the repeated overlap counts toward the limit (exit 78), not forever.
+        #expect(host.clones == 6)
+        let failed = recorder.events.filter { $0.name == "network.enforcement.failed" }
+        #expect(failed.map { $0.fields["reason"] } == ["subnet-overlap", "subnet-overlap"])
+        #expect(failed.last?.fields["final"] == "true")
         #expect(host.lock.withLock { host.started }.filter { $0 == "tunnel" }.isEmpty)
     }
 

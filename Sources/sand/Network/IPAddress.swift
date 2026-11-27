@@ -49,6 +49,29 @@ enum IPAddress: Hashable, Sendable, CustomStringConvertible {
         return false
     }
 
+    /// 127/8 or ::1.
+    var isLoopback: Bool {
+        switch self {
+        case let .v4(value): return value >> 24 == 127
+        case let .v6(bytes): return bytes[0..<15].allSatisfy { $0 == 0 } && bytes[15] == 1
+        }
+    }
+
+    /// fe80::/10.
+    var isLinkLocalV6: Bool {
+        guard case let .v6(bytes) = self else { return false }
+        return bytes[0] == 0xfe && bytes[1] & 0xc0 == 0x80
+    }
+
+    /// getifaddrs on macOS embeds the interface index in bytes 2-3 of a
+    /// link-local address (KAME); clear it so the address prints as fe80::...
+    var withoutEmbeddedScope: IPAddress {
+        guard isLinkLocalV6, case var .v6(bytes) = self else { return self }
+        bytes[2] = 0
+        bytes[3] = 0
+        return .v6(bytes)
+    }
+
     /// For an IPv4-mapped IPv6 address (::ffff:a.b.c.d) returns the IPv4 form.
     var unwrappedIPv4Mapped: IPAddress? {
         guard case let .v6(bytes) = self,

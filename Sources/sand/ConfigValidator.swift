@@ -191,8 +191,8 @@ final class ConfigValidator {
             if network.backend != nil {
                 error("vm.run.network.backend applies to profiles only; mode \(network.mode?.rawValue ?? "") always uses softnet (or shared NAT).")
             }
-            if network.hostListeners != nil || !network.acceptedHostListeners.isEmpty || network.tlsInspection != nil {
-                error("vm.run.network hostListeners, acceptedHostListeners and tlsInspection require a profile, not mode.")
+            if network.hostListeners != nil || !network.acceptedHostListeners.isEmpty || network.tlsInspection != nil || network.ipForwarding != nil {
+                error("vm.run.network hostListeners, acceptedHostListeners, tlsInspection and ipForwarding require a profile, not mode.")
             }
         }
         if network.profile == .offline, network.tlsInspection != nil {
@@ -210,6 +210,12 @@ final class ConfigValidator {
         }
         if network.backendChoice == .softnet, network.profile != nil, network.hostListeners != nil || !network.acceptedHostListeners.isEmpty {
             warning("vm.run.network hostListeners/acceptedHostListeners only apply to the hostOnly backend; softnet already blocks guest access to host services.")
+        }
+        if network.backendChoice == .softnet, network.profile != nil, network.ipForwarding != nil {
+            warning("vm.run.network.ipForwarding only applies to the hostOnly backend; softnet filters guest packets before they reach the host's routing.")
+        }
+        if network.ipForwarding == .accept, network.backendChoice != .softnet {
+            warning("vm.run.network.ipForwarding: accept runs hostOnly VMs while host IP forwarding is on: a job with root in the guest can route through the host to anything the host forwards to with a return path (for example a tailnet resolver or a NATing VPN), outside the proxy and the audit log.")
         }
         if network.hostListeners == .warn, !network.acceptedHostListeners.isEmpty {
             warning("vm.run.network.acceptedHostListeners has no effect with hostListeners: warn (every listener is only reported).")

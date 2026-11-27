@@ -149,7 +149,8 @@ struct Run: AsyncParsableCommand {
                 logLevel: level,
                 logSink: logSink,
                 audit: NetworkAudit(logger: Logger(label: "network.\(logLabel)", minimumLevel: level, sink: logSink), file: auditFile),
-                inspectionCAs: inspectionCAs[policies[index].1.policyHash] ?? []
+                inspectionCAs: inspectionCAs[policies[index].1.policyHash] ?? [],
+                pinnedBackend: policies[index].1.backend
             )
             runners.append(runner)
         }

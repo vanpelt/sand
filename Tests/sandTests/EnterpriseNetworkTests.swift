@@ -76,7 +76,7 @@ private func issues(_ network: NetworkConfig) -> [ConfigValidationIssue] {
         let trust = try NetworkConfig(selection: .profile(.github), tlsInspection: .trustHostCA).compile()
         let deny = try NetworkConfig(selection: .profile(.github), hostListeners: .deny).compile()
         #expect(Set([hostOnly.policyHash, softnet.policyHash, trust.policyHash, deny.policyHash]).count == 4)
-        #expect(hostOnly.explain().contains { $0.contains("no peer-VM isolation") })
+        #expect(hostOnly.explain().contains { $0.contains("does not guarantee peer-VM isolation") })
     }
 
     @Test func allowedCIDRsNeedExplicitSoftnet() {
@@ -578,5 +578,6 @@ struct FakeTrustStore: HostTrustStore {
         #expect(policy.tartArguments == ["--net-host"])
         #expect(policy.options.hostListeners == .deny)
         #expect(policy.options.tlsInspection == .trustHostCA)
+        #expect(policy.options.ipForwarding == .deny)
     }
 }

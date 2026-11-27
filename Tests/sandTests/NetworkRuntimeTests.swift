@@ -47,11 +47,13 @@ struct FakeFileSystem: PreflightFileSystem {
     var paths: [String: String] = ["tart": "/opt/homebrew/bin/tart", "softnet": "/opt/homebrew/bin/softnet", "ssh": "/usr/bin/ssh", "sshpass": "/opt/homebrew/bin/sshpass"]
     var owner: (uid: UInt32, mode: UInt16)? = (0, UInt16(S_ISUID) | 0o755)
     var free: Int64? = 100_000_000_000
+    var sysctls: [String: Int] = [IPForwardingState.ipv4Name: 0, IPForwardingState.ipv6Name: 0]
 
     func which(_ command: String) -> String? { paths[command] }
     func realpath(_ path: String) -> String { path.replacingOccurrences(of: "/opt/homebrew/bin", with: "/opt/homebrew/Cellar/softnet/0.26.0/bin") }
     func ownerAndMode(_ path: String) -> (uid: UInt32, mode: UInt16)? { owner }
     func freeBytes(atPath path: String) -> Int64? { free }
+    func sysctlInt(_ name: String) -> Int? { sysctls[name] }
 }
 
 struct FakeHostProbe: HostEgressProbing {

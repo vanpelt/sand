@@ -114,13 +114,20 @@ struct NetworkCommand: AsyncParsableCommand {
             let routes = await RouteInspector.current(processRunner: SystemProcessRunner())
             let github = (try? await SystemHostResolver().resolve("github.com")) ?? []
             let targets = GuestEgressVerifier.StrictTargets.derive(facts: facts, routes: routes)
+            // hostOnly: include the adversarial routed probes the runner adds.
+            let routed = hostGateway == nil ? nil : GuestEgressVerifier.RoutedTargets(
+                resolvers: await HostDNSServers.current(processRunner: SystemProcessRunner()),
+                tunnelTargets: targets.tunnelTargets,
+                forwardingAccepted: false
+            )
             let verifier = GuestEgressVerifier(
                 level: level,
                 directGitHubAddress: github.first(where: \.isIPv4)?.description ?? "140.82.112.3",
                 strictTargets: targets,
                 expectsProxy: !noProxy,
                 backend: hostGateway == nil ? .softnet : .hostOnly,
-                hostGateway: hostGateway
+                hostGateway: hostGateway,
+                routed: routed
             )
             print(verifier.script)
         }
@@ -128,7 +135,7 @@ struct NetworkCommand: AsyncParsableCommand {
 
     struct Listeners: AsyncParsableCommand {
         static let configuration = CommandConfiguration(
-            abstract: "List host services a hostOnly VM could reach on the host-only bridge (what the post-boot check reports)."
+            abstract: "List host services a hostOnly VM could reach (bound to all interfaces or to any non-loopback host address; what the post-boot check reports)."
         )
 
         @Option(help: "The VM's IP (to find the bridge), e.g. from `tart ip VM`.")
@@ -144,8 +151,10 @@ struct NetworkCommand: AsyncParsableCommand {
             if let bridgeIp, let address = IPAddress(bridgeIp) {
                 bridge.append(address)
             }
-            print("bridge addresses: \(bridge.isEmpty ? "(none; wildcard listeners only)" : bridge.map(\.description).joined(separator: ", "))")
-            let result = await HostListenerInspector(processRunner: SystemProcessRunner()).inspect(bridgeAddresses: bridge)
+            print("bridge addresses: \(bridge.isEmpty ? "(none)" : bridge.map(\.description).joined(separator: ", "))")
+            // A guest that routes via the bridge reaches every non-loopback host address (weak host).
+            let reachable = HostListenerInspector.reachableAddresses(bridge: bridge, host: HostFacts.current().interfaceAddresses)
+            let result = await HostListenerInspector(processRunner: SystemProcessRunner()).inspect(bridgeAddresses: reachable)
             for listener in result.listeners {
                 print("  \(listener)")
             }

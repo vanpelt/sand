@@ -7,9 +7,10 @@ enum SandBuildInfo {
 
 /// How the guest's direct egress is removed.
 enum EnforcementBackend: String, Sendable, Equatable, CaseIterable {
-    /// `tart run --net-host`: a host-only vmnet network with no route off the
-    /// host. Needs no root. Host services bound to the bridge (or to all
-    /// interfaces) stay reachable, and VMs on the bridge can reach each other.
+    /// `tart run --net-host`: a host-only vmnet network. Needs no root. The guest
+    /// gets no default gateway, but a guest with root can route via the host's
+    /// bridge address, so host IP forwarding must be off (preflight P11). Host
+    /// services bound to any non-loopback host address stay reachable.
     case hostOnly
     /// Softnet deny-all plus a host-SSH allow. Needs a privileged softnet; adds
     /// host-service and peer-VM isolation.
@@ -23,6 +24,7 @@ struct NetworkPolicy: Sendable, Equatable {
         var hostListeners: NetworkConfig.HostListenerPolicy = .warn
         var acceptedHostListeners: [HostListenerPattern] = []
         var tlsInspection: NetworkConfig.TLSInspectionMode = .fail
+        var ipForwarding: NetworkConfig.IPForwardingPolicy = .deny
         var maxEnforcementFailures: Int = NetworkConfig.defaultMaxEnforcementFailures
     }
 
@@ -133,6 +135,7 @@ struct NetworkPolicy: Sendable, Equatable {
         }
         if backend == .hostOnly {
             canonical["hostListeners"] = [options.hostListeners.rawValue] + options.acceptedHostListeners.map(\.description).sorted()
+            canonical["ipForwarding"] = [options.ipForwarding.rawValue]
         }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
@@ -150,9 +153,10 @@ struct NetworkPolicy: Sendable, Equatable {
         ]
         switch backend {
         case .hostOnly:
-            lines.append("enforcement backend: hostOnly (tart --net-host; no root; no route off the host)")
+            lines.append("enforcement backend: hostOnly (tart --net-host; no root; no route off the host while host IP forwarding is off)")
+            lines.append("host IP forwarding: \(options.ipForwarding.rawValue)" + (options.ipForwarding == .accept ? " (WARNING: a guest with root can route through the host to whatever the host forwards to)" : " (preflight fails and running VMs stop while it is on)"))
             lines.append("host listeners on the VM bridge: \(options.hostListeners.rawValue)" + (options.acceptedHostListeners.isEmpty ? "" : " (accepted: \(options.acceptedHostListeners.map(\.description).joined(separator: ", ")))"))
-            lines.append("note: hostOnly has no peer-VM isolation; VMs on the host-only bridge can reach each other (use backend: softnet for that)")
+            lines.append("note: hostOnly does not guarantee peer-VM isolation; VMs that share a host-only bridge can reach each other (use backend: softnet for that)")
         case .softnet:
             lines.append("enforcement backend: softnet (privileged softnet binary required)")
         case nil:
