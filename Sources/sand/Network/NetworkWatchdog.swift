@@ -16,7 +16,7 @@ actor NetworkWatchdog {
     }
 
     private let components: Components
-    private let interval: TimeInterval
+    nonisolated let interval: TimeInterval
     private let processRunner: ProcessRunning
     private let onLost: @Sendable (String) async -> Void
     private var task: Task<Void, Never>?
@@ -38,7 +38,7 @@ actor NetworkWatchdog {
                     await self.fire(lost)
                     return
                 }
-                try? await Task.sleep(nanoseconds: UInt64(max(0.05, await self.interval) * 1_000_000_000))
+                try? await Task.sleep(nanoseconds: UInt64(max(0.05, self.interval) * 1_000_000_000))
             }
         }
     }

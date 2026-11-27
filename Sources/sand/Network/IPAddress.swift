@@ -64,7 +64,7 @@ enum IPAddress: Hashable, Sendable, CustomStringConvertible {
             guard inet_ntop(AF_INET6, &address, &buffer, socklen_t(buffer.count)) != nil else {
                 return "::"
             }
-            return String(cString: buffer)
+            return String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
         }
     }
 
