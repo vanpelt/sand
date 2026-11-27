@@ -242,7 +242,8 @@ struct Runner: Sendable {
                     throw RunnerError.missingGitHub
                 }
                 logger.info("run github provisioner")
-                let token = try await github.runnerRegistrationToken()
+                let credentials = try await github.runnerRegistrationCredentials()
+                let token = credentials.runnerToken
                 let runnerName = GitHubProvisioner.uniqueRunnerName(base: githubConfig.runnerName)
                 logger.info("register runner as \(runnerName)")
                 await shutdownCoordinator.setDeregistration { [github, logger] in
@@ -254,7 +255,7 @@ struct Runner: Sendable {
                         logger.warning("failed to deregister runner \(runnerName): \(String(describing: error))")
                     }
                 }
-                try await installRunnerTarball(ssh: ssh)
+                try await installRunnerTarball(ssh: ssh, authToken: credentials.installationToken)
                 let commands = provisioner.script(
                     config: githubConfig,
                     runnerName: runnerName,
@@ -349,13 +350,13 @@ struct Runner: Sendable {
         )
     }
 
-    private func installRunnerTarball(ssh: SSHClient) async throws {
+    private func installRunnerTarball(ssh: SSHClient, authToken: String) async throws {
         let platform = try await resolveRunnerPlatform(ssh: ssh)
         let directory = config.vm.cache?.hostPath ?? Config.expandPath(Config.Cache.defaultHostPath)
         try ensureDirectoryExists(directory)
         let tarball: String
         do {
-            let release = try await runnerVersionResolver.latestRelease()
+            let release = try await runnerVersionResolver.latestRelease(authToken: authToken)
             let asset = RunnerAsset(platform: platform, version: release.version)
             guard let digest = release.digests[asset.name] else {
                 throw RunnerCacheError.missingDigest(asset.name)

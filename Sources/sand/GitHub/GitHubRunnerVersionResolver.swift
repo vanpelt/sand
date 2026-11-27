@@ -2,7 +2,7 @@ import Foundation
 
 enum GitHubRunnerVersionResolverError: Error {
     case invalidResponse
-    case httpStatus(Int)
+    case httpStatus(status: Int, message: String)
     case missingTag
     case invalidTag(String)
 }
@@ -15,22 +15,22 @@ struct RunnerRelease: Sendable, Equatable {
 actor GitHubRunnerVersionResolver: Sendable {
     static let refreshInterval: TimeInterval = 86_400
 
-    private let session: URLSession
+    private let session: URLSessionProtocol
     private var cached: (release: RunnerRelease, fetchedAt: Date)?
     private var inFlight: Task<RunnerRelease, Error>?
 
-    init(session: URLSession = .shared) {
+    init(session: URLSessionProtocol = URLSession.shared) {
         self.session = session
     }
 
-    func latestRelease() async throws -> RunnerRelease {
+    func latestRelease(authToken: String? = nil) async throws -> RunnerRelease {
         if let cached, Date().timeIntervalSince(cached.fetchedAt) < Self.refreshInterval {
             return cached.release
         }
         if let inFlight {
             return try await inFlight.value
         }
-        let task = Task { try await fetchLatestRelease() }
+        let task = Task { try await fetchLatestRelease(authToken: authToken) }
         inFlight = task
         defer {
             inFlight = nil
@@ -47,19 +47,30 @@ actor GitHubRunnerVersionResolver: Sendable {
         }
     }
 
-    private func fetchLatestRelease() async throws -> RunnerRelease {
+    private func fetchLatestRelease(authToken: String?) async throws -> RunnerRelease {
         guard let url = URL(string: "https://api.github.com/repos/actions/runner/releases/latest") else {
             throw GitHubRunnerVersionResolverError.invalidResponse
         }
         var request = URLRequest(url: url)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("sand", forHTTPHeaderField: "User-Agent")
+        if let authToken, !authToken.isEmpty {
+            request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
+        }
         let (data, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
             throw GitHubRunnerVersionResolverError.invalidResponse
         }
         guard (200..<300).contains(httpResponse.statusCode) else {
-            throw GitHubRunnerVersionResolverError.httpStatus(httpResponse.statusCode)
+            let responseMessage = (try? JSONDecoder().decode(GitHubAPIError.self, from: data))?.message
+                ?? "GitHub did not provide an error message"
+            let remaining = httpResponse.value(forHTTPHeaderField: "X-RateLimit-Remaining")
+            let reset = httpResponse.value(forHTTPHeaderField: "X-RateLimit-Reset")
+            let rateLimit = remaining.map { " (rate-limit remaining: \($0)" + (reset.map { ", reset: \($0)" } ?? "") + ")" } ?? ""
+            throw GitHubRunnerVersionResolverError.httpStatus(
+                status: httpResponse.statusCode,
+                message: responseMessage + rateLimit
+            )
         }
         return try Self.parseRelease(data)
     }
@@ -121,6 +132,10 @@ actor GitHubRunnerVersionResolver: Sendable {
             }
         }
         return false
+    }
+
+    private struct GitHubAPIError: Decodable {
+        let message: String
     }
 
     private struct LatestRelease: Decodable {
