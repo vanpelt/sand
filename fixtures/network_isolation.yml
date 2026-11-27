@@ -1,0 +1,20 @@
+# Prototype-only configuration: use a real isolated proxy endpoint before running.
+runners:
+  - name: restricted-prototype
+    vm:
+      source:
+        type: local
+        name: golden
+      mounts: []
+      run:
+        noGraphics: true
+        noClipboard: true
+        nested: false
+        network:
+          mode: restricted
+          allowCIDRs:
+            - 10.42.10.25/32
+    provisioner:
+      type: script
+      config:
+        run: echo "network policy prototype"

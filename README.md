@@ -98,6 +98,12 @@ vm:
 
 For `local` sources sand skips the registry pull and clones the named VM directly (`tart clone <name> <ephemeral>`), so the VM must already exist in `~/.tart/vms`.
 
+### Experimental VM network isolation
+
+Sand supports opt-in Softnet isolation and a restricted IPv4 egress mode. The
+restricted mode is a prototype and requires a separately configured egress
+proxy for GitHub Actions connectivity. See [network isolation prototype](docs/network-isolation.md).
+
 ### GitHub Actions setup
 
 1) Create a GitHub App and grant `Self-hosted runners` permission set to `Read & Write` at the organization level. https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app

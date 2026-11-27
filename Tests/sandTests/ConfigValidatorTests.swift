@@ -206,6 +206,30 @@ final class ConfigValidatorTests: XCTestCase {
             message: "runner runner-1: provisioner.config.runnerGroup requires organization-level registration; remove provisioner.config.repository."
         )))
     }
+
+    func testRestrictedNetworkRequiresFailClosedSettings() {
+        let network = NetworkPolicy(mode: .restricted, allowCIDRs: ["0.0.0.0/0", "10.1.2.3/32"])
+        let vm = Config.VM(
+            source: Config.VMSource(type: .local, image: nil, name: "golden"),
+            hardware: nil,
+            mounts: [Config.DirectoryMount(hostPath: "/tmp", name: "shared", mode: .rw)],
+            cache: nil,
+            run: Config.RunOptions(noGraphics: true, noClipboard: false, nested: true, network: network),
+            diskSizeGb: nil,
+            ssh: .standard
+        )
+        let runner = Config.RunnerConfig(
+            name: "secure-vm", vm: vm,
+            provisioner: .init(type: .script, script: .init(run: "true"), github: nil),
+            preRun: nil, postRun: nil, stopAfter: nil, healthCheck: nil
+        )
+        let messages = ConfigValidator().validate(Config(runners: [runner])).map(\.message).joined(separator: "\n")
+        XCTAssertTrue(messages.contains("prefix /24 through /32"))
+        XCTAssertTrue(messages.contains("noClipboard: true"))
+        XCTAssertTrue(messages.contains("nested: false"))
+        XCTAssertTrue(messages.contains("does not permit host directory mounts"))
+    }
+
     func testGitHubKeySourceValidation() throws {
         let keyURL = try writeTempFile(contents: "key", suffix: ".pem")
         func issues(path: String?, label: String?) -> [ConfigValidationIssue] {

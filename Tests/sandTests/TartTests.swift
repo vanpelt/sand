@@ -73,6 +73,47 @@ final class TartTests: XCTestCase {
         ))
     }
 
+
+    func testRunUsesSoftnetIsolation() throws {
+        let runner = MockProcessRunner()
+        let tart = makeTart(runner)
+        let options = Tart.RunOptions(
+            directoryMounts: [], noAudio: true, noGraphics: true,
+            noClipboard: true, nested: false,
+            network: NetworkPolicy(mode: .softnet)
+        )
+        _ = try tart.run(name: "ephemeral", options: options)
+        XCTAssertEqual(runner.startCalls.last?.arguments, [
+            "run", "ephemeral", "--net-softnet", "--no-graphics", "--no-audio", "--no-clipboard"
+        ])
+    }
+
+    func testRunUsesRestrictedDefaultDenyBeforeBoot() throws {
+        let runner = MockProcessRunner()
+        let tart = makeTart(runner)
+        let options = Tart.RunOptions(
+            directoryMounts: [], noAudio: true, noGraphics: true,
+            noClipboard: true, nested: false,
+            network: NetworkPolicy(mode: .restricted, allowCIDRs: ["10.42.10.25/32", "10.42.11.0/24"])
+        )
+        _ = try tart.run(name: "ephemeral", options: options)
+        XCTAssertEqual(runner.startCalls.last?.arguments, [
+            "run", "ephemeral", "--net-softnet", "--net-softnet-block=0.0.0.0/0",
+            "--net-softnet-allow=10.42.10.25/32,10.42.11.0/24",
+            "--no-graphics", "--no-audio", "--no-clipboard"
+        ])
+    }
+
+    func testNetworkCIDRValidationRejectsBroadAndMalformedRules() {
+        for value in ["0.0.0.0/0", "0.0.0.0/1", "10.0.0.0/8", "@host",
+                      "github.com", "::/0", "192.168.1.1/33", "999.1.2.3/32",
+                      "10.01.1.1/32", "10.0.0.1", "10.0.0.1/24,127.0.0.1/32"] {
+            XCTAssertFalse(NetworkPolicy.isAllowedCIDR(value), value)
+        }
+        XCTAssertTrue(NetworkPolicy.isAllowedCIDR("10.42.10.25/32"))
+        XCTAssertTrue(NetworkPolicy.isAllowedCIDR("192.168.1.0/24"))
+    }
+
     func testSetArgs() async throws {
         let runner = MockProcessRunner()
         let tart = makeTart(runner)
