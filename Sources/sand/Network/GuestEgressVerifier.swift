@@ -40,12 +40,15 @@ struct GuestEgressVerifier: Sendable {
     let directGitHubAddress: String
     let strictTargets: StrictTargets
     let proxyPort: Int
+    /// False for profile offline: there is no proxy, so only negative probes run.
+    let expectsProxy: Bool
 
-    init(level: VerifyLevel, directGitHubAddress: String, strictTargets: StrictTargets = StrictTargets(), proxyPort: Int = NetworkPolicy.guestProxyPort) {
+    init(level: VerifyLevel, directGitHubAddress: String, strictTargets: StrictTargets = StrictTargets(), proxyPort: Int = NetworkPolicy.guestProxyPort, expectsProxy: Bool = true) {
         self.level = level
         self.directGitHubAddress = directGitHubAddress
         self.strictTargets = strictTargets
         self.proxyPort = proxyPort
+        self.expectsProxy = expectsProxy
     }
 
     var probes: [Probe] {
@@ -60,8 +63,10 @@ struct GuestEgressVerifier: Sendable {
             Probe(id: "N4a", expectation: .closedUDP, summary: "DNS via gateway", command: "dnsq N4a \"$GW\""),
             Probe(id: "N4b", expectation: .closedUDP, summary: "DNS via 8.8.8.8", command: "dnsq N4b 8.8.8.8"),
             Probe(id: "N5", expectation: .closed, summary: "IPv6 internet", command: "v6 N5"),
-            Probe(id: "P1", expectation: .proxyWorks, summary: "api.github.com via proxy", command: "proxied P1 \(proxy) https://api.github.com/zen")
         ]
+        if expectsProxy {
+            probes.append(Probe(id: "P1", expectation: .proxyWorks, summary: "api.github.com via proxy", command: "proxied P1 \(proxy) https://api.github.com/zen"))
+        }
         guard level == .strict else { return probes }
         if let gateway = strictTargets.lanGateway {
             probes.append(Probe(id: "S1", expectation: .closed, summary: "host LAN gateway :80", command: "tcp S1 \(Self.quote(gateway)) 80"))
@@ -73,7 +78,9 @@ struct GuestEgressVerifier: Sendable {
             probes.append(Probe(id: "S5", expectation: .closed, summary: "host LAN address :7000", command: "tcp S5 \(Self.quote(address)) 7000"))
         }
         probes.append(Probe(id: "S6", expectation: .closedUDP, summary: "DNS via 1.1.1.1", command: "dnsq S6 1.1.1.1"))
-        probes.append(Probe(id: "S7", expectation: .closed, summary: "non-allowlisted host via proxy", command: "denied S7 \(proxy) https://example.com"))
+        if expectsProxy {
+            probes.append(Probe(id: "S7", expectation: .closed, summary: "non-allowlisted host via proxy", command: "denied S7 \(proxy) https://example.com"))
+        }
         for (index, target) in strictTargets.tunnelTargets.prefix(8).enumerated() {
             probes.append(Probe(id: "T\(index + 1)", expectation: .closed, summary: "VPN route :443", command: "tcp T\(index + 1) \(Self.quote(target)) 443"))
         }
@@ -117,7 +124,7 @@ struct GuestEgressVerifier: Sendable {
           if [ "$connect" = 403 ]; then echo "SANDPROBE $1 CLOSED connect=403"; else echo "SANDPROBE $1 OPEN connect=$connect"; fi
         }
         """#
-        return ([prelude] + probes.map(\.command)).joined(separator: "\n")
+        return ([prelude] + probes.map(\.command) + ["exit 0"]).joined(separator: "\n")
     }
 
     func evaluate(_ output: String) -> [ProbeResult] {

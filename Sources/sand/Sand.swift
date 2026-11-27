@@ -41,7 +41,46 @@ struct Run: AsyncParsableCommand {
             logger.warning("\(warning.message)")
         }
         let processRunner = SystemProcessRunner()
+        let auditFile = try logLevel.resolvedLogFile().map { try AuditFileSink(path: AuditFileSink.path(nextTo: $0)) }
+        let audit = NetworkAudit(logger: Logger(label: "network", minimumLevel: level, sink: logSink), file: auditFile)
+        // Fail closed before any clone: every distinct policy must pass the full preflight.
+        let policies = try NetworkStartup.compiledPolicies(config)
+        for (runnerName, policy) in policies {
+            audit.emit("network.policy.compiled", [
+                "runner": runnerName,
+                "hash": policy.policyHash,
+                "profile": policy.name.replacingOccurrences(of: "=", with: ":"),
+                "domains": String(policy.egress?.rules.count ?? 0),
+                "tart_args": policy.tartArguments.joined(separator: "|")
+            ])
+            logger.info("runner \(runnerName): effective network policy \(policy.name) (hash \(policy.policyHash.prefix(12)))")
+            if !policy.requiresSoftnet {
+                logger.warning("runner \(runnerName): network mode shared: VM has unrestricted host/LAN/VPN/corporate network reach")
+            }
+        }
+        let preflight = NetworkPreflight(processRunner: processRunner)
+        for (policy, checks) in await NetworkStartup.preflight(policies.map(\.1), preflight: preflight, includeSSHTools: !dryRun) {
+            let failures = NetworkPreflight.failures(checks)
+            for check in checks {
+                logger.log(check.status == .failed ? .error : (check.status == .warning ? .warning : .info), "network preflight (\(policy.name)) \(check.line)")
+            }
+            audit.emit(failures.isEmpty ? "network.preflight.ok" : "network.preflight.failed", level: failures.isEmpty ? .info : .error, [
+                "policy": policy.name.replacingOccurrences(of: "=", with: ":"),
+                "hash": policy.policyHash,
+                "failed": failures.map(\.name).joined(separator: ",")
+            ])
+            if !failures.isEmpty && !dryRun {
+                FileHandle.standardError.write(Data((NetworkStartup.failureMessage(failures) + "\n").utf8))
+                throw ExitCode(78) // EX_CONFIG: the host is not prepared for the configured policy
+            }
+        }
         if dryRun {
+            for (runnerName, policy) in policies {
+                print("runner \(runnerName):")
+                for line in policy.explain() {
+                    print("  \(line)")
+                }
+            }
             for (index, runnerConfig) in config.runners.enumerated() {
                 let runnerIndex = index + 1
                 let runnerName = runnerConfig.name
@@ -89,7 +128,8 @@ struct Run: AsyncParsableCommand {
                 vmName: runnerName,
                 logLabel: logLabel,
                 logLevel: level,
-                logSink: logSink
+                logSink: logSink,
+                audit: NetworkAudit(logger: Logger(label: "network.\(logLabel)", minimumLevel: level, sink: logSink), file: auditFile)
             )
             runners.append(runner)
         }

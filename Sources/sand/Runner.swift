@@ -10,6 +10,7 @@ struct Runner: Sendable {
     let shutdownCoordinator: VMShutdownCoordinator
     let control: RunnerControl
     let vmName: String
+    let network: RunnerNetworkDependencies
     private let logger: Logger
     private let vmLogger: Logger
     private let restartBackoff = RestartBackoff()
@@ -22,6 +23,7 @@ struct Runner: Sendable {
         case invalidMountHostPath(String)
         case vmExitedBeforeIP
         case unsupportedRunnerPlatform(String)
+        case sshNotReady
     }
 
     init(
@@ -36,7 +38,9 @@ struct Runner: Sendable {
         vmName: String,
         logLabel: String,
         logLevel: LogLevel,
-        logSink: LogFileSink?
+        logSink: LogFileSink?,
+        network: RunnerNetworkDependencies? = nil,
+        audit: NetworkAudit? = nil
     ) {
         self.tart = tart
         self.github = github
@@ -49,6 +53,8 @@ struct Runner: Sendable {
         self.vmName = vmName
         self.logger = Logger(label: "host.\(logLabel)", minimumLevel: logLevel, sink: logSink)
         self.vmLogger = Logger(label: "vm.\(logLabel)", minimumLevel: logLevel, sink: logSink)
+        let networkAudit = audit ?? NetworkAudit(logger: Logger(label: "network.\(logLabel)", minimumLevel: logLevel, sink: logSink))
+        self.network = network ?? .live(processRunner: tart.processRunner, audit: networkAudit)
     }
 
     func run() async throws {
@@ -95,6 +101,21 @@ struct Runner: Sendable {
         let vm = config.vm
         let provisionerConfig = config.provisioner
         let source = vm.source.resolvedSource
+        // Compile and re-check the network policy before touching any VM, so an
+        // unprepared host never clones or boots (and never falls back to shared NAT).
+        let networkPolicy = try vm.run.network.compile(sshPort: vm.ssh.port)
+        if networkPolicy.requiresSoftnet {
+            let failures = NetworkPreflight.failures(await network.preflight.perVM(policy: networkPolicy))
+            if !failures.isEmpty {
+                network.audit.emit("network.preflight.failed", level: .error, [
+                    "stage": "per-vm",
+                    "checks": failures.map(\.name).joined(separator: ",")
+                ])
+                throw NetworkEnforcementError.preflightFailed(failures)
+            }
+        } else {
+            network.audit.emit("network.shared.unrestricted", level: .warning, ["vm": name])
+        }
         if vm.source.type == .oci {
             logger.info("prepare source \(source)")
             do {
@@ -116,6 +137,77 @@ struct Runner: Sendable {
         }
         // Before cloning, so a bad mount path doesn't leave a cloned VM behind on every retry.
         let directoryMounts = try buildDirectoryMounts(vm: vm)
+        let runOptions = Tart.RunOptions(
+            directoryMounts: directoryMounts,
+            noAudio: vm.hardware?.audio == false,
+            noGraphics: vm.run.noGraphics,
+            noClipboard: vm.run.noClipboard,
+            nested: vm.run.nested,
+            rootDiskOpts: vm.run.rootDiskOpts,
+            network: networkPolicy
+        )
+        let session = VMNetworkSession(policy: networkPolicy, dependencies: network, processRunner: tart.processRunner, logger: logger)
+        var bootAttempt = 0
+        var booted: (tartRun: ProcessHandle, ip: String, ssh: SSHClient)?
+        while booted == nil {
+            bootAttempt += 1
+            guard let result = try await bootVM(name: name, source: source, vm: vm, runOptions: runOptions) else {
+                return
+            }
+            // softnet picks the VM subnet; if it collides with a host route (e.g. a
+            // VPN's 172.16/16 carrying the steered GitHub fronts), recreate the VM.
+            if let conflict = await session.subnetConflict(vmIP: result.ip) {
+                logger.warning("VM subnet conflict (attempt \(bootAttempt)/\(network.maxSubnetAttempts)): \(conflict); recreating VM")
+                await shutdownCoordinator.cleanup(reason: "VM subnet overlaps a host route")
+                if bootAttempt >= network.maxSubnetAttempts {
+                    throw NetworkEnforcementError.subnetOverlap(conflict)
+                }
+                continue
+            }
+            booted = result
+        }
+        guard let (tartRun, ip, ssh) = booted else { return }
+        let healthCheckState = HealthCheckState()
+        if networkPolicy.requiresSoftnet {
+            do {
+                try await session.establish(ssh: ssh, vmIP: ip)
+            } catch {
+                logger.error("\(String(describing: error)); destroying VM without registering a runner")
+                await session.teardown()
+                await shutdownCoordinator.cleanup(reason: "network enforcement not verified")
+                throw error
+            }
+        }
+        // From here until teardown, losing any enforcement component (or tart itself)
+        // ends the job: stop and delete the VM and deregister the runner at once.
+        await session.startWatchdog(tartRun: tartRun, vmIP: ip) { [logger, control, shutdownCoordinator] component in
+            guard await !shutdownCoordinator.isCleaningUp() else { return }
+            logger.error("network enforcement lost (\(component)); stopping VM")
+            await healthCheckState.markFailed(message: "network enforcement lost: \(component)")
+            await control.terminateProvisioning()
+            await shutdownCoordinator.cleanup(reason: "network enforcement lost: \(component)")
+        }
+        do {
+            if let env = session.guestEnv {
+                logger.info("configure guest proxy settings (usability only; enforcement is host-side)")
+                let result = try await execWithRetry(command: env.guestSetupCommand, ssh: ssh, stage: "guest proxy setup")
+                logIfNonEmpty(label: "guest proxy setup", text: result?.stdout ?? "")
+            }
+            try await runStages(
+                name: name, vm: vm, provisionerConfig: provisionerConfig, ssh: ssh,
+                healthCheckState: healthCheckState, egress: session.guestEnv
+            )
+        } catch {
+            await session.teardown()
+            await shutdownCoordinator.cleanup(reason: "runOnce failed")
+            throw error
+        }
+        await session.teardown()
+    }
+
+    /// Clone and boot the VM, then wait for its IP and SSH. Returns nil (after
+    /// scheduling a restart and cleaning up) when the VM never became reachable.
+    private func bootVM(name: String, source: String, vm: Config.VM, runOptions: Tart.RunOptions) async throws -> (tartRun: ProcessHandle, ip: String, ssh: SSHClient)? {
         // Leftover from a crash or a failed clone: tart clone refuses to overwrite it.
         do {
             try await tart.delete(name: name)
@@ -137,22 +229,6 @@ struct Runner: Sendable {
             await shutdownCoordinator.cleanup(reason: "apply VM config failed")
             throw error
         }
-        let networkPolicy: NetworkPolicy
-        do {
-            networkPolicy = try vm.run.network.compile(sshPort: vm.ssh.port)
-        } catch {
-            await shutdownCoordinator.cleanup(reason: "network policy invalid")
-            throw error
-        }
-        let runOptions = Tart.RunOptions(
-            directoryMounts: directoryMounts,
-            noAudio: vm.hardware?.audio == false,
-            noGraphics: vm.run.noGraphics,
-            noClipboard: vm.run.noClipboard,
-            nested: vm.run.nested,
-            rootDiskOpts: vm.run.rootDiskOpts,
-            network: networkPolicy
-        )
         logRunOptions(name: name, options: runOptions)
         logger.info("boot VM \(name)")
         let tartRun: ProcessHandle
@@ -174,17 +250,29 @@ struct Runner: Sendable {
             logger.warning("resolve VM IP failed; scheduling restart: \(String(describing: error))")
             await scheduleRestart(reason: .ipNotReady)
             await shutdownCoordinator.cleanup(reason: "resolve VM IP failed")
-            return
+            return nil
         }
         logger.info("VM IP \(ip)")
         await logVMStatusAfterBoot(name: name)
-        let ssh = SSHClient(processRunner: tart.processRunner, host: ip, config: vm.ssh)
-        guard await waitForSSH(ssh: ssh, tartRun: tartRun) else {
+        let initial = SSHClient(processRunner: tart.processRunner, host: ip, config: vm.ssh)
+        // Under softnet the first lease can be stale; only an IP that answers SSH is trusted.
+        guard let ssh = await waitForSSH(ssh: initial, tartRun: tartRun, refreshIP: runOptions.network.requiresSoftnet) else {
             logger.debug("waitForSSH failed; scheduling restart")
             await scheduleRestart(reason: .sshNotReady)
             await shutdownCoordinator.cleanup(reason: "ssh not ready")
-            return
+            return nil
         }
+        return (tartRun, ssh.host, ssh)
+    }
+
+    private func runStages(
+        name: String,
+        vm: Config.VM,
+        provisionerConfig: Config.Provisioner,
+        ssh: SSHClient,
+        healthCheckState: HealthCheckState,
+        egress: GuestEgressEnv?
+    ) async throws {
         if let preRun = config.preRun {
             logger.info("run preRun")
             logScript(preRun)
@@ -196,7 +284,7 @@ struct Runner: Sendable {
                 }
                 logger.info("preRun finished")
             } catch {
-                if await handleStageFailure(error, stage: "preRun", healthCheckState: nil) {
+                if await handleStageFailure(error, stage: "preRun", healthCheckState: healthCheckState) {
                     await shutdownCoordinator.cleanup(reason: "preRun failed")
                     return
                 }
@@ -204,7 +292,6 @@ struct Runner: Sendable {
                 throw error
             }
         }
-        let healthCheckState = HealthCheckState()
         logger.debug("healthCheck task preparing (vm=\(name))")
         let healthCheckTask = startHealthCheck(
             healthCheck: config.healthCheck ?? .standard,
@@ -267,7 +354,8 @@ struct Runner: Sendable {
                 let commands = provisioner.script(
                     config: githubConfig,
                     runnerName: runnerName,
-                    runnerToken: token
+                    runnerToken: token,
+                    egress: egress
                 )
                 let outcome = await runProvisionerCommands(commands, ssh: ssh, healthCheckState: healthCheckState, secrets: [token])
                 switch outcome {
@@ -391,7 +479,8 @@ struct Runner: Sendable {
         return platform
     }
 
-    private func waitForSSH(ssh: SSHClient, tartRun: ProcessHandle) async -> Bool {
+    private func waitForSSH(ssh initial: SSHClient, tartRun: ProcessHandle, refreshIP: Bool) async -> SSHClient? {
+        var ssh = initial
         var attempt = 0
         var stoppedChecks = 0
         let maxRetries = ssh.config.connectMaxRetries
@@ -405,12 +494,12 @@ struct Runner: Sendable {
                 let statusErrorLabel = lastStatusError ?? "none"
                 let sshErrorLabel = lastSSHError ?? "none"
                 logger.warning("SSH not ready after \(maxRetries) attempts (lastStatus=\(statusLabel), statusError=\(statusErrorLabel), sshError=\(sshErrorLabel)), restarting VM")
-                return false
+                return nil
             }
             attempt += 1
             if await tartRun.hasExited() {
                 logger.error("Tart process exited before VM \(vmName) became SSH-ready; aborting startup")
-                return false
+                return nil
             }
             do {
                 let status = try await tart.status(name: vmName)
@@ -421,18 +510,18 @@ struct Runner: Sendable {
                     let reason = status == .missing ? "missing" : "stopped"
                     if status == .missing {
                         logger.warning("VM \(vmName) not running (\(reason)) while waiting for SSH (attempt \(attempt)), restarting VM")
-                        return false
+                        return nil
                     }
                     stoppedChecks += 1
                     if stoppedChecks >= 5 {
                         logger.warning("VM \(vmName) not running (\(reason)) after \(stoppedChecks) checks, restarting VM")
-                        return false
+                        return nil
                     }
                     logger.info("VM \(vmName) not running (\(reason)) while waiting for SSH (attempt \(attempt)), retrying")
                     do {
                         try await Task.sleep(nanoseconds: 1_000_000_000)
                     } catch {
-                        return false
+                        return nil
                     }
                     continue
                 }
@@ -445,10 +534,14 @@ struct Runner: Sendable {
                 stoppedChecks = 0
                 lastSSHError = nil
                 logger.info("SSH ready after \(attempt) attempt(s)")
-                return true
+                return ssh
             } catch {
                 lastSSHError = String(describing: error)
                 logger.debug("SSH checkConnection failed (attempt \(attempt)): \(String(describing: error))")
+                if refreshIP, attempt % 5 == 0, let fresh = try? await tart.ip(name: vmName, wait: 5), fresh != ssh.host {
+                    logger.warning("VM \(vmName) IP changed from \(ssh.host) to \(fresh) while waiting for SSH (stale lease); using the new address")
+                    ssh = SSHClient(processRunner: ssh.processRunner, host: fresh, config: ssh.config)
+                }
                 if let maxRetries {
                     logger.info("SSH not ready, retrying in 1s (attempt \(attempt)/\(maxRetries))")
                 } else {
@@ -457,7 +550,7 @@ struct Runner: Sendable {
                 do {
                     try await Task.sleep(nanoseconds: 1_000_000_000)
                 } catch {
-                    return false
+                    return nil
                 }
             }
         }

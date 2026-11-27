@@ -21,6 +21,14 @@ struct NetworkPolicy: Sendable, Equatable {
 
     let kind: Kind
     let softnet: SoftnetRuleSet?
+    /// Guest egress verification before registration (profiles only).
+    let verify: VerifyLevel
+
+    init(kind: Kind, softnet: SoftnetRuleSet?, verify: VerifyLevel = .off) {
+        self.kind = kind
+        self.softnet = softnet
+        self.verify = verify
+    }
 
     static let shared = NetworkPolicy(kind: .shared, softnet: nil)
 

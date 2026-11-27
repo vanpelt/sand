@@ -39,7 +39,15 @@ final class RunnerRetryTests: XCTestCase {
             tart: tart, github: nil, provisioner: GitHubProvisioner(), runnerVersionResolver: GitHubRunnerVersionResolver(),
             runnerCache: RunnerCache(), config: config,
             shutdownCoordinator: VMShutdownCoordinator(destroyer: VMDestroyer(tart: tart, logger: logger), logger: logger),
-            control: RunnerControl(), vmName: "slot", logLabel: "slot", logLevel: .critical, logSink: nil
+            control: RunnerControl(), vmName: "slot", logLabel: "slot", logLevel: .critical, logSink: nil,
+            network: RunnerNetworkDependencies(
+                preflight: NetworkPreflight(processRunner: ScriptedProcessRunner(responder: currentToolHelp), fileSystem: FakeFileSystem(), resolver: StaticHostResolver(table: ["github.com": [IPAddress("140.82.112.3")!]]), hostProbe: FakeHostProbe(), proxySelfTest: nil),
+                resolver: StaticHostResolver(table: [:]),
+                hostFacts: { HostFacts() },
+                routes: { RouteInspector(routes: []) },
+                makeProxy: { _, _, _ in FakeProxy() },
+                audit: .silent
+            )
         )
         let task = Task { try await runner.run() }
         // First clone at t=0, retry after the 1s backoff. Generous timeout for slow CI hosts.

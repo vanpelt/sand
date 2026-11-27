@@ -179,7 +179,7 @@ struct NetworkPreflight: Sendable {
             let missing = ["ssh", "sshpass"].filter { fileSystem.which($0) == nil }
             checks.append(missing.isEmpty
                 ? PreflightCheck("P6 ssh tools", .ok, "ssh and sshpass found (guest sshd TCP forwarding is verified after boot)")
-                : PreflightCheck("P6 ssh tools", .failed, "missing \(missing.joined(separator: ", "))", remediation: "brew install hudochenkov/sshpass/sshpass"))
+                : PreflightCheck("P6 ssh tools", .failed, "missing \(missing.joined(separator: ", "))", remediation: missing.contains("sshpass") ? "brew install hudochenkov/sshpass/sshpass" : nil))
         }
         checks.append(checkDisk())
         return checks

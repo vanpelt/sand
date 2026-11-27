@@ -19,6 +19,11 @@ actor VMShutdownCoordinator {
         logger.info("shutdown coordinator activated for VM \(name)")
     }
 
+    /// True once cleanup started or nothing is active (used to ignore expected teardown signals).
+    func isCleaningUp() -> Bool {
+        cleanupTask != nil || activeName == nil
+    }
+
     func setDeregistration(_ action: @escaping @Sendable () async -> Void) {
         deregistration = action
     }

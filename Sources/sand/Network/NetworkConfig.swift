@@ -178,7 +178,7 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
             let rules = [ssh] + allowCIDRs.map { SoftnetRule(direction: .outbound, proto: nil, target: .cidr($0), port: nil) }
             return NetworkPolicy(kind: .restricted(allowCIDRs), softnet: try .denyAll(allowing: rules))
         case .profile(.offline):
-            return NetworkPolicy(kind: .offline, softnet: try .denyAll(allowing: [ssh]))
+            return NetworkPolicy(kind: .offline, softnet: try .denyAll(allowing: [ssh]), verify: effectiveVerify)
         case .profile(.github):
             var rules = Set<DomainRule>()
             var presetNames = Set(presets.compactMap(EgressPreset.init(rawValue:)))
@@ -203,7 +203,7 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
                 verify: effectiveVerify,
                 extraCIDRs: allowedCIDRs
             )
-            return NetworkPolicy(kind: .egressProxy(egress), softnet: try .denyAll(allowing: [ssh] + direct))
+            return NetworkPolicy(kind: .egressProxy(egress), softnet: try .denyAll(allowing: [ssh] + direct), verify: effectiveVerify)
         }
     }
 

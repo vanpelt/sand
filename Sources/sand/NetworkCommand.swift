@@ -90,7 +90,19 @@ struct NetworkCommand: AsyncParsableCommand {
         var config: String = Config.defaultPath
 
         func run() async throws {
-            throw ValidationError("not implemented yet")
+            let loaded = try Config.load(path: config)
+            let policies = try NetworkStartup.compiledPolicies(loaded)
+            var failed = false
+            for (policy, checks) in await NetworkStartup.preflight(policies.map(\.1), preflight: NetworkPreflight(processRunner: SystemProcessRunner()), includeSSHTools: true) {
+                print("policy \(policy.name) (hash \(policy.policyHash.prefix(12))):")
+                for check in checks {
+                    print("  " + check.line.replacingOccurrences(of: "\n", with: "\n  "))
+                }
+                failed = failed || !NetworkPreflight.failures(checks).isEmpty
+            }
+            if failed {
+                throw ExitCode(1)
+            }
         }
     }
 }

@@ -51,6 +51,36 @@ struct Doctor: AsyncParsableCommand {
         let defaultPath = Config.expandPath(Config.defaultPath)
         report("- config at \(defaultPath)")
         issues.append(contentsOf: checkConfig(at: defaultPath))
+        report("- network isolation (softnet, privilege, GitHub egress, proxy self-test)")
+        issues.append(contentsOf: await checkNetwork(configPath: defaultPath, report: report))
+        return issues
+    }
+
+    /// Without a config the secure default (profile: github) is what `sand run` would enforce.
+    private func checkNetwork(configPath: String, report: (String) -> Void) async -> [ConfigValidationIssue] {
+        var policies: [NetworkPolicy] = []
+        if FileManager.default.fileExists(atPath: configPath), let config = try? Config.load(path: configPath),
+           let compiled = try? NetworkStartup.compiledPolicies(config) {
+            policies = compiled.map(\.1)
+        }
+        if policies.isEmpty, let secure = try? NetworkConfig.secureDefault.compile() {
+            policies = [secure]
+        }
+        var issues: [ConfigValidationIssue] = []
+        let preflight = NetworkPreflight(processRunner: SystemProcessRunner())
+        for (policy, checks) in await NetworkStartup.preflight(policies, preflight: preflight, includeSSHTools: false) {
+            for check in checks {
+                switch check.status {
+                case .ok:
+                    report("  ok \(policy.name) \(check.name): \(check.detail)")
+                case .warning:
+                    issues.append(.init(severity: .warning, message: "network (\(policy.name)) \(check.name): \(check.detail)"))
+                case .failed:
+                    let fix = check.remediation.map { "\n\($0)" } ?? ""
+                    issues.append(.init(severity: .error, message: "network (\(policy.name)) \(check.name): \(check.detail)\(fix)"))
+                }
+            }
+        }
         return issues
     }
 
