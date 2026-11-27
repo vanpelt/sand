@@ -63,9 +63,13 @@ struct SystemPreflightFileSystem: PreflightFileSystem {
         return (info.st_uid, info.st_mode)
     }
 
+    /// Space available to an unprivileged process right now (statfs f_bavail).
+    /// Not `volumeAvailableCapacityForImportantUsage`, which counts purgeable
+    /// space the OS may never free for a `tart clone`.
     func freeBytes(atPath path: String) -> Int64? {
-        let values = try? URL(fileURLWithPath: path).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-        return values?.volumeAvailableCapacityForImportantUsage
+        var info = statfs()
+        guard statfs(path, &info) == 0 else { return nil }
+        return Int64(info.f_bavail) * Int64(info.f_bsize)
     }
 }
 
@@ -129,7 +133,8 @@ private final class PreflightOnce: @unchecked Sendable {
 /// remediation text is for the user to run.
 struct NetworkPreflight: Sendable {
     static let softnetRemediation = """
-    One-time setup, run in your own terminal (sand never does this):
+    The softnet backend needs a privileged softnet. Either drop `backend: softnet`
+    (the default hostOnly backend needs no root), or do this one-time setup in your own terminal (sand never does this):
       sudo chown root:wheel "$(realpath "$(which softnet)")" && sudo chmod u+s "$(realpath "$(which softnet)")"
     `brew upgrade softnet` resets this; re-run it after upgrades. Alternative: a sudoers NOPASSWD rule
     for both /opt/homebrew/bin/softnet and its Cellar path. Softnet runs its setup as root and rewrites the
@@ -143,6 +148,8 @@ struct NetworkPreflight: Sendable {
     /// Optional in-process proxy self-test (P5); nil skips it.
     let proxySelfTest: (@Sendable (EgressPolicy) async -> [PreflightCheck])?
     let hostFacts: @Sendable () -> HostFacts
+    /// P10; nil skips TLS-inspection detection (tests). Production passes `.live`.
+    let tlsInspection: TLSInspectionDetector?
 
     init(
         processRunner: ProcessRunning,
@@ -150,9 +157,11 @@ struct NetworkPreflight: Sendable {
         resolver: HostResolving = SystemHostResolver(),
         hostProbe: HostEgressProbing = SystemHostEgressProbe(),
         proxySelfTest: (@Sendable (EgressPolicy) async -> [PreflightCheck])? = NetworkPreflight.liveProxySelfTest,
-        hostFacts: @escaping @Sendable () -> HostFacts = { HostFacts.current() }
+        hostFacts: @escaping @Sendable () -> HostFacts = { HostFacts.current() },
+        tlsInspection: TLSInspectionDetector? = nil
     ) {
         self.hostFacts = hostFacts
+        self.tlsInspection = tlsInspection
         self.processRunner = processRunner
         self.fileSystem = fileSystem
         self.resolver = resolver
@@ -164,19 +173,40 @@ struct NetworkPreflight: Sendable {
         checks.filter { $0.status == .failed }
     }
 
+    /// The production preflight: everything, including TLS-inspection detection.
+    static func live(processRunner: ProcessRunning) -> NetworkPreflight {
+        NetworkPreflight(processRunner: processRunner, tlsInspection: .live(processRunner: processRunner))
+    }
+
     /// Everything, for startup and `sand doctor`.
     func run(policy: NetworkPolicy, includeSSHTools: Bool = true) async -> [PreflightCheck] {
-        guard policy.requiresSoftnet else {
-            return [PreflightCheck("P8 network mode", .warning, "mode shared: VM has unrestricted host/LAN/VPN/corporate network reach")]
+        await runWithInspection(policy: policy, includeSSHTools: includeSSHTools).checks
+    }
+
+    /// Like `run`, plus the TLS-inspection report (whose CA certificates the
+    /// runner installs in the guest under `tlsInspection: trustHostCA`).
+    func runWithInspection(policy: NetworkPolicy, includeSSHTools: Bool = true) async -> (checks: [PreflightCheck], inspection: TLSInspectionReport?) {
+        guard policy.isIsolated else {
+            return ([PreflightCheck("P8 network mode", .warning, "mode shared: VM has unrestricted host/LAN/VPN/corporate network reach")], nil)
         }
         var checks: [PreflightCheck] = []
-        checks.append(contentsOf: await checkTart())
-        checks.append(contentsOf: await checkSoftnet())
+        var inspection: TLSInspectionReport?
+        checks.append(contentsOf: await checkTart(backend: policy.backend ?? .softnet))
+        if policy.usesSoftnet {
+            checks.append(contentsOf: await checkSoftnet())
+        } else {
+            checks.append(PreflightCheck("P3 softnet privilege", .ok, "not needed: the hostOnly backend runs without root"))
+        }
         if let egress = policy.egress {
             checks.append(checkDirectCIDROverlap(egress))
             checks.append(contentsOf: await checkHostEgress())
             if let proxySelfTest {
                 checks.append(contentsOf: await proxySelfTest(egress))
+            }
+            if let tlsInspection {
+                let report = await tlsInspection.detect(hosts: TLSInspectionDetector.probeHosts(for: egress))
+                inspection = report
+                checks.append(contentsOf: Self.inspectionChecks(report, mode: policy.options.tlsInspection))
             }
         }
         if includeSSHTools {
@@ -186,13 +216,75 @@ struct NetworkPreflight: Sendable {
                 : PreflightCheck("P6 ssh tools", .failed, "missing \(missing.joined(separator: ", "))", remediation: missing.contains("sshpass") ? "brew install hudochenkov/sshpass/sshpass" : nil))
         }
         checks.append(checkDisk())
+        return (checks, inspection)
+    }
+
+    /// P10: interception of the proxy's upstream TLS. Off: fail closed with the
+    /// list of hosts. trustHostCA: OK when every intercepting CA was exported.
+    static func inspectionChecks(_ report: TLSInspectionReport, mode: NetworkConfig.TLSInspectionMode) -> [PreflightCheck] {
+        var checks: [PreflightCheck] = []
+        if !report.unreachable.isEmpty {
+            let detail = report.unreachable.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value)" }.joined(separator: "; ")
+            checks.append(PreflightCheck("P10 TLS inspection probe", .warning, "could not inspect \(detail)"))
+        }
+        guard report.isIntercepted else {
+            checks.append(PreflightCheck("P10 TLS inspection", .ok, "no interception of upstream TLS (\(report.probed.count - report.unreachable.count) host(s) chain to Apple-shipped roots)"))
+            return checks
+        }
+        let hosts = report.interceptedHosts.joined(separator: ", ")
+        let authorities = report.authorities.isEmpty ? "an unexportable CA" : report.authoritySummary
+        switch mode {
+        case .fail:
+            checks.append(PreflightCheck(
+                "P10 TLS inspection", .failed,
+                "the host's upstream TLS is intercepted for \(hosts) (issuer: \(authorities)); the guest does not trust that CA, so Actions jobs would fail TLS",
+                remediation: """
+                Either ask IT to exempt these hosts from TLS inspection: \(hosts)
+                (typically *.actions.githubusercontent.com, *.githubusercontent.com and the GitHub results *.blob.core.windows.net accounts),
+                or opt in to trusting the inspection CA in the guest: vm.run.network.tlsInspection: trustHostCA
+                (only the CA's public certificate is installed; its fingerprint is written to the audit log).
+                """
+            ))
+        case .trustHostCA:
+            if report.problems.isEmpty, !report.authorities.isEmpty {
+                checks.append(PreflightCheck("P10 TLS inspection", .ok, "interception for \(hosts); guest will trust \(report.authoritySummary)"))
+            } else {
+                checks.append(PreflightCheck(
+                    "P10 TLS inspection", .failed,
+                    "interception for \(hosts) but the CA cannot be trusted in the guest: \(report.problems.joined(separator: "; "))",
+                    remediation: "Ask IT to exempt these hosts from TLS inspection, or to install the inspection CA (public certificate) in /Library/Keychains/System.keychain."
+                ))
+            }
+        }
         return checks
+    }
+
+    /// What `backend: auto` means on this host: softnet when it is installed,
+    /// new enough and privileged; otherwise hostOnly (which needs no root).
+    func resolveBackend(_ config: NetworkConfig) async -> EnforcementBackend {
+        switch config.backendChoice {
+        case .hostOnly: return .hostOnly
+        case .softnet: return .softnet
+        case .auto:
+            let tart = await checkTart(backend: .softnet)
+            let softnet = await checkSoftnet()
+            let ready = (tart + softnet).allSatisfy { $0.status != .failed }
+            return ready ? .softnet : .hostOnly
+        }
+    }
+
+    /// Compiles a runner's policy, resolving `backend: auto` on this host.
+    func compile(_ config: NetworkConfig, sshPort: Int) async throws -> NetworkPolicy {
+        try config.compile(sshPort: sshPort, autoBackend: await resolveBackend(config))
     }
 
     /// Cheap re-check before every clone: privilege can be reset by `brew upgrade`.
     func perVM(policy: NetworkPolicy) async -> [PreflightCheck] {
-        guard policy.requiresSoftnet else { return [] }
-        var checks = [await checkSoftnetPrivilege()]
+        guard policy.isIsolated else { return [] }
+        var checks: [PreflightCheck] = []
+        if policy.usesSoftnet {
+            checks.append(await checkSoftnetPrivilege())
+        }
         if let egress = policy.egress {
             checks.append(checkDirectCIDROverlap(egress))
             do {
@@ -205,17 +297,25 @@ struct NetworkPreflight: Sendable {
         return checks
     }
 
-    func checkTart() async -> [PreflightCheck] {
+    func checkTart(backend: EnforcementBackend) async -> [PreflightCheck] {
         guard fileSystem.which("tart") != nil else {
             return [PreflightCheck("P1 tart", .failed, "tart not found in PATH", remediation: "brew install cirruslabs/cli/tart")]
         }
         let help = (try? await processRunner.run(executable: "tart", arguments: ["run", "--help"], wait: true))?.stdout ?? ""
         let version = ((try? await processRunner.run(executable: "tart", arguments: ["--version"], wait: true))?.stdout ?? "unknown")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard help.contains("--net-softnet-allow") else {
-            return [PreflightCheck("P1 tart", .failed, "tart \(version) does not support --net-softnet-allow", remediation: "brew upgrade cirruslabs/cli/tart")]
+        switch backend {
+        case .softnet:
+            guard help.contains("--net-softnet-allow") else {
+                return [PreflightCheck("P1 tart", .failed, "tart \(version) does not support --net-softnet-allow", remediation: "brew upgrade cirruslabs/cli/tart")]
+            }
+            return [PreflightCheck("P1 tart", .ok, "tart \(version) supports softnet rules")]
+        case .hostOnly:
+            guard help.contains("--net-host") else {
+                return [PreflightCheck("P1 tart", .failed, "tart \(version) does not support --net-host (host-only networking)", remediation: "brew upgrade cirruslabs/cli/tart")]
+            }
+            return [PreflightCheck("P1 tart", .ok, "tart \(version) supports --net-host (hostOnly backend, no root)")]
         }
-        return [PreflightCheck("P1 tart", .ok, "tart \(version) supports softnet rules")]
     }
 
     func checkSoftnet() async -> [PreflightCheck] {

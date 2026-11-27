@@ -1,33 +1,65 @@
 import Foundation
 
 /// Guest-side proxy settings. These are for usability only: enforcement is
-/// softnet deny-all on the host plus the host-side proxy, so a tool that
+/// the enforcement backend (hostOnly or softnet) plus the host-side proxy, so a tool that
 /// ignores them simply fails to connect.
 struct GuestEgressEnv: Sendable, Equatable {
     let proxyURL: String
     let noProxy: String
+    /// Set when the host's TLS-inspection CA is trusted in the guest
+    /// (`tlsInspection: trustHostCA`): point TLS clients at the combined bundle.
+    var trustsInspectionCA = false
 
     static let standard = GuestEgressEnv(
         proxyURL: "http://127.0.0.1:\(NetworkPolicy.guestProxyPort)",
         noProxy: "localhost,127.0.0.1,::1"
     )
 
+    func trustingInspectionCA() -> GuestEgressEnv {
+        var copy = self
+        copy.trustsInspectionCA = true
+        return copy
+    }
+
     var variables: [(String, String)] {
-        [
+        var variables = [
             ("https_proxy", proxyURL), ("http_proxy", proxyURL),
             ("HTTPS_PROXY", proxyURL), ("HTTP_PROXY", proxyURL),
             ("no_proxy", noProxy), ("NO_PROXY", noProxy)
         ]
+        if trustsInspectionCA {
+            // A combined bundle (guest defaults + inspection CA), never a replacement.
+            variables += [
+                ("SSL_CERT_FILE", GuestInspectionTrust.bundlePath),
+                ("REQUESTS_CA_BUNDLE", GuestInspectionTrust.bundlePath),
+                ("CURL_CA_BUNDLE", GuestInspectionTrust.bundlePath),
+                ("GIT_SSL_CAINFO", GuestInspectionTrust.bundlePath),
+                // Node appends these to its built-in roots.
+                ("NODE_EXTRA_CA_CERTS", GuestInspectionTrust.extraPath)
+            ]
+        }
+        return variables
+    }
+
+    /// Quotes `NAME=value` for a guest shell. A value starting with `$HOME/`
+    /// (only Sand's own fixed CA paths) expands `$HOME` in the guest.
+    static func quoteAssignment(_ name: String, _ value: String) -> String {
+        let home = "$HOME/"
+        guard value.hasPrefix(home) else {
+            return GitHubProvisioner.shellQuote("\(name)=\(value)")
+        }
+        return GitHubProvisioner.shellQuote("\(name)=") + "\"$HOME\"" + GitHubProvisioner.shellQuote("/" + value.dropFirst(home.count))
     }
 
     /// `env https_proxy=... ...` prefix for a single command.
     var envPrefix: String {
-        "env " + variables.map { "\($0.0)=\(GitHubProvisioner.shellQuote($0.1))" }.joined(separator: " ")
+        "env " + variables.map { Self.quoteAssignment($0.0, $0.1) }.joined(separator: " ")
     }
 
     /// Writes the runner's `.env`, which the runner loads at startup and passes to job steps.
+    /// The runner does not expand variables there, so `$HOME` is expanded when writing.
     func runnerDotEnvCommand(directory: String = "~/actions-runner") -> String {
-        let lines = variables.map { GitHubProvisioner.shellQuote("\($0.0)=\($0.1)") }.joined(separator: " ")
+        let lines = variables.map { Self.quoteAssignment($0.0, $0.1) }.joined(separator: " ")
         return "printf '%s\\n' \(lines) > \(directory)/.env"
     }
 

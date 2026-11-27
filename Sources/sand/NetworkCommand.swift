@@ -6,7 +6,7 @@ struct NetworkCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "network",
         abstract: "Inspect and debug VM network policies.",
-        subcommands: [Explain.self, Proxy.self, Preflight.self, ProbeScript.self]
+        subcommands: [Explain.self, Proxy.self, Preflight.self, ProbeScript.self, Listeners.self]
     )
 
     static func loadPolicy(configPath: String, runner: String?) throws -> (Config.RunnerConfig, NetworkPolicy) {
@@ -32,9 +32,13 @@ struct NetworkCommand: AsyncParsableCommand {
 
         func run() async throws {
             let loaded = try Config.load(path: config)
+            let preflight = NetworkPreflight(processRunner: SystemProcessRunner())
             for runner in loaded.runners {
                 print("runner \(runner.name):")
-                let policy = try runner.vm.run.network.compile(sshPort: runner.vm.ssh.port)
+                let policy = try await preflight.compile(runner.vm.run.network, sshPort: runner.vm.ssh.port)
+                if runner.vm.run.network.backendChoice == .auto {
+                    print("  backend: auto resolved to \(policy.backend?.rawValue ?? "none") on this host")
+                }
                 for line in policy.explain() {
                     print("  \(line)")
                 }
@@ -95,6 +99,8 @@ struct NetworkCommand: AsyncParsableCommand {
         var noProxy = false
         @Flag(help: "Print the guest proxy setup command (shell profiles, macOS system proxy) instead.")
         var guestSetup = false
+        @Option(help: "hostOnly: the host's bridge address, probed as the gateway when the guest has no default route (e.g. 192.168.128.1).")
+        var hostGateway: String?
 
         func run() async throws {
             if guestSetup {
@@ -112,9 +118,38 @@ struct NetworkCommand: AsyncParsableCommand {
                 level: level,
                 directGitHubAddress: github.first(where: \.isIPv4)?.description ?? "140.82.112.3",
                 strictTargets: targets,
-                expectsProxy: !noProxy
+                expectsProxy: !noProxy,
+                backend: hostGateway == nil ? .softnet : .hostOnly,
+                hostGateway: hostGateway
             )
             print(verifier.script)
+        }
+    }
+
+    struct Listeners: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "List host services a hostOnly VM could reach on the host-only bridge (what the post-boot check reports)."
+        )
+
+        @Option(help: "The VM's IP (to find the bridge), e.g. from `tart ip VM`.")
+        var vmIp: String?
+        @Option(help: "The host's bridge address instead of --vm-ip, e.g. 192.168.128.1.")
+        var bridgeIp: String?
+
+        func run() async throws {
+            var bridge: [IPAddress] = []
+            if let vmIp {
+                bridge = HostListenerInspector.bridgeAddresses(forVMIP: vmIp)
+            }
+            if let bridgeIp, let address = IPAddress(bridgeIp) {
+                bridge.append(address)
+            }
+            print("bridge addresses: \(bridge.isEmpty ? "(none; wildcard listeners only)" : bridge.map(\.description).joined(separator: ", "))")
+            let result = await HostListenerInspector(processRunner: SystemProcessRunner()).inspect(bridgeAddresses: bridge)
+            for listener in result.listeners {
+                print("  \(listener)")
+            }
+            print("\(result.listeners.count) reachable listener(s) (method: \(result.method)); loopback-only sockets (including Sand's proxy) are never reachable")
         }
     }
 
@@ -126,10 +161,14 @@ struct NetworkCommand: AsyncParsableCommand {
 
         func run() async throws {
             let loaded = try Config.load(path: config)
-            let policies = try NetworkStartup.compiledPolicies(loaded)
+            let preflight = NetworkPreflight.live(processRunner: SystemProcessRunner())
+            let policies = try await NetworkStartup.compiledPolicies(loaded, preflight: preflight)
             var failed = false
-            for (policy, checks) in await NetworkStartup.preflight(policies.map(\.1), preflight: NetworkPreflight(processRunner: SystemProcessRunner()), includeSSHTools: true) {
-                print("policy \(policy.name) (hash \(policy.policyHash.prefix(12))):")
+            if let warning = NetworkStartup.peerIsolationWarning(policies) {
+                print("warning: \(warning)")
+            }
+            for (policy, checks) in await NetworkStartup.preflight(policies.map(\.1), preflight: preflight, includeSSHTools: true) {
+                print("policy \(policy.label) (hash \(policy.policyHash.prefix(12))):")
                 for check in checks {
                     print("  " + check.line.replacingOccurrences(of: "\n", with: "\n  "))
                 }

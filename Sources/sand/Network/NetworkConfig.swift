@@ -3,14 +3,44 @@ import Foundation
 /// `vm.run.network`: either a profile (secure defaults, the proxy-based egress
 /// allowlist) or a legacy explicit softnet mode.
 ///
+/// Profiles are enforced by a backend: `hostOnly` (tart `--net-host`, no root,
+/// the default) or `softnet` (needs a privileged softnet binary).
+///
 /// An omitted `network` key means `profile: github`. Unrestricted shared NAT is
 /// only available by writing `mode: shared` explicitly.
 struct NetworkConfig: Decodable, Sendable, Equatable {
     enum Profile: String, Sendable, CaseIterable {
-        /// Softnet deny-all plus the host-side allowlisting CONNECT proxy.
+        /// No direct guest egress plus the host-side allowlisting CONNECT proxy.
         case github
-        /// Softnet deny-all with no proxy: host SSH only.
+        /// No direct guest egress and no proxy: host SSH only.
         case offline
+    }
+
+    /// Which enforcement backend a profile asks for.
+    enum BackendChoice: String, Sendable, CaseIterable {
+        /// Tart's host-only network (`--net-host`): no root, no route off the host.
+        case hostOnly
+        /// Softnet deny-all with a host-SSH allow: needs softnet to be setuid root or allowed by passwordless sudo.
+        case softnet
+        /// Softnet when the host has a privileged softnet, otherwise hostOnly.
+        case auto
+    }
+
+    /// Host services reachable on the VM bridge under hostOnly.
+    enum HostListenerPolicy: String, Sendable, CaseIterable {
+        /// Report them (log + audit) and continue.
+        case warn
+        /// Refuse to register a runner while any unaccepted listener is reachable.
+        case deny
+    }
+
+    /// What to do when the host's upstream TLS to allowlisted hosts is intercepted
+    /// (for example by an endpoint agent such as Netskope).
+    enum TLSInspectionMode: String, Sendable, CaseIterable {
+        /// Detect and fail closed (the default).
+        case fail
+        /// Install the host's intercepting CA certificate(s) (public part only) in the guest.
+        case trustHostCA
     }
 
     enum Mode: String, Sendable, CaseIterable {
@@ -43,6 +73,16 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
     let verify: VerifyLevel?
     let allowGitHubSSH: Bool
     let transport: Transport
+    /// nil means the default (`hostOnly`) for profiles; modes always use softnet.
+    let backend: BackendChoice?
+    let hostListeners: HostListenerPolicy?
+    /// `tcp/7000`, `udp/5353`, `udp/*`: host listeners accepted under `hostListeners: deny`.
+    let acceptedHostListeners: [String]
+    let tlsInspection: TLSInspectionMode?
+    /// Consecutive network enforcement failures before `sand run` exits 78.
+    let maxEnforcementFailures: Int?
+
+    static let defaultMaxEnforcementFailures = 3
 
     static let secureDefault = NetworkConfig(selection: .profile(.github))
 
@@ -54,7 +94,12 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
         allowCIDRs: [String] = [],
         verify: VerifyLevel? = nil,
         allowGitHubSSH: Bool = false,
-        transport: Transport = .tunnel
+        transport: Transport = .tunnel,
+        backend: BackendChoice? = nil,
+        hostListeners: HostListenerPolicy? = nil,
+        acceptedHostListeners: [String] = [],
+        tlsInspection: TLSInspectionMode? = nil,
+        maxEnforcementFailures: Int? = nil
     ) {
         self.selection = selection
         self.presets = presets
@@ -64,6 +109,11 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
         self.verify = verify
         self.allowGitHubSSH = allowGitHubSSH
         self.transport = transport
+        self.backend = backend
+        self.hostListeners = hostListeners
+        self.acceptedHostListeners = acceptedHostListeners
+        self.tlsInspection = tlsInspection
+        self.maxEnforcementFailures = maxEnforcementFailures
     }
 
     /// Legacy convenience used by the softnet prototype and its tests.
@@ -128,10 +178,27 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
         } else {
             self.transport = .tunnel
         }
+        backend = try Self.decodeEnum(BackendChoice.self, key: .backend, in: container)
+        hostListeners = try Self.decodeEnum(HostListenerPolicy.self, key: .hostListeners, in: container)
+        acceptedHostListeners = try container.decodeIfPresent([String].self, forKey: .acceptedHostListeners) ?? []
+        tlsInspection = try Self.decodeEnum(TLSInspectionMode.self, key: .tlsInspection, in: container)
+        maxEnforcementFailures = try container.decodeIfPresent(Int.self, forKey: .maxEnforcementFailures)
+    }
+
+    private static func decodeEnum<T: RawRepresentable & CaseIterable>(_ type: T.Type, key: CodingKeys, in container: KeyedDecodingContainer<CodingKeys>) throws -> T? where T.RawValue == String {
+        guard let raw = try container.decodeIfPresent(String.self, forKey: key) else { return nil }
+        guard let value = T(rawValue: raw) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "vm.run.network.\(key.stringValue): unknown value '\(raw)' (expected \(T.allCases.map(\.rawValue).joined(separator: ", ")))"
+            )
+        }
+        return value
     }
 
     private enum CodingKeys: String, CodingKey {
         case profile, mode, presets, allowedDomains, allowedCIDRs, allowCIDRs, verify, allowGitHubSSH, transport
+        case backend, hostListeners, acceptedHostListeners, tlsInspection, maxEnforcementFailures
     }
 
     var profile: Profile? {
@@ -144,9 +211,23 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
         return nil
     }
 
-    /// True for every selection that confines the guest with softnet.
+    /// True for every selection that confines the guest (hostOnly or softnet).
     var isIsolated: Bool {
         mode != .shared
+    }
+
+    /// The backend a profile asks for, before `auto` is resolved on the host.
+    var backendChoice: BackendChoice {
+        switch selection {
+        case .profile:
+            return backend ?? .hostOnly
+        case .mode:
+            return .softnet
+        }
+    }
+
+    var effectiveMaxEnforcementFailures: Int {
+        maxEnforcementFailures ?? Self.defaultMaxEnforcementFailures
     }
 
     var effectiveVerify: VerifyLevel {
@@ -164,22 +245,44 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
 
     /// Compiles the declarative config into the enforced policy. Throws on any
     /// rule the validator would reject, so an invalid policy can never boot a VM.
-    func compile(sshPort: Int = 22) throws -> NetworkPolicy {
+    ///
+    /// `autoBackend` is what `backend: auto` resolved to on this host (see
+    /// `NetworkPreflight.resolveBackend`); without it, auto means hostOnly.
+    func compile(sshPort: Int = 22, autoBackend: EnforcementBackend = .hostOnly) throws -> NetworkPolicy {
         let ssh = SoftnetRule.sshFromHost(port: sshPort)
+        let backend: EnforcementBackend
+        switch backendChoice {
+        case .hostOnly: backend = .hostOnly
+        case .softnet: backend = .softnet
+        case .auto: backend = autoBackend
+        }
+        let options = NetworkPolicy.Options(
+            hostListeners: hostListeners ?? .warn,
+            acceptedHostListeners: try acceptedHostListeners.map(HostListenerPattern.parse),
+            tlsInspection: tlsInspection ?? .fail,
+            maxEnforcementFailures: effectiveMaxEnforcementFailures
+        )
         switch selection {
         case .mode(.shared):
             return NetworkPolicy(kind: .shared, softnet: nil)
         case .mode(.softnet):
-            return NetworkPolicy(kind: .softnet, softnet: nil)
+            return NetworkPolicy(kind: .softnet, softnet: nil, backend: .softnet, options: options)
         case .mode(.restricted):
             for cidr in allowCIDRs where !NetworkPolicy.isAllowedCIDR(cidr) {
                 throw SoftnetRuleError.invalidCIDR(cidr)
             }
             let rules = [ssh] + allowCIDRs.map { SoftnetRule(direction: .outbound, proto: nil, target: .cidr($0), port: nil) }
-            return NetworkPolicy(kind: .restricted(allowCIDRs), softnet: try .denyAll(allowing: rules))
+            return NetworkPolicy(kind: .restricted(allowCIDRs), softnet: try .denyAll(allowing: rules), backend: .softnet, options: options)
         case .profile(.offline):
-            return NetworkPolicy(kind: .offline, softnet: try .denyAll(allowing: [ssh]), verify: effectiveVerify)
+            return NetworkPolicy(
+                kind: .offline,
+                softnet: backend == .softnet ? try .denyAll(allowing: [ssh]) : nil,
+                verify: effectiveVerify, backend: backend, options: options
+            )
         case .profile(.github):
+            if backend == .hostOnly, !allowedCIDRs.isEmpty {
+                throw DirectCIDRError.requiresSoftnet
+            }
             var rules = Set<DomainRule>()
             var presetNames = Set(presets.compactMap(EgressPreset.init(rawValue:)))
             presetNames.insert(.github)
@@ -203,7 +306,11 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
                 verify: effectiveVerify,
                 extraCIDRs: allowedCIDRs
             )
-            return NetworkPolicy(kind: .egressProxy(egress), softnet: try .denyAll(allowing: [ssh] + direct), verify: effectiveVerify)
+            return NetworkPolicy(
+                kind: .egressProxy(egress),
+                softnet: backend == .softnet ? try .denyAll(allowing: [ssh] + direct) : nil,
+                verify: effectiveVerify, backend: backend, options: options
+            )
         }
     }
 
@@ -253,9 +360,12 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
 enum DirectCIDRError: Error, Equatable, CustomStringConvertible {
     case privateRange(String)
     case hostLocalRange(String)
+    case requiresSoftnet
 
     var description: String {
         switch self {
+        case .requiresSoftnet:
+            return "allowedCIDRs needs backend: softnet; the hostOnly backend has no direct route off the host"
         case let .hostLocalRange(cidr):
             return "allowedCIDRs entry \(cidr) overlaps loopback, link-local/metadata, multicast or reserved space; this is refused even with allowPrivate: true"
         case let .privateRange(cidr):

@@ -39,6 +39,9 @@ final class FakeVMHost: ProcessRunning, @unchecked Sendable {
     var tartRunState = LiveHandleState()
     var tartRun: LiveHandleState { lock.withLock { tartRunState } }
     let tunnel = LiveHandleState()
+    /// When set, every `tart run` exits at once with this stderr (a dead network backend).
+    var tartExitStderr: String?
+    var tartRunArguments: [[String]] = []
 
     func run(executable: String, arguments: [String], wait: Bool) async throws -> ProcessResult? {
         let ok = ProcessResult(stdout: "", stderr: "", exitCode: 0)
@@ -55,6 +58,10 @@ final class FakeVMHost: ProcessRunning, @unchecked Sendable {
                 let running = lock.withLock { booted } && !tartRun.finished
                 return ProcessResult(stdout: running ? #"[{"Name":"slot","Running":true}]"# : "[]", stderr: "", exitCode: 0)
             case "ip":
+                if lock.withLock({ tartExitStderr }) != nil {
+                    // No lease ever appears: the VM's network never came up.
+                    try await Task.sleep(nanoseconds: 5_000_000_000)
+                }
                 return ProcessResult(stdout: "192.168.64.5\n", stderr: "", exitCode: 0)
             default:
                 break
@@ -64,6 +71,9 @@ final class FakeVMHost: ProcessRunning, @unchecked Sendable {
         if executable == "sshpass" {
             let command = arguments.last ?? ""
             lock.withLock { executed.append(command) }
+            if command.contains(GuestInspectionTrust.okMarker) {
+                return ProcessResult(stdout: "\(GuestInspectionTrust.okMarker)\n", stderr: "", exitCode: 0)
+            }
             if command.contains("SAND_TUNNEL_OK") {
                 return ProcessResult(stdout: tunnelReady ? "SAND_TUNNEL_OK\n" : "", stderr: "", exitCode: 0)
             }
@@ -80,6 +90,12 @@ final class FakeVMHost: ProcessRunning, @unchecked Sendable {
 
     func start(executable: String, arguments: [String]) throws -> ProcessHandle {
         if executable == "tart" {
+            lock.withLock { tartRunArguments.append(arguments) }
+            if let stderr = lock.withLock({ tartExitStderr }) {
+                lock.withLock { booted = true }
+                let error = ProcessRunnerError.failed(exitCode: 1, stdout: "", stderr: stderr, command: ["tart"] + arguments)
+                return ProcessHandle(waitAsync: { throw error }, terminate: {}, hasExited: { true })
+            }
             // A fresh tart run per boot (recreated VMs get a new process).
             let state = LiveHandleState()
             lock.withLock {
@@ -130,7 +146,7 @@ final class FakeProxy: EgressProxying, @unchecked Sendable {
     func fail() { lock.withLock { failed = true } }
 }
 
-private func dependencies(
+func dependencies(
     host: FakeVMHost,
     proxy: FakeProxy,
     routes: RouteInspector = RouteInspector(routes: []),
@@ -156,11 +172,11 @@ private func dependencies(
     return deps
 }
 
-private func makeRunner(host: ProcessRunning, network: RunnerNetworkDependencies, run: String = "echo provisioned-marker") -> Runner {
+func makeRunner(host: ProcessRunning, network: RunnerNetworkDependencies, run: String = "echo provisioned-marker", policy: NetworkConfig = .secureDefault, stopAfter: Int? = 1) -> Runner {
     let logger = Logger(label: "test", minimumLevel: .critical)
     let tart = Tart(processRunner: host, logger: logger)
-    let vm = Config.VM(source: .init(type: .local, image: nil, name: "golden"), hardware: nil, mounts: [], cache: nil, run: .default, diskSizeGb: nil, ssh: .standard)
-    let config = Config.RunnerConfig(name: "slot", vm: vm, provisioner: .init(type: .script, script: .init(run: run), github: nil), preRun: nil, postRun: nil, stopAfter: 1, healthCheck: Config.HealthCheck(command: "true", interval: 30, delay: 600))
+    let vm = Config.VM(source: .init(type: .local, image: nil, name: "golden"), hardware: nil, mounts: [], cache: nil, run: .init(noGraphics: true, noClipboard: true, nested: false, network: policy), diskSizeGb: nil, ssh: .standard)
+    let config = Config.RunnerConfig(name: "slot", vm: vm, provisioner: .init(type: .script, script: .init(run: run), github: nil), preRun: nil, postRun: nil, stopAfter: stopAfter, healthCheck: Config.HealthCheck(command: "true", interval: 30, delay: 600))
     return Runner(
         tart: tart, github: nil, provisioner: GitHubProvisioner(), runnerVersionResolver: GitHubRunnerVersionResolver(),
         runnerCache: RunnerCache(), config: config,
@@ -176,7 +192,7 @@ private func makeRunner(host: ProcessRunning, network: RunnerNetworkDependencies
         var fileSystem = FakeFileSystem()
         fileSystem.paths["softnet"] = nil
         let recorder = AuditRecorder()
-        let runner = makeRunner(host: host, network: dependencies(host: host, proxy: FakeProxy(), fileSystem: fileSystem, recorder: recorder))
+        let runner = makeRunner(host: host, network: dependencies(host: host, proxy: FakeProxy(), fileSystem: fileSystem, recorder: recorder), policy: NetworkConfig(selection: .profile(.github), backend: .softnet))
         await #expect(throws: NetworkEnforcementError.self) { try await runner.run() }
         #expect(host.clones == 0)
         #expect(recorder.events.contains { $0.name == "network.preflight.failed" })

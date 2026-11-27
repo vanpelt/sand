@@ -5,9 +5,27 @@ enum SandBuildInfo {
     static let version = "0.0.0-dev"
 }
 
+/// How the guest's direct egress is removed.
+enum EnforcementBackend: String, Sendable, Equatable, CaseIterable {
+    /// `tart run --net-host`: a host-only vmnet network with no route off the
+    /// host. Needs no root. Host services bound to the bridge (or to all
+    /// interfaces) stay reachable, and VMs on the bridge can reach each other.
+    case hostOnly
+    /// Softnet deny-all plus a host-SSH allow. Needs a privileged softnet; adds
+    /// host-service and peer-VM isolation.
+    case softnet
+}
+
 /// The compiled, enforced network policy for one VM. Produced only by
 /// `NetworkConfig.compile`, so every softnet rule it carries was validated.
 struct NetworkPolicy: Sendable, Equatable {
+    struct Options: Sendable, Equatable {
+        var hostListeners: NetworkConfig.HostListenerPolicy = .warn
+        var acceptedHostListeners: [HostListenerPattern] = []
+        var tlsInspection: NetworkConfig.TLSInspectionMode = .fail
+        var maxEnforcementFailures: Int = NetworkConfig.defaultMaxEnforcementFailures
+    }
+
     enum Kind: Sendable, Equatable {
         case shared
         case softnet
@@ -23,11 +41,20 @@ struct NetworkPolicy: Sendable, Equatable {
     let softnet: SoftnetRuleSet?
     /// Guest egress verification before registration (profiles only).
     let verify: VerifyLevel
+    /// nil only for shared NAT.
+    let backend: EnforcementBackend?
+    let options: Options
 
-    init(kind: Kind, softnet: SoftnetRuleSet?, verify: VerifyLevel = .off) {
+    init(kind: Kind, softnet: SoftnetRuleSet?, verify: VerifyLevel = .off, backend: EnforcementBackend? = nil, options: Options = Options()) {
         self.kind = kind
         self.softnet = softnet
         self.verify = verify
+        self.options = options
+        if kind == .shared {
+            self.backend = nil
+        } else {
+            self.backend = backend ?? (softnet != nil || kind == .softnet ? .softnet : .hostOnly)
+        }
     }
 
     static let shared = NetworkPolicy(kind: .shared, softnet: nil)
@@ -39,12 +66,25 @@ struct NetworkPolicy: Sendable, Equatable {
         case .softnet:
             return ["--net-softnet"]
         case .restricted, .egressProxy, .offline:
+            if backend == .hostOnly {
+                return ["--net-host"]
+            }
             return softnet?.tartArguments ?? ["--net-softnet", "--net-softnet-block=0.0.0.0/0"]
         }
     }
 
-    var requiresSoftnet: Bool {
+    /// Every policy except shared NAT confines the guest and is enforced.
+    var isIsolated: Bool {
         kind != .shared
+    }
+
+    /// Needs a privileged softnet binary (preflight P2/P3, watchdog softnet check).
+    var usesSoftnet: Bool {
+        backend == .softnet
+    }
+
+    var isHostOnly: Bool {
+        backend == .hostOnly
     }
 
     var egress: EgressPolicy? {
@@ -67,6 +107,11 @@ struct NetworkPolicy: Sendable, Equatable {
         }
     }
 
+    /// `profile=github backend=hostOnly`, for logs.
+    var label: String {
+        backend.map { "\(name) backend=\($0.rawValue)" } ?? name
+    }
+
     /// SHA-256 over a canonical encoding of everything that determines
     /// enforcement: tart arguments, domain rules, steered names, verify level,
     /// preset version and the sand version.
@@ -81,6 +126,13 @@ struct NetworkPolicy: Sendable, Equatable {
             canonical["domains"] = egress.rules.map(\.description).sorted()
             canonical["steered"] = egress.steeredNames.sorted()
             canonical["verify"] = [egress.verify.rawValue]
+            canonical["tlsInspection"] = [options.tlsInspection.rawValue]
+        }
+        if let backend {
+            canonical["backend"] = [backend.rawValue]
+        }
+        if backend == .hostOnly {
+            canonical["hostListeners"] = [options.hostListeners.rawValue] + options.acceptedHostListeners.map(\.description).sorted()
         }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
@@ -96,6 +148,19 @@ struct NetworkPolicy: Sendable, Equatable {
             "policy version: \(EgressPreset.policyVersion)",
             "tart arguments: \(tartArguments.isEmpty ? "(none: shared NAT)" : tartArguments.joined(separator: " "))"
         ]
+        switch backend {
+        case .hostOnly:
+            lines.append("enforcement backend: hostOnly (tart --net-host; no root; no route off the host)")
+            lines.append("host listeners on the VM bridge: \(options.hostListeners.rawValue)" + (options.acceptedHostListeners.isEmpty ? "" : " (accepted: \(options.acceptedHostListeners.map(\.description).joined(separator: ", ")))"))
+            lines.append("note: hostOnly has no peer-VM isolation; VMs on the host-only bridge can reach each other (use backend: softnet for that)")
+        case .softnet:
+            lines.append("enforcement backend: softnet (privileged softnet binary required)")
+        case nil:
+            break
+        }
+        if isIsolated {
+            lines.append("max consecutive enforcement failures before exit 78: \(options.maxEnforcementFailures)")
+        }
         switch kind {
         case .shared:
             lines.append("WARNING: VM has unrestricted host/LAN/VPN/corporate network reach")
@@ -108,6 +173,7 @@ struct NetworkPolicy: Sendable, Equatable {
         case let .egressProxy(egress):
             lines.append("guest egress: HTTPS CONNECT proxy at 127.0.0.1:\(Self.guestProxyPort) in the guest (SSH reverse tunnel)")
             lines.append("verify: \(egress.verify.rawValue)")
+            lines.append("TLS inspection: \(options.tlsInspection.rawValue)" + (options.tlsInspection == .trustHostCA ? " (an intercepting host CA, if detected, is trusted in the guest)" : " (detected interception fails preflight)"))
             lines.append("steered names (VPN split-DNS fronts allowed): \(egress.steeredNames.sorted().joined(separator: ", "))")
             lines.append("allowed destinations (\(egress.rules.count)):")
             lines.append(contentsOf: egress.rules.map { "  - \($0)" })

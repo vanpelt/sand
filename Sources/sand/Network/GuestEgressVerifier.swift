@@ -11,6 +11,9 @@ struct GuestEgressVerifier: Sendable {
         case closedUDP
         /// The proxied positive probe.
         case proxyWorks
+        /// A host service on the VM bridge (hostOnly only): OPEN is reported, and
+        /// fails only under `hostListeners: deny` for an unaccepted port.
+        case hostService(port: Int)
     }
 
     struct Probe: Sendable, Equatable {
@@ -62,13 +65,44 @@ struct GuestEgressVerifier: Sendable {
     let proxyPort: Int
     /// False for profile offline: there is no proxy, so only negative probes run.
     let expectsProxy: Bool
+    /// hostOnly: the gateway is the host's bridge address, so host services bound
+    /// to all interfaces answer there. Those are reported, not egress.
+    let backend: EnforcementBackend
+    let hostListenerPolicy: NetworkConfig.HostListenerPolicy
+    let acceptedHostListeners: [HostListenerPattern]
+    /// Host TCP listeners found on the bridge; probed from the guest as evidence (hostOnly).
+    let hostServicePorts: [Int]
+    /// The host's address on the VM network, used when the guest has no default
+    /// route (host-only networks have none): gateway probes then target the host.
+    let hostGateway: String?
 
-    init(level: VerifyLevel, directGitHubAddress: String, strictTargets: StrictTargets = StrictTargets(), proxyPort: Int = NetworkPolicy.guestProxyPort, expectsProxy: Bool = true) {
+    init(
+        level: VerifyLevel,
+        directGitHubAddress: String,
+        strictTargets: StrictTargets = StrictTargets(),
+        proxyPort: Int = NetworkPolicy.guestProxyPort,
+        expectsProxy: Bool = true,
+        backend: EnforcementBackend = .softnet,
+        hostListenerPolicy: NetworkConfig.HostListenerPolicy = .warn,
+        acceptedHostListeners: [HostListenerPattern] = [],
+        hostServicePorts: [Int] = [],
+        hostGateway: String? = nil
+    ) {
         self.level = level
         self.directGitHubAddress = directGitHubAddress
         self.strictTargets = strictTargets
         self.proxyPort = proxyPort
         self.expectsProxy = expectsProxy
+        self.backend = backend
+        self.hostListenerPolicy = hostListenerPolicy
+        self.acceptedHostListeners = acceptedHostListeners
+        self.hostServicePorts = hostServicePorts
+        self.hostGateway = hostGateway.flatMap { IPAddress($0) != nil ? $0 : nil }
+    }
+
+    /// Under softnet every host port is blocked; under hostOnly a host service is reported.
+    private func gatewayExpectation(port: Int) -> Expectation {
+        backend == .hostOnly ? .hostService(port: port) : .closed
     }
 
     var probes: [Probe] {
@@ -77,15 +111,22 @@ struct GuestEgressVerifier: Sendable {
         var probes: [Probe] = [
             Probe(id: "N1", expectation: .closed, summary: "arbitrary internet 1.1.1.1:443", command: "tcp N1 1.1.1.1 443"),
             Probe(id: "N2", expectation: .closed, summary: "direct GitHub/VPN front :443", command: "tcp N2 \(Self.quote(directGitHubAddress)) 443"),
-            Probe(id: "N3a", expectation: .closed, summary: "host gateway :5000", command: "tcp N3a \"$GW\" 5000"),
+            Probe(id: "N3a", expectation: gatewayExpectation(port: 5000), summary: "host gateway :5000", command: "tcp N3a \"$GW\" 5000"),
+            // DNS to the host is an egress path (a recursive resolver), never just a host service.
             Probe(id: "N3b", expectation: .closed, summary: "host gateway :53/tcp", command: "tcp N3b \"$GW\" 53"),
-            Probe(id: "N3c", expectation: .closed, summary: "host gateway :22", command: "tcp N3c \"$GW\" 22"),
+            Probe(id: "N3c", expectation: gatewayExpectation(port: 22), summary: "host gateway :22", command: "tcp N3c \"$GW\" 22"),
             Probe(id: "N4a", expectation: .closedUDP, summary: "DNS via gateway", command: "dnsq N4a \"$GW\""),
             Probe(id: "N4b", expectation: .closedUDP, summary: "DNS via 8.8.8.8", command: "dnsq N4b 8.8.8.8"),
             Probe(id: "N5", expectation: .closed, summary: "IPv6 internet", command: "v6 N5"),
         ]
         if expectsProxy {
             probes.append(Probe(id: "P1", expectation: .proxyWorks, summary: "api.github.com via proxy", command: "proxied P1 \(proxy) https://api.github.com/zen"))
+        }
+        if backend == .hostOnly {
+            let fixed: Set<Int> = [5000, 22, 53]
+            for (index, port) in hostServicePorts.filter({ !fixed.contains($0) }).prefix(8).enumerated() {
+                probes.append(Probe(id: "H\(index + 1)", expectation: .hostService(port: port), summary: "host service on the bridge :\(port)", command: "tcp H\(index + 1) \"$GW\" \(port)"))
+            }
         }
         guard level == .strict else { return probes }
         if let gateway = strictTargets.lanGateway {
@@ -144,7 +185,9 @@ struct GuestEgressVerifier: Sendable {
           if [ "$connect" = 403 ]; then echo "SANDPROBE $1 CLOSED connect=403"; else echo "SANDPROBE $1 OPEN connect=$connect"; fi
         }
         """#
-        return ([prelude] + probes.map(\.command) + ["exit 0"]).joined(separator: "\n")
+        // No default route (host-only): probe the host's bridge address instead.
+        let fallback = hostGateway.map { [#"[ -n "$GW" ] || GW=\#(Self.quote($0))"#] } ?? []
+        return ([prelude] + fallback + probes.map(\.command) + ["exit 0"]).joined(separator: "\n")
     }
 
     func evaluate(_ output: String) -> [ProbeResult] {
@@ -161,8 +204,21 @@ struct GuestEgressVerifier: Sendable {
                 passed = outcome == "CLOSED" || outcome == "INCONCLUSIVE"
             case .proxyWorks:
                 passed = outcome == "OK"
+            case let .hostService(port):
+                let accepted = hostListenerPolicy == .warn
+                    || acceptedHostListeners.contains { $0.matches(HostListener(proto: .tcp, port: port, boundTo: "*")) }
+                passed = outcome == "CLOSED" || (outcome == "OPEN" && accepted)
             }
             return ProbeResult(id: probe.id, outcome: outcome, detail: "\(probe.summary): \(detail)", passed: passed)
+        }
+    }
+
+    /// hostOnly host services the guest actually reached (OPEN), for the audit log.
+    func reachableHostServices(_ results: [ProbeResult]) -> [String] {
+        let byID = Dictionary(uniqueKeysWithValues: probes.map { ($0.id, $0) })
+        return results.compactMap { result in
+            guard result.outcome == "OPEN", case let .hostService(port)? = byID[result.id]?.expectation else { return nil }
+            return "tcp/\(port)"
         }
     }
 

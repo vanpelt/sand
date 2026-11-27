@@ -44,34 +44,53 @@ struct Run: AsyncParsableCommand {
         let auditFile = try logLevel.resolvedLogFile().map { try AuditFileSink(path: AuditFileSink.path(nextTo: $0)) }
         let audit = NetworkAudit(logger: Logger(label: "network", minimumLevel: level, sink: logSink), file: auditFile)
         // Fail closed before any clone: every distinct policy must pass the full preflight.
-        let policies = try NetworkStartup.compiledPolicies(config)
+        let preflight = NetworkPreflight.live(processRunner: processRunner)
+        let policies = try await NetworkStartup.compiledPolicies(config, preflight: preflight)
         for (runnerName, policy) in policies {
             audit.emit("network.policy.compiled", [
                 "runner": runnerName,
                 "hash": policy.policyHash,
                 "profile": policy.name.replacingOccurrences(of: "=", with: ":"),
+                "backend": policy.backend?.rawValue ?? "none",
                 "domains": String(policy.egress?.rules.count ?? 0),
-                "tart_args": policy.tartArguments.joined(separator: "|")
+                "tart_args": policy.tartArguments.joined(separator: " ")
             ])
-            logger.info("runner \(runnerName): effective network policy \(policy.name) (hash \(policy.policyHash.prefix(12)))")
-            if !policy.requiresSoftnet {
+            logger.info("runner \(runnerName): effective network policy \(policy.label) (hash \(policy.policyHash.prefix(12)))")
+            if !policy.isIsolated {
                 logger.warning("runner \(runnerName): network mode shared: VM has unrestricted host/LAN/VPN/corporate network reach")
             }
         }
-        let preflight = NetworkPreflight(processRunner: processRunner)
-        for (policy, checks) in await NetworkStartup.preflight(policies.map(\.1), preflight: preflight, includeSSHTools: !dryRun) {
+        if let warning = NetworkStartup.peerIsolationWarning(policies) {
+            logger.warning(warning)
+            audit.emit("network.peer.isolation", level: .warning, ["backend": "hostOnly", "runners": policies.filter { $0.1.isHostOnly }.map(\.0).joined(separator: ",")])
+        }
+        var inspectionCAs: [String: [InspectionCA]] = [:]
+        for (policy, checks, inspection) in await NetworkStartup.preflightWithInspection(policies.map(\.1), preflight: preflight, includeSSHTools: !dryRun) {
             let failures = NetworkPreflight.failures(checks)
             for check in checks {
-                logger.log(check.status == .failed ? .error : (check.status == .warning ? .warning : .info), "network preflight (\(policy.name)) \(check.line)")
+                logger.log(check.status == .failed ? .error : (check.status == .warning ? .warning : .info), "network preflight (\(policy.label)) \(check.line)")
             }
             audit.emit(failures.isEmpty ? "network.preflight.ok" : "network.preflight.failed", level: failures.isEmpty ? .info : .error, [
                 "policy": policy.name.replacingOccurrences(of: "=", with: ":"),
+                "backend": policy.backend?.rawValue ?? "none",
                 "hash": policy.policyHash,
                 "failed": failures.map(\.name).joined(separator: ",")
             ])
+            if let inspection, inspection.isIntercepted {
+                audit.emit("network.tls.inspection", level: .warning, [
+                    "hash": policy.policyHash,
+                    "mode": policy.options.tlsInspection.rawValue,
+                    "hosts": inspection.interceptedHosts.joined(separator: ","),
+                    "ca_sha256": inspection.authorities.map(\.sha256).joined(separator: ","),
+                    "ca_subject": inspection.authorities.map(\.subject).joined(separator: ",")
+                ])
+                if policy.options.tlsInspection == .trustHostCA, failures.isEmpty {
+                    inspectionCAs[policy.policyHash] = inspection.authorities
+                }
+            }
             if !failures.isEmpty && !dryRun {
                 FileHandle.standardError.write(Data((NetworkStartup.failureMessage(failures) + "\n").utf8))
-                throw ExitCode(78) // EX_CONFIG: the host is not prepared for the configured policy
+                throw ExitCode(NetworkStartup.exitCode) // EX_CONFIG: the host is not prepared for the configured policy
             }
         }
         if dryRun {
@@ -129,7 +148,8 @@ struct Run: AsyncParsableCommand {
                 logLabel: logLabel,
                 logLevel: level,
                 logSink: logSink,
-                audit: NetworkAudit(logger: Logger(label: "network.\(logLabel)", minimumLevel: level, sink: logSink), file: auditFile)
+                audit: NetworkAudit(logger: Logger(label: "network.\(logLabel)", minimumLevel: level, sink: logSink), file: auditFile),
+                inspectionCAs: inspectionCAs[policies[index].1.policyHash] ?? []
             )
             runners.append(runner)
         }
@@ -156,13 +176,27 @@ struct Run: AsyncParsableCommand {
         defer {
             _ = signalHandler
         }
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            for runner in runners {
-                group.addTask {
-                    try await runner.run()
+        do {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for runner in runners {
+                    group.addTask {
+                        try await runner.run()
+                    }
                 }
+                try await group.waitForAll()
             }
-            try await group.waitForAll()
+        } catch let error as NetworkEnforcementError {
+            // A runtime enforcement failure ends sand like a failed preflight (78),
+            // after every slot's VM is stopped and deleted. Never a shared-NAT fallback.
+            for control in runnerControls {
+                await control.terminateProvisioning()
+            }
+            for coordinator in cleanupTargets {
+                await coordinator.cleanup(reason: "network enforcement failed")
+            }
+            logger.error("\(error)")
+            FileHandle.standardError.write(Data(("sand: \(error)\n").utf8))
+            throw ExitCode(NetworkStartup.exitCode)
         }
     }
 

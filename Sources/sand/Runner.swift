@@ -14,6 +14,7 @@ struct Runner: Sendable {
     private let logger: Logger
     private let vmLogger: Logger
     private let restartBackoff = RestartBackoff()
+    private let enforcementFailures = EnforcementFailureCounter()
     private let sshRetryDelays: [TimeInterval] = [1, 2, 4, 8, 16, 30, 30, 30, 30, 30]
     private static let healthCheckExitMarker = "__SAND_HEALTHCHECK_EXIT_CODE__"
 
@@ -40,7 +41,8 @@ struct Runner: Sendable {
         logLevel: LogLevel,
         logSink: LogFileSink?,
         network: RunnerNetworkDependencies? = nil,
-        audit: NetworkAudit? = nil
+        audit: NetworkAudit? = nil,
+        inspectionCAs: [InspectionCA] = []
     ) {
         self.tart = tart
         self.github = github
@@ -54,7 +56,11 @@ struct Runner: Sendable {
         self.logger = Logger(label: "host.\(logLabel)", minimumLevel: logLevel, sink: logSink)
         self.vmLogger = Logger(label: "vm.\(logLabel)", minimumLevel: logLevel, sink: logSink)
         let networkAudit = audit ?? NetworkAudit(logger: Logger(label: "network.\(logLabel)", minimumLevel: logLevel, sink: logSink))
-        self.network = network ?? .live(processRunner: tart.processRunner, audit: networkAudit)
+        var dependencies = network ?? .live(processRunner: tart.processRunner, audit: networkAudit)
+        if !inspectionCAs.isEmpty {
+            dependencies.inspectionCAs = inspectionCAs
+        }
+        self.network = dependencies
     }
 
     func run() async throws {
@@ -82,6 +88,11 @@ struct Runner: Sendable {
             } catch where error is CancellationError || Task.isCancelled {
                 // A cancelled tart or GitHub call can surface as its own error type; report it as cancellation, not a failure.
                 throw CancellationError()
+            } catch let error as NetworkEnforcementError where error.isFatal {
+                // Bounded: repeated enforcement failures end sand (exit 78) instead of re-cloning forever.
+                logger.error("\(error)")
+                await shutdownCoordinator.cleanup(reason: "network enforcement failed")
+                throw error
             } catch {
                 // A transient failure (e.g. two slots cloning the same image at once) must not
                 // retire this slot for good: sand keeps running the other slots, so launchd never restarts it.
@@ -103,8 +114,8 @@ struct Runner: Sendable {
         let source = vm.source.resolvedSource
         // Compile and re-check the network policy before touching any VM, so an
         // unprepared host never clones or boots (and never falls back to shared NAT).
-        let networkPolicy = try vm.run.network.compile(sshPort: vm.ssh.port)
-        if networkPolicy.requiresSoftnet {
+        let networkPolicy = try await network.preflight.compile(vm.run.network, sshPort: vm.ssh.port)
+        if networkPolicy.isIsolated {
             let failures = NetworkPreflight.failures(await network.preflight.perVM(policy: networkPolicy))
             if !failures.isEmpty {
                 network.audit.emit("network.preflight.failed", level: .error, [
@@ -151,7 +162,7 @@ struct Runner: Sendable {
         var booted: (tartRun: ProcessHandle, ip: String, ssh: SSHClient)?
         while booted == nil {
             bootAttempt += 1
-            guard let result = try await bootVM(name: name, source: source, vm: vm, runOptions: runOptions) else {
+            guard let result = try await bootVM(name: name, source: source, vm: vm, runOptions: runOptions, session: session) else {
                 return
             }
             // softnet picks the VM subnet; if it collides with a host route (e.g. a
@@ -168,30 +179,36 @@ struct Runner: Sendable {
         }
         guard let (tartRun, ip, ssh) = booted else { return }
         let healthCheckState = HealthCheckState()
-        if networkPolicy.requiresSoftnet {
+        if networkPolicy.isIsolated {
             do {
                 try await session.establish(ssh: ssh, vmIP: ip)
             } catch {
                 logger.error("\(String(describing: error)); destroying VM without registering a runner")
                 await session.teardown()
                 await shutdownCoordinator.cleanup(reason: "network enforcement not verified")
+                try await recordEnforcementFailure(policy: networkPolicy, stage: "establish", reason: Self.enforcementReason(error), detail: String(describing: error))
                 throw error
             }
+            await enforcementFailures.reset()
         }
         // From here until teardown, losing any enforcement component (or tart itself)
         // ends the job: stop and delete the VM and deregister the runner at once.
         await session.startWatchdog(tartRun: tartRun, vmIP: ip) { [logger, control, shutdownCoordinator] component in
-            guard await !shutdownCoordinator.isCleaningUp() else { return }
+            guard await !shutdownCoordinator.isCleaningUp() else { return false }
             logger.error("network enforcement lost (\(component)); stopping VM")
             await healthCheckState.markFailed(message: "network enforcement lost: \(component)")
             await control.terminateProvisioning()
             await shutdownCoordinator.cleanup(reason: "network enforcement lost: \(component)")
+            return true
         }
         do {
             if let env = session.guestEnv {
                 logger.info("configure guest proxy settings (usability only; enforcement is host-side)")
                 let result = try await execWithRetry(command: env.guestSetupCommand, ssh: ssh, stage: "guest proxy setup")
                 logIfNonEmpty(label: "guest proxy setup", text: result?.stdout ?? "")
+            }
+            if !session.inspectionCAs.isEmpty {
+                try await installInspectionTrust(session.inspectionCAs, ssh: ssh, policy: networkPolicy)
             }
             try await runStages(
                 name: name, vm: vm, provisionerConfig: provisionerConfig, ssh: ssh,
@@ -207,7 +224,7 @@ struct Runner: Sendable {
 
     /// Clone and boot the VM, then wait for its IP and SSH. Returns nil (after
     /// scheduling a restart and cleaning up) when the VM never became reachable.
-    private func bootVM(name: String, source: String, vm: Config.VM, runOptions: Tart.RunOptions) async throws -> (tartRun: ProcessHandle, ip: String, ssh: SSHClient)? {
+    private func bootVM(name: String, source: String, vm: Config.VM, runOptions: Tart.RunOptions, session: VMNetworkSession) async throws -> (tartRun: ProcessHandle, ip: String, ssh: SSHClient)? {
         // Leftover from a crash or a failed clone: tart clone refuses to overwrite it.
         do {
             try await tart.delete(name: name)
@@ -248,21 +265,106 @@ struct Runner: Sendable {
             ip = try await resolveIP(name: name, whileRunning: tartRun)
         } catch {
             logger.warning("resolve VM IP failed; scheduling restart: \(String(describing: error))")
-            await scheduleRestart(reason: .ipNotReady)
+            // Sample before cleanup: cleanup stops tart, which would look like an early exit.
+            let exitedEarly = await tartRun.hasExited()
             await shutdownCoordinator.cleanup(reason: "resolve VM IP failed")
+            if exitedEarly {
+                try await recordEarlyTartExit(tartRun, policy: runOptions.network, stage: "before-ip")
+            }
+            await scheduleRestart(reason: .ipNotReady)
             return nil
         }
         logger.info("VM IP \(ip)")
         await logVMStatusAfterBoot(name: name)
         let initial = SSHClient(processRunner: tart.processRunner, host: ip, config: vm.ssh)
         // Under softnet the first lease can be stale; only an IP that answers SSH is trusted.
-        guard let ssh = await waitForSSH(ssh: initial, tartRun: tartRun, refreshIP: runOptions.network.requiresSoftnet) else {
+        guard let ssh = await waitForSSH(ssh: initial, tartRun: tartRun, refreshIP: runOptions.network.usesSoftnet) else {
             logger.debug("waitForSSH failed; scheduling restart")
-            await scheduleRestart(reason: .sshNotReady)
+            let exitedEarly = await tartRun.hasExited()
             await shutdownCoordinator.cleanup(reason: "ssh not ready")
+            if exitedEarly {
+                try await recordEarlyTartExit(tartRun, policy: runOptions.network, stage: "before-ssh")
+            }
+            await scheduleRestart(reason: .sshNotReady)
             return nil
         }
         return (tartRun, ssh.host, ssh)
+    }
+
+    /// Under an isolated policy, tart exiting before the VM is reachable is a
+    /// network enforcement failure (softnet died, --net-host failed, ...).
+    private func recordEarlyTartExit(_ tartRun: ProcessHandle, policy: NetworkPolicy, stage: String) async throws {
+        guard policy.isIsolated, !Task.isCancelled else { return }
+        let stderr: String
+        do {
+            stderr = try await tartRun.waitAsync(terminateOnCancel: false).stderr
+        } catch let ProcessRunnerError.failed(exitCode, _, message, _) {
+            stderr = "exit \(exitCode): \(message)"
+        } catch {
+            stderr = String(describing: error)
+        }
+        let reason = NetworkBackendFailure.classify(stderr: stderr, backend: policy.backend)
+        let detail = NetworkBackendFailure.summary(stderr)
+        logger.error("tart exited \(stage) under network policy \(policy.label) (\(reason)): \(detail)")
+        try await recordEnforcementFailure(policy: policy, stage: stage, reason: reason, detail: detail)
+    }
+
+    /// Counts consecutive enforcement failures; throws `gaveUp` at the limit.
+    private func recordEnforcementFailure(policy: NetworkPolicy, stage: String, reason: String, detail: String) async throws {
+        let attempt = await enforcementFailures.record()
+        let limit = max(1, policy.options.maxEnforcementFailures)
+        let final = attempt >= limit
+        network.audit.emit("network.enforcement.failed", level: .error, [
+            "vm": vmName,
+            "stage": stage,
+            "reason": reason,
+            "backend": policy.backend?.rawValue ?? "none",
+            "attempt": String(attempt),
+            "max": String(limit),
+            "final": String(final),
+            "detail": detail,
+            "policy_hash": policy.policyHash
+        ])
+        if final {
+            throw NetworkEnforcementError.gaveUp(attempts: attempt, last: "\(stage) \(reason): \(detail)")
+        }
+        logger.warning("network enforcement failure \(attempt)/\(limit) (\(reason)); retrying with the same policy")
+    }
+
+    static func enforcementReason(_ error: Error) -> String {
+        guard let error = error as? NetworkEnforcementError else { return "establish-error" }
+        switch error {
+        case .preflightFailed: return "preflight"
+        case .subnetOverlap: return "subnet-overlap"
+        case .tunnelFailed: return "tunnel"
+        case .verificationFailed: return "guest-verification"
+        case .hostListenersDenied: return "host-listeners"
+        case let .backendFailed(reason, _): return reason
+        case .inspectionTrustFailed: return "inspection-ca"
+        case .gaveUp: return "gave-up"
+        }
+    }
+
+    /// `tlsInspection: trustHostCA`: install the public CA certificate(s) and the
+    /// combined bundle before any workflow code runs.
+    private func installInspectionTrust(_ authorities: [InspectionCA], ssh: SSHClient, policy: NetworkPolicy) async throws {
+        logger.info("trust host TLS-inspection CA in the guest: \(authorities.map { "\($0.subject) sha256=\($0.sha256)" }.joined(separator: "; "))")
+        let result = try await execWithRetry(command: GuestInspectionTrust.installCommand(authorities), ssh: ssh, stage: "inspection CA trust")
+        let output = result?.stdout ?? ""
+        for line in output.split(whereSeparator: \.isNewline) where line.hasPrefix("WARN") {
+            logger.warning("guest inspection CA: \(line)")
+        }
+        guard output.contains(GuestInspectionTrust.okMarker) else {
+            network.audit.emit("network.tls.inspection.trusted", level: .error, ["vm": vmName, "result": "failed", "policy_hash": policy.policyHash])
+            throw NetworkEnforcementError.inspectionTrustFailed(output.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        network.audit.emit("network.tls.inspection.trusted", level: .warning, [
+            "vm": vmName,
+            "ca_sha256": authorities.map(\.sha256).joined(separator: ","),
+            "ca_subject": authorities.map(\.subject).joined(separator: ","),
+            "keychain": output.contains("WARN") ? "partial" : "ok",
+            "policy_hash": policy.policyHash
+        ])
     }
 
     private func runStages(
@@ -1149,5 +1251,19 @@ private actor HealthCheckState {
         if let continuation = waiters.removeValue(forKey: id) {
             continuation.resume(throwing: CancellationError())
         }
+    }
+}
+
+/// Consecutive network enforcement failures for one runner slot.
+private actor EnforcementFailureCounter {
+    private var count = 0
+
+    func record() -> Int {
+        count += 1
+        return count
+    }
+
+    func reset() {
+        count = 0
     }
 }

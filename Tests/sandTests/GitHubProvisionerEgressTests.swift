@@ -13,8 +13,9 @@ import Testing
         #expect(dotEnv != nil && configure != nil && extract != nil)
         #expect(extract! < dotEnv! && dotEnv! < configure!)
         let configureLine = script[configure!]
-        #expect(configureLine.hasPrefix("env https_proxy='http://127.0.0.1:3128' http_proxy='http://127.0.0.1:3128'"))
-        #expect(configureLine.contains("no_proxy='localhost,127.0.0.1,::1'"))
+        #expect(configureLine.hasPrefix("env 'https_proxy=http://127.0.0.1:3128' 'http_proxy=http://127.0.0.1:3128'"))
+        #expect(configureLine.contains("'no_proxy=localhost,127.0.0.1,::1'"))
+        #expect(!configureLine.contains("SSL_CERT_FILE"))
         #expect(configureLine.hasSuffix("--disableupdate"))
         #expect(script[dotEnv!].contains("'https_proxy=http://127.0.0.1:3128'"))
         #expect(script.last == "~/actions-runner/run.sh")

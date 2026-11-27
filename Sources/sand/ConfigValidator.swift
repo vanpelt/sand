@@ -187,6 +187,42 @@ final class ConfigValidator {
                 error("vm.run.network presets, allowedDomains, allowedCIDRs and verify require a profile, not mode.")
             }
         }
+        if network.mode != nil {
+            if network.backend != nil {
+                error("vm.run.network.backend applies to profiles only; mode \(network.mode?.rawValue ?? "") always uses softnet (or shared NAT).")
+            }
+            if network.hostListeners != nil || !network.acceptedHostListeners.isEmpty || network.tlsInspection != nil {
+                error("vm.run.network hostListeners, acceptedHostListeners and tlsInspection require a profile, not mode.")
+            }
+        }
+        if network.profile == .offline, network.tlsInspection != nil {
+            error("vm.run.network.tlsInspection applies to profile: github only (offline has no proxy).")
+        }
+        if !network.allowedCIDRs.isEmpty, network.profile != nil, network.backendChoice != .softnet {
+            error("vm.run.network.allowedCIDRs requires backend: softnet; the \(network.backendChoice.rawValue) backend \(network.backendChoice == .auto ? "may resolve to hostOnly, which has" : "has") no direct route off the host.")
+        }
+        for entry in network.acceptedHostListeners {
+            do {
+                _ = try HostListenerPattern.parse(entry)
+            } catch let failure {
+                error("vm.run.network.\(failure)")
+            }
+        }
+        if network.backendChoice == .softnet, network.profile != nil, network.hostListeners != nil || !network.acceptedHostListeners.isEmpty {
+            warning("vm.run.network hostListeners/acceptedHostListeners only apply to the hostOnly backend; softnet already blocks guest access to host services.")
+        }
+        if network.hostListeners == .warn, !network.acceptedHostListeners.isEmpty {
+            warning("vm.run.network.acceptedHostListeners has no effect with hostListeners: warn (every listener is only reported).")
+        }
+        if network.tlsInspection == .trustHostCA {
+            warning("vm.run.network.tlsInspection: trustHostCA installs the host's TLS-inspection CA certificate in the guest when interception is detected; the inspection vendor can then read the job's TLS to intercepted hosts.")
+        }
+        if let max = network.maxEnforcementFailures, !(1...100).contains(max) {
+            error("vm.run.network.maxEnforcementFailures must be between 1 and 100.")
+        }
+        if network.mode == .shared, network.maxEnforcementFailures != nil {
+            error("vm.run.network.maxEnforcementFailures does not apply to mode: shared (nothing is enforced).")
+        }
         if network.mode != .restricted, !network.allowCIDRs.isEmpty {
             error("vm.run.network.allowCIDRs is supported only when mode is restricted (use allowedCIDRs with a profile).")
         }

@@ -46,7 +46,9 @@ private func vm(network: NetworkConfig, noClipboard: Bool = true, nested: Bool =
         #expect(vm.run.noClipboard == true)
         let policy = try vm.run.network.compile()
         #expect(policy.egress != nil)
-        #expect(policy.requiresSoftnet)
+        #expect(policy.isIsolated)
+        #expect(policy.backend == .hostOnly)
+        #expect(policy.tartArguments == ["--net-host"])
     }
 
     @Test func explicitSharedModeDecodesAndWarns() throws {
@@ -127,6 +129,7 @@ private func vm(network: NetworkConfig, noClipboard: Bool = true, nested: Bool =
                   presets: [npm, pypi]
                   allowedDomains: [Registry.Example-Artifacts.com., "*.cdn.example.com", "git.example.org:8443"]
                   verify: strict
+                  backend: softnet
                   allowedCIDRs:
                     - { cidr: 203.0.113.10/32, port: 443 }
         """)
@@ -167,7 +170,7 @@ private func vm(network: NetworkConfig, noClipboard: Bool = true, nested: Bool =
     @Test func directCIDRRulesRejectPrivateAndWideRanges() {
         let privateAllow = vm(network: NetworkConfig(selection: .profile(.github), allowedCIDRs: [DirectCIDRAllow(cidr: "172.16.7.60/32", port: 443)]))
         #expect(validationMessages(privateAllow).contains { $0.severity == .error && $0.message.contains("private") })
-        let reviewed = vm(network: NetworkConfig(selection: .profile(.github), allowedCIDRs: [DirectCIDRAllow(cidr: "172.16.7.60/32", port: 443, allowPrivate: true)]))
+        let reviewed = vm(network: NetworkConfig(selection: .profile(.github), allowedCIDRs: [DirectCIDRAllow(cidr: "172.16.7.60/32", port: 443, allowPrivate: true)], backend: .softnet))
         #expect(validationMessages(reviewed).filter { $0.severity == .error }.isEmpty)
         #expect(validationMessages(reviewed).contains { $0.severity == .warning && $0.message.contains("allowPrivate") })
         let wide = vm(network: NetworkConfig(selection: .profile(.github), allowedCIDRs: [DirectCIDRAllow(cidr: "0.0.0.0/0", port: 443)]))
@@ -231,13 +234,13 @@ private func vm(network: NetworkConfig, noClipboard: Bool = true, nested: Bool =
 
 @Suite struct SoftnetRulesTests {
     @Test func githubProfileEmitsDenyAllPlusHostSSH() throws {
-        #expect(try NetworkConfig.secureDefault.compile().tartArguments == [
+        #expect(try NetworkConfig(selection: .profile(.github), backend: .softnet).compile().tartArguments == [
             "--net-softnet", "--net-softnet-block=0.0.0.0/0", "--net-softnet-allow=in proto tcp @host port 22"
         ])
     }
 
     @Test func sshRuleFollowsTheConfiguredPort() throws {
-        #expect(try NetworkConfig(selection: .profile(.offline)).compile(sshPort: 2222).tartArguments.last == "--net-softnet-allow=in proto tcp @host port 2222")
+        #expect(try NetworkConfig(selection: .profile(.offline), backend: .softnet).compile(sshPort: 2222).tartArguments.last == "--net-softnet-allow=in proto tcp @host port 2222")
     }
 
     @Test func restrictedPutsHostSSHAheadOfDirectAllows() throws {
@@ -246,7 +249,7 @@ private func vm(network: NetworkConfig, noClipboard: Bool = true, nested: Bool =
     }
 
     @Test func renderedRulesNeverContainCommas() throws {
-        let policy = try NetworkConfig(selection: .profile(.github), allowedCIDRs: [DirectCIDRAllow(cidr: "203.0.113.0/24", port: 443)]).compile()
+        let policy = try NetworkConfig(selection: .profile(.github), allowedCIDRs: [DirectCIDRAllow(cidr: "203.0.113.0/24", port: 443)], backend: .softnet).compile()
         for rule in try #require(policy.softnet).allows {
             #expect(!rule.render().contains(","))
         }
@@ -263,7 +266,7 @@ private func vm(network: NetworkConfig, noClipboard: Bool = true, nested: Bool =
     }
 
     @Test func exposeIsNeverEmitted() throws {
-        for config in [NetworkConfig.secureDefault, NetworkConfig(selection: .profile(.offline)), NetworkConfig(mode: .restricted, allowCIDRs: ["10.0.0.0/24"]), NetworkConfig(mode: .softnet)] {
+        for config in [NetworkConfig.secureDefault, NetworkConfig(selection: .profile(.github), backend: .softnet), NetworkConfig(selection: .profile(.offline)), NetworkConfig(mode: .restricted, allowCIDRs: ["10.0.0.0/24"]), NetworkConfig(mode: .softnet)] {
             #expect(!(try config.compile()).tartArguments.contains { $0.contains("expose") })
         }
     }
@@ -271,7 +274,7 @@ private func vm(network: NetworkConfig, noClipboard: Bool = true, nested: Bool =
     @Test func sharedPolicyEmitsNothing() throws {
         #expect(try NetworkConfig(mode: .shared).compile().tartArguments == [])
         #expect(NetworkPolicy.shared.tartArguments == [])
-        #expect(!NetworkPolicy.shared.requiresSoftnet)
+        #expect(!NetworkPolicy.shared.isIsolated)
     }
 }
 

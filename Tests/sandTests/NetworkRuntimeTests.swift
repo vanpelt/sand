@@ -63,7 +63,7 @@ struct FakeHostProbe: HostEgressProbing {
 
 let currentToolHelp: @Sendable (String, [String]) throws -> ProcessResult = { executable, arguments in
     if executable == "tart", arguments == ["run", "--help"] {
-        return ProcessResult(stdout: "--net-softnet-allow <comma-separated CIDRs>", stderr: "", exitCode: 0)
+        return ProcessResult(stdout: "--net-softnet-allow <comma-separated CIDRs>\n  --net-host  Restrict network access to the host-only network", stderr: "", exitCode: 0)
     }
     if executable == "tart", arguments == ["--version"] {
         return ProcessResult(stdout: "2.42.0\n", stderr: "", exitCode: 0)
@@ -82,7 +82,8 @@ func makePreflight(runner: ScriptedProcessRunner, fileSystem: FakeFileSystem = F
 }
 
 @Suite struct NetworkPreflightTests {
-    let github = try! NetworkConfig.secureDefault.compile()
+    let github = try! NetworkConfig(selection: .profile(.github), backend: .softnet).compile()
+    let hostOnly = try! NetworkConfig.secureDefault.compile()
 
     @Test func preparedHostPasses() async {
         let checks = await makePreflight(runner: ScriptedProcessRunner(responder: currentToolHelp)).run(policy: github)
@@ -283,7 +284,7 @@ func makePreflight(runner: ScriptedProcessRunner, fileSystem: FakeFileSystem = F
     @Test func tartNeverReceivesSentryVariables() async throws {
         let runner = ScriptedProcessRunner()
         let tart = Tart(processRunner: runner, logger: Logger(label: "test", minimumLevel: .critical))
-        _ = try tart.run(name: "vm", options: .init(directoryMounts: [], noAudio: true, noGraphics: true, noClipboard: true, nested: false, network: try NetworkConfig.secureDefault.compile()))
+        _ = try tart.run(name: "vm", options: .init(directoryMounts: [], noAudio: true, noGraphics: true, noClipboard: true, nested: false, network: try NetworkConfig(selection: .profile(.github), backend: .softnet).compile()))
         try await tart.clone(source: "a", name: "b")
         let scrubbed = Tart.scrubbedEnvironment(["SENTRY_DSN": "x", "CIRRUS_SENTRY_TAGS": "y", "PATH": "/bin"])
         #expect(scrubbed == ["PATH": "/bin"])
