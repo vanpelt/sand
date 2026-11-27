@@ -67,7 +67,12 @@ runners:
           allowGitHubSSH: false    # reserved; HTTPS checkout only
           verify: basic            # basic (default) | strict
           transport: tunnel        # tunnel (default); gateway is reserved
-          allowedCIDRs:            # expert escape hatch: direct allows that bypass the proxy
+          backend: softnet         # hostOnly (default, no root) | softnet (privileged softnet) | auto
+          hostListeners: warn      # hostOnly only: warn (default) | deny host services reachable on the bridge
+          acceptedHostListeners: []  # with deny: accepted exposures, e.g. [tcp/7000, udp/5353, udp/*]
+          tlsInspection: fail      # fail (default) | trustHostCA: trust the host's TLS-inspection CA in the guest
+          maxEnforcementFailures: 3  # consecutive enforcement failures before sand run exits 78
+          allowedCIDRs:            # expert escape hatch (softnet backend only): direct allows that bypass the proxy
             - cidr: 203.0.113.10/32
               port: 443
               proto: tcp

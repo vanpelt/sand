@@ -1,5 +1,7 @@
 # The github profile extended with built-in presets, extra domains and one
-# reviewed direct CIDR allow. `sand network explain --config <this file>` prints
+# reviewed direct CIDR allow. Direct CIDR allows need the softnet backend
+# (a privileged softnet; see docs/network-isolation.md): the default hostOnly
+# backend has no route off the host. `sand network explain --config <this file>` prints
 # the compiled policy and its hash.
 runners:
   - name: secure-extended
@@ -16,6 +18,7 @@ runners:
             - "*.cdn.example.com"
             - "git.example.org:8443"
           verify: strict
+          backend: softnet
           allowedCIDRs:
             # Bypasses the proxy (no hostname check, no audit line). Public ranges only.
             - { cidr: 203.0.113.10/32, port: 443, proto: tcp }
