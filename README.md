@@ -98,11 +98,47 @@ vm:
 
 For `local` sources sand skips the registry pull and clones the named VM directly (`tart clone <name> <ephemeral>`), so the VM must already exist in `~/.tart/vms`.
 
-### Experimental VM network isolation
+### VM network isolation (secure by default)
 
-Sand supports opt-in Softnet isolation and a restricted IPv4 egress mode. The
-restricted mode is a prototype and requires a separately configured egress
-proxy for GitHub Actions connectivity. See [network isolation prototype](docs/network-isolation.md).
+> **Breaking change:** a runner with no `vm.run.network` key now gets
+> `profile: github` instead of Tart's shared NAT. On a host without the one-time
+> softnet setup, `sand run` exits before cloning and prints the fix. To keep the
+> old unrestricted behaviour, opt out explicitly with `network: { mode: shared }`
+> (required for host `mounts`).
+
+With no configuration, every VM is confined by Softnet (deny all guest IPv4,
+IPv6 dropped, host SSH only) and reaches the internet only through a per-VM,
+host-side HTTPS CONNECT proxy that Sand runs on loopback and forwards into the
+guest as `127.0.0.1:3128` over the SSH session. The proxy allows GitHub
+(github.com, the Actions service, release/LFS/package CDNs, ghcr.io) and
+nothing else, so the guest cannot reach the host, the LAN, the tailnet or
+corporate ranges. Because it resolves names with the host's own resolver, VPN
+split DNS (for example BlastShield steering github.com to a private front so
+traffic satisfies an org IP allow list) works with no configuration.
+
+```yaml
+vm:
+  run:
+    network:
+      profile: github                # default; or offline (no egress at all)
+      presets: [npm, pypi, homebrew] # optional extra destination bundles
+      allowedDomains:                # optional; port defaults to 443
+        - registry.example-artifacts.com
+        - "*.cdn.example.com"
+```
+
+One-time host setup (run it yourself; Sand never runs sudo):
+
+```sh
+brew install openai/tools/softnet
+sudo chown root:wheel "$(realpath "$(which softnet)")" && sudo chmod u+s "$(realpath "$(which softnet)")"
+sand doctor   # or: sand network preflight --config sand.yml
+```
+
+`sand network explain --config sand.yml` prints each runner's compiled policy
+and hash. See [docs/network-isolation.md](docs/network-isolation.md) for the
+threat model, presets, VPN/BlastShield behaviour, audit lines, troubleshooting
+and residual risks.
 
 ### GitHub Actions setup
 
@@ -211,9 +247,11 @@ runners:
     vm:
       run:
         noGraphics: true    # default true; pass --no-graphics
-        noClipboard: false  # default false; pass --no-clipboard when true
+        noClipboard: true   # default true when network is isolated (the default), false with mode: shared
         nested: false       # default false; pass --nested for nested virtualization
         rootDiskOpts: null  # optional; passed as --root-disk-opts
+        network:            # optional; omitted means profile: github (see above)
+          profile: github
 ```
 
 Set `nested: true` to boot the VM with `tart run --nested`, enabling nested virtualization inside the guest. This requires an Apple Silicon host and guest that support it (see the [Tart docs](https://tart.run/)).
