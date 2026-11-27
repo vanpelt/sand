@@ -24,5 +24,18 @@ jobs:
           swift --version
       - name: Check out this PR branch
         uses: actions/checkout@v7
-      - name: Run Swift tests
-        run: swift test
+      - name: Create unlocked Keychain and run Swift tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Headless Tart guests may have a locked/missing login Keychain.
+          # Use a fresh Keychain so the persistent RSA signing test can run
+          # without prompting for interactive authorization.
+          KEYCHAIN="$RUNNER_TEMP/sand-smoke.keychain-db"
+          PASSWORD="$(openssl rand -hex 32)"
+          security create-keychain -p "$PASSWORD" "$KEYCHAIN"
+          security unlock-keychain -p "$PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN"
+          security default-keychain -d user -s "$KEYCHAIN"
+          swift test
