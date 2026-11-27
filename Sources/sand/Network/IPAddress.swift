@@ -8,6 +8,11 @@ enum IPAddress: Hashable, Sendable, CustomStringConvertible {
     case v6([UInt8])
 
     init?(_ string: String) {
+        // inet_pton stops at the first NUL; refuse anything that is not printable
+        // ASCII so "1.1.1.1\0..." can never parse as the address before the NUL.
+        guard !string.isEmpty, string.utf8.allSatisfy({ $0 > 0x20 && $0 < 0x7f }) else {
+            return nil
+        }
         var v4 = in_addr()
         if inet_pton(AF_INET, string, &v4) == 1 {
             self = .v4(UInt32(bigEndian: v4.s_addr))

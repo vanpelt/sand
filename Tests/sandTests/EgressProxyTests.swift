@@ -57,7 +57,7 @@ private struct Harness {
     let echoPort: UInt16
     let recorder: AuditRecorder
 
-    static func make(maxTunnels: Int = 256) async throws -> Harness {
+    static func make(maxTunnels: Int = 256, extraCIDRs: [DirectCIDRAllow] = [], hostFacts: HostFacts = HostFacts(), testAllowance: Set<sand.IPAddress>? = nil) async throws -> Harness {
         let echo = try EchoServer()
         let echoPort = try await echo.start()
         let loopback = IPAddress("127.0.0.1")!
@@ -65,15 +65,17 @@ private struct Harness {
             rules: [
                 DomainRule(pattern: DomainPattern(kind: .exact("echo.test")), port: Int(echoPort)),
                 DomainRule(pattern: DomainPattern(kind: .exact("rebind.test")), port: Int(echoPort)),
-                DomainRule(pattern: DomainPattern(kind: .exact("echo.test")), port: 22)
+                DomainRule(pattern: DomainPattern(kind: .exact("echo.test")), port: 22),
+                DomainRule(pattern: DomainPattern(kind: .suffix("wild.test")), port: Int(echoPort))
             ],
             steeredNames: [],
             verify: .basic,
-            extraCIDRs: []
+            extraCIDRs: extraCIDRs
         )
         let resolver = StaticHostResolver(table: [
             "echo.test": [loopback],
-            "rebind.test": [IPAddress("10.0.0.1")!]
+            "rebind.test": [IPAddress("10.0.0.1")!],
+            "example.com": [loopback]
         ])
         let recorder = AuditRecorder()
         var limits = EgressProxy.Limits()
@@ -82,7 +84,7 @@ private struct Harness {
         limits.clientHelloTimeout = 3
         let proxy = EgressProxy(
             policy: policy,
-            destinationGuard: DestinationGuard(hostFacts: HostFacts(), testAllowance: [loopback]),
+            destinationGuard: DestinationGuard(hostFacts: hostFacts, testAllowance: testAllowance ?? [loopback]),
             resolver: resolver,
             audit: recorder.audit,
             limits: limits
@@ -236,6 +238,69 @@ private func background<T: Sendable>(_ work: @escaping @Sendable () throws -> T)
         #expect(!harness.proxy.hasFailed)
         harness.proxy.failForTesting()
         #expect(harness.proxy.hasFailed)
+    }
+
+    @Test(arguments: [
+        "example.com\u{0}.wild.test", "example.com%00.wild.test", "a/b.wild.test", "a_b.wild.test",
+        "a\tb.wild.test", "a..wild.test", "x.-a.wild.test", "1.1.1.1\u{0}.wild.test"
+    ])
+    func hostWithForbiddenBytesIsRefusedBeforeResolution(host: String) async throws {
+        let harness = try await Harness.make()
+        defer { harness.stop() }
+        let port = harness.echoPort
+        let status = try await background { LoopbackClient.connectStatus(port: harness.proxyPort, target: "\(host):\(port)") }
+        #expect(status == 400)
+        // Nothing was allowed or connected.
+        #expect(!harness.recorder.events.contains { $0.fields["decision"] == "allow" })
+        #expect(harness.recorder.events.contains { $0.fields["reason"] == "bad-request" })
+    }
+
+    @Test func denyHeaderCarriesOnlyAFixedCode() async throws {
+        let harness = try await Harness.make()
+        defer { harness.stop() }
+        let port = harness.echoPort
+        let header = try await background { () -> String in
+            let client = try harness.client()
+            try client.send("CONNECT rebind.test:\(port) HTTP/1.1\r\nHost: rebind.test\r\n\r\n")
+            return try client.readHeader()
+        }
+        #expect(LoopbackClient.statusCode(of: header) == 403)
+        #expect(header.contains("X-Sand-Deny: blocked-address\r\n"))
+        #expect(!header.contains("10.0.0.1"))
+        #expect(!header.contains("private"))
+        // The detail stays in the host audit log.
+        #expect(harness.recorder.events.contains { $0.fields["reason"]?.contains("10.0.0.1") == true })
+    }
+
+    @Test func publicDenyCodesStripDetail() {
+        #expect(EgressProxy.publicDenyCode("blocked-address(10.1.2.3=private;fd00::1=unique-local)") == "blocked-address")
+        #expect(EgressProxy.publicDenyCode("resolve-failed:resolve x: nodename nor servname provided") == "resolve-failed")
+        #expect(EgressProxy.publicDenyCode("connect-failed:POSIXErrorCode(rawValue: 61)") == "connect-failed")
+        #expect(EgressProxy.publicDenyCode("not-allowlisted") == "not-allowlisted")
+        #expect(EgressProxy.publicDenyCode("10.0.0.1 something") == "denied")
+    }
+
+    @Test func allowPrivateLiteralToLoopbackIsStillDenied() async throws {
+        // A reviewed allowPrivate entry covering loopback must not reach host services.
+        // The guard must deny before any upstream connect, so the port is arbitrary.
+        let echoPort = 5000
+        let harness = try await Harness.make(
+            extraCIDRs: [DirectCIDRAllow(cidr: "127.0.0.0/24", port: echoPort, allowPrivate: true)],
+            testAllowance: []
+        )
+        defer { harness.stop() }
+        let status = try await background { LoopbackClient.connectStatus(port: harness.proxyPort, target: "127.0.0.1:\(echoPort)") }
+        #expect(status == 403)
+        #expect(harness.recorder.events.contains { $0.fields["reason"]?.hasPrefix("blocked-address(127.0.0.1=loopback") == true })
+    }
+
+    @Test func connectRequestRejectsNonLDHHosts() {
+        for host in ["a\u{0}.b.com", "a%2e.b.com", "a/b.com", "a_b.com", "a\tb.com", "a..b.com", "-a.b.com", "a.123",
+                     String(repeating: "a.", count: 127) + "com"] {
+            #expect(throws: ConnectRequest.ParseError.badRequest) { try ConnectRequest.parse(header: "CONNECT \(host):443 HTTP/1.1") }
+        }
+        #expect(throws: ConnectRequest.ParseError.badRequest) { try ConnectRequest.parse(header: "CONNECT [1.1.1.1\u{0}x]:443 HTTP/1.1") }
+        #expect((try? ConnectRequest.parse(header: "CONNECT 1.1.1.1:443 HTTP/1.1")) == ConnectRequest(host: "1.1.1.1", port: 443))
     }
 
     @Test func connectRequestParsing() throws {

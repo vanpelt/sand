@@ -56,6 +56,15 @@ struct RouteInspector: Sendable {
         }
     }
 
+    /// The interface of the most specific non-default route covering `address`,
+    /// or nil when only the default route would carry it.
+    func interface(for address: IPAddress) -> String? {
+        routes
+            .filter { $0.destination?.contains(address) == true }
+            .max { ($0.destination?.prefixLength ?? 0) < ($1.destination?.prefixLength ?? 0) }?
+            .interface
+    }
+
     var defaultGateways: [String] {
         routes.filter { $0.isDefault && IPAddress($0.gateway) != nil }.map(\.gateway)
     }

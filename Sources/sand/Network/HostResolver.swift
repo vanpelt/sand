@@ -29,6 +29,10 @@ struct SystemHostResolver: HostResolving {
     }
 
     static func resolveBlocking(_ host: String) throws -> [IPAddress] {
+        // Defence in depth: getaddrinfo(3) would silently truncate at a NUL.
+        guard !host.isEmpty, host.utf8.allSatisfy({ $0 > 0x20 && $0 < 0x7f }) else {
+            throw HostResolverError.failed("<invalid>", "hostname contains control or non-ASCII bytes")
+        }
         var hints = addrinfo()
         hints.ai_family = AF_UNSPEC
         hints.ai_socktype = SOCK_STREAM

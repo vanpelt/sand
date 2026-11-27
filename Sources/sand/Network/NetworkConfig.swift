@@ -220,17 +220,44 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
         guard (1...65_535).contains(allow.port) else {
             throw DomainPatternError.invalidPort("\(allow.cidr) port \(allow.port)")
         }
+        if hardDeniedRanges.contains(where: { $0.overlaps(network) }) {
+            throw DirectCIDRError.hostLocalRange(allow.cidr)
+        }
         if !allow.allowPrivate, protectedRanges.contains(where: { $0.overlaps(network) }) {
             throw DirectCIDRError.privateRange(allow.cidr)
+        }
+    }
+
+    /// Ranges no direct allow may touch, even with `allowPrivate`: the softnet
+    /// allow would let the guest reach host loopback, link-local/metadata or
+    /// multicast directly.
+    static let hardDeniedRanges: [IPNetwork] = ["0.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4"].compactMap(IPNetwork.init)
+
+    /// `allowedCIDRs` entries that overlap a host interface address or an
+    /// attached subnet (the LAN, a VPN's point-to-point address, the vmnet
+    /// bridge). Checked at preflight because it depends on the host.
+    static func hostOverlaps(_ allows: [DirectCIDRAllow], facts: HostFacts) -> [(DirectCIDRAllow, String)] {
+        allows.compactMap { allow in
+            guard let network = IPNetwork(allow.cidr) else { return nil }
+            if let address = facts.interfaceAddresses.first(where: { network.contains($0) }) {
+                return (allow, "contains host address \(address)")
+            }
+            if let subnet = facts.onLinkSubnets.first(where: { $0.overlaps(network) }) {
+                return (allow, "overlaps on-link subnet \(subnet)")
+            }
+            return nil
         }
     }
 }
 
 enum DirectCIDRError: Error, Equatable, CustomStringConvertible {
     case privateRange(String)
+    case hostLocalRange(String)
 
     var description: String {
         switch self {
+        case let .hostLocalRange(cidr):
+            return "allowedCIDRs entry \(cidr) overlaps loopback, link-local/metadata, multicast or reserved space; this is refused even with allowPrivate: true"
         case let .privateRange(cidr):
             return "allowedCIDRs entry \(cidr) overlaps a private, loopback, link-local, CGNAT or multicast range; set allowPrivate: true only after review"
         }

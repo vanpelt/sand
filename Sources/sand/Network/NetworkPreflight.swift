@@ -142,14 +142,17 @@ struct NetworkPreflight: Sendable {
     let hostProbe: HostEgressProbing
     /// Optional in-process proxy self-test (P5); nil skips it.
     let proxySelfTest: (@Sendable (EgressPolicy) async -> [PreflightCheck])?
+    let hostFacts: @Sendable () -> HostFacts
 
     init(
         processRunner: ProcessRunning,
         fileSystem: PreflightFileSystem = SystemPreflightFileSystem(),
         resolver: HostResolving = SystemHostResolver(),
         hostProbe: HostEgressProbing = SystemHostEgressProbe(),
-        proxySelfTest: (@Sendable (EgressPolicy) async -> [PreflightCheck])? = NetworkPreflight.liveProxySelfTest
+        proxySelfTest: (@Sendable (EgressPolicy) async -> [PreflightCheck])? = NetworkPreflight.liveProxySelfTest,
+        hostFacts: @escaping @Sendable () -> HostFacts = { HostFacts.current() }
     ) {
+        self.hostFacts = hostFacts
         self.processRunner = processRunner
         self.fileSystem = fileSystem
         self.resolver = resolver
@@ -170,6 +173,7 @@ struct NetworkPreflight: Sendable {
         checks.append(contentsOf: await checkTart())
         checks.append(contentsOf: await checkSoftnet())
         if let egress = policy.egress {
+            checks.append(checkDirectCIDROverlap(egress))
             checks.append(contentsOf: await checkHostEgress())
             if let proxySelfTest {
                 checks.append(contentsOf: await proxySelfTest(egress))
@@ -189,7 +193,8 @@ struct NetworkPreflight: Sendable {
     func perVM(policy: NetworkPolicy) async -> [PreflightCheck] {
         guard policy.requiresSoftnet else { return [] }
         var checks = [await checkSoftnetPrivilege()]
-        if policy.egress != nil {
+        if let egress = policy.egress {
+            checks.append(checkDirectCIDROverlap(egress))
             do {
                 let addresses = try await resolver.resolve("github.com")
                 checks.append(PreflightCheck("P4 resolve github.com", addresses.isEmpty ? .failed : .ok, "\(addresses.count) address(es)"))
@@ -260,6 +265,20 @@ struct NetworkPreflight: Sendable {
             checks.append(PreflightCheck("P4 GitHub egress", .failed, "TLS handshake to api.github.com:443 failed: \(error)", remediation: "The host itself cannot reach GitHub; fix host connectivity first."))
         }
         return checks
+    }
+
+    /// P9: a reviewed `allowedCIDRs` entry must never cover the host itself or
+    /// an attached subnet; the softnet allow would reach it directly.
+    func checkDirectCIDROverlap(_ egress: EgressPolicy) -> PreflightCheck {
+        guard !egress.extraCIDRs.isEmpty else {
+            return PreflightCheck("P9 allowedCIDRs vs host", .ok, "no direct CIDR allows")
+        }
+        let overlaps = NetworkConfig.hostOverlaps(egress.extraCIDRs, facts: hostFacts())
+        guard overlaps.isEmpty else {
+            let detail = overlaps.map { "\($0.0.cidr): \($0.1)" }.joined(separator: "; ")
+            return PreflightCheck("P9 allowedCIDRs vs host", .failed, detail, remediation: "Remove or narrow the allowedCIDRs entry; the VM must never reach the host or its LAN/VPN subnets directly.")
+        }
+        return PreflightCheck("P9 allowedCIDRs vs host", .ok, "\(egress.extraCIDRs.count) entr(ies) clear of host subnets")
     }
 
     func checkDisk() -> PreflightCheck {

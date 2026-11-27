@@ -34,13 +34,26 @@ struct HostFacts: Sendable, Equatable {
                 continue
             }
             facts.interfaceAddresses.append(address)
-            if let maskPointer = entry.pointee.ifa_netmask,
-               let mask = IPAddress(sockaddr: UnsafePointer(maskPointer)),
-               let network = IPNetwork(address: address, prefixLength: prefixLength(of: mask, family: address)) {
+            let pointToPoint = entry.pointee.ifa_flags & UInt32(IFF_POINTOPOINT) != 0
+            let maskLength = entry.pointee.ifa_netmask
+                .flatMap { IPAddress(sockaddr: UnsafePointer($0)) }
+                .map { prefixLength(of: $0, family: address) }
+            if let network = Self.onLinkNetwork(address: address, maskLength: maskLength, pointToPoint: pointToPoint) {
                 facts.onLinkSubnets.append(network)
             }
         }
         return facts
+    }
+
+    /// A point-to-point (utun/VPN) interface has no attached LAN: only its own
+    /// address is on-link, whatever netmask the VPN client set. Otherwise a /16
+    /// on a VPN tunnel would mark every steered GitHub front as on-link.
+    static func onLinkNetwork(address: IPAddress, maskLength: Int?, pointToPoint: Bool) -> IPNetwork? {
+        if pointToPoint {
+            return IPNetwork(address: address, prefixLength: address.isIPv4 ? 32 : 128)
+        }
+        guard let maskLength else { return nil }
+        return IPNetwork(address: address, prefixLength: maskLength)
     }
 
     func withVMSubnet(_ subnet: IPNetwork?) -> HostFacts {

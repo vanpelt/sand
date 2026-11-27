@@ -175,6 +175,26 @@ private func vm(network: NetworkConfig, noClipboard: Bool = true, nested: Bool =
         #expect(throws: (any Error).self) { try wide.run.network.compile() }
     }
 
+    @Test(arguments: ["127.0.0.0/24", "127.0.0.1/32", "169.254.169.254/32", "224.0.0.0/24", "0.0.0.0/24"])
+    func directCIDRHardFloorIgnoresAllowPrivate(cidr: String) {
+        let config = vm(network: NetworkConfig(selection: .profile(.github), allowedCIDRs: [DirectCIDRAllow(cidr: cidr, port: 5000, allowPrivate: true)]))
+        #expect(validationMessages(config).contains { $0.severity == .error && $0.message.contains("even with allowPrivate") })
+        #expect(throws: (any Error).self) { try config.run.network.compile() }
+    }
+
+    @Test func directCIDROverlappingHostSubnetFailsPreflight() throws {
+        let facts = HostFacts(interfaceAddresses: [IPAddress("10.0.0.152")!], onLinkSubnets: [IPNetwork("10.0.0.0/24")!])
+        let lan = DirectCIDRAllow(cidr: "10.0.0.0/24", port: 443, allowPrivate: true)
+        let other = DirectCIDRAllow(cidr: "10.9.9.0/24", port: 443, allowPrivate: true)
+        let overlaps = NetworkConfig.hostOverlaps([lan, other], facts: facts)
+        #expect(overlaps.map(\.0) == [lan])
+        let policy = EgressPolicy(rules: [], steeredNames: [], verify: .basic, extraCIDRs: [lan])
+        let preflight = NetworkPreflight(processRunner: SystemProcessRunner(), proxySelfTest: nil, hostFacts: { facts })
+        #expect(preflight.checkDirectCIDROverlap(policy).status == .failed)
+        let clean = EgressPolicy(rules: [], steeredNames: [], verify: .basic, extraCIDRs: [other])
+        #expect(preflight.checkDirectCIDROverlap(clean).status == .ok)
+    }
+
     @Test func isolatedProfilesRejectMountsNestedAndVerifyOff() {
         let mount = Config.DirectoryMount(hostPath: "/tmp", name: "tmp", mode: .ro)
         let messages = validationMessages(vm(network: .secureDefault, nested: true, mounts: [mount])).map(\.message).joined(separator: "\n")
@@ -204,7 +224,8 @@ private func vm(network: NetworkConfig, noClipboard: Bool = true, nested: Bool =
         #expect(base.policyHash.count == 64)
         let extended = try NetworkConfig(selection: .profile(.github), allowedDomains: ["example.org"]).compile()
         #expect(base.policyHash != extended.policyHash)
-        #expect(base.explain().contains { $0.contains("productionresultssa*.blob.core.windows.net") })
+        #expect(base.explain().contains { $0.contains("productionresultssa0.blob.core.windows.net") })
+        #expect(!base.explain().contains { $0.contains("productionresultssa*") })
     }
 }
 
@@ -271,6 +292,30 @@ private func vm(network: NetworkConfig, noClipboard: Bool = true, nested: Bool =
         #expect(!pattern.matches("a.productionresultssa1.blob.core.windows.net"))
         #expect(!pattern.matches("evil.blob.core.windows.net"))
         #expect(!pattern.matches("productionresultssa1.blob.core.windows.net.evil.com"))
+    }
+
+    @Test func presetListsGitHubResultsAccountsExactly() throws {
+        let policy = try NetworkConfig.secureDefault.compile()
+        guard let egress = policy.egress else {
+            Issue.record("expected egress policy")
+            return
+        }
+        #expect(egress.allows(host: "productionresultssa0.blob.core.windows.net", port: 443))
+        #expect(egress.allows(host: "productionresultssa19.blob.core.windows.net", port: 443))
+        // Attacker-registrable storage account names must not match.
+        #expect(!egress.allows(host: "productionresultssaxyz12.blob.core.windows.net", port: 443))
+        #expect(!egress.allows(host: "productionresultssa20.blob.core.windows.net", port: 443))
+        #expect(!egress.allows(host: "productionresultssa1x.blob.core.windows.net", port: 443))
+    }
+
+    @Test func wildcardHeadMustBeStrictLDH() throws {
+        let pattern = try DomainPattern.parse("*.actions.githubusercontent.com")
+        for host in ["example.com\u{0}.actions.githubusercontent.com", "a%00.actions.githubusercontent.com",
+                     "a/b.actions.githubusercontent.com", "a_b.actions.githubusercontent.com", "a\tb.actions.githubusercontent.com"] {
+            #expect(!pattern.matches(host), "\(host) must not match")
+        }
+        let glob = try DomainPattern.parse("foo*.example.com")
+        #expect(!glob.matches("foo\u{0}.example.com"))
     }
 
     @Test func matchingIsCaseAndTrailingDotInsensitive() throws {

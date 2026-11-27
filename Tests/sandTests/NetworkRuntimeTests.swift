@@ -180,6 +180,15 @@ func makePreflight(runner: ScriptedProcessRunner, fileSystem: FakeFileSystem = F
         #expect(results.first { $0.id == "N1" }?.passed == false)
     }
 
+    @Test func emptyTargetNeverPasses() {
+        // With no default route $GW is empty: the gateway probes must not pass untested.
+        let results = verifier.evaluate(transcript(["N3a": "NOTARGET empty-target", "N4a": "NOTARGET empty-target"]))
+        #expect(results.first { $0.id == "N3a" }?.passed == false)
+        #expect(results.first { $0.id == "N4a" }?.passed == false)
+        #expect(verifier.script.contains("NOTARGET"))
+        #expect(!verifier.script.contains("CLOSED no-target"))
+    }
+
     @Test func duplicateLinesKeepTheWorstOutcome() {
         #expect(GuestEgressVerifier.parse("SANDPROBE N1 OPEN a\nSANDPROBE N1 CLOSED b")["N1"]?.0 == "OPEN")
         #expect(GuestEgressVerifier.parse("SANDPROBE N1 CLOSED a\nSANDPROBE N1 OPEN b")["N1"]?.0 == "OPEN")

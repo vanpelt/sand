@@ -96,7 +96,11 @@ final class VMNetworkSession: @unchecked Sendable {
     func establish(ssh: SSHClient, vmIP: String) async throws {
         let facts = dependencies.hostFacts().withVMSubnet(RouteInspector.vmSubnet(for: vmIP))
         if let egress = policy.egress {
-            let proxy = dependencies.makeProxy(egress, DestinationGuard(hostFacts: facts), audit)
+            let routes = await dependencies.routes()
+            let steeredInterfaces = await DestinationGuard.learnSteeredInterfaces(names: egress.steeredNames, resolver: dependencies.resolver, routes: routes)
+            audit.emit("network.steering.learned", ["interfaces": steeredInterfaces.sorted().joined(separator: ","), "policy_hash": policy.policyHash])
+            let guardrail = DestinationGuard(hostFacts: facts, routes: routes, steeredInterfaces: steeredInterfaces)
+            let proxy = dependencies.makeProxy(egress, guardrail, audit)
             lock.withLock { self.proxy = proxy }
             let port = try await proxy.start(port: 0)
             logger.info("egress proxy for VM listening on 127.0.0.1:\(port)")

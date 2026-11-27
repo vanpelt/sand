@@ -40,6 +40,12 @@ final class SSHClientTests: XCTestCase {
             arguments: [
                 "-p", "pw",
                 "ssh",
+                "-F", "/dev/null",
+                "-o", "ForwardAgent=no",
+                "-o", "ForwardX11=no",
+                "-o", "PermitLocalCommand=no",
+                "-o", "ControlMaster=no",
+                "-o", "ControlPath=none",
                 "-o", "PreferredAuthentications=password",
                 "-o", "PubkeyAuthentication=no",
                 "-o", "IdentitiesOnly=yes",
@@ -49,6 +55,7 @@ final class SSHClientTests: XCTestCase {
                 "-o", "ConnectTimeout=10",
                 "-o", "ServerAliveInterval=30",
                 "-o", "ServerAliveCountMax=6",
+                "-o", "ClearAllForwardings=yes",
                 "-p", "2222",
                 "admin@10.0.0.1",
                 "/bin/bash -lc 'echo hi'"
@@ -56,5 +63,38 @@ final class SSHClientTests: XCTestCase {
             wait: false
         )
         XCTAssertEqual(runner.startCalls.first, expected)
+    }
+
+    func testEverySSHInvocationIgnoresUserConfigAndForwardsNothing() async throws {
+        let runner = SSHProcessRunner()
+        let ssh = SSHClient(processRunner: runner, host: "10.0.0.1", config: .init(user: "admin", password: "pw", port: 22))
+        _ = try await ssh.exec(command: "true")
+        _ = try await ssh.copy(localPath: "/tmp/a", remotePath: "/tmp/b")
+        _ = try ssh.startReverseTunnel(remotePort: 3128, localPort: 50000)
+        let calls = runner.runCalls + runner.startCalls
+        XCTAssertEqual(calls.count, 3)
+        for call in calls {
+            let args = call.arguments
+            guard let f = args.firstIndex(of: "-F") else {
+                XCTFail("missing -F /dev/null in \(args)")
+                continue
+            }
+            XCTAssertEqual(args[f + 1], "/dev/null")
+            for option in ["ForwardAgent=no", "ForwardX11=no", "PermitLocalCommand=no", "ControlMaster=no", "ControlPath=none"] {
+                XCTAssertTrue(args.contains(option), "\(option) missing")
+            }
+        }
+        // exec and scp forward nothing; the tunnel keeps only its own -R.
+        XCTAssertTrue(runner.runCalls.allSatisfy { $0.arguments.contains("ClearAllForwardings=yes") })
+        let tunnel = runner.startCalls[0].arguments
+        XCTAssertFalse(tunnel.contains("ClearAllForwardings=yes"))
+        XCTAssertEqual(tunnel.filter { $0 == "-R" }.count, 1)
+    }
+
+    func testChildEnvironmentDropsTheAgentSocket() {
+        let env = SSHClient.childEnvironment(["SSH_AUTH_SOCK": "/private/tmp/agent", "SSH_AGENT_PID": "1", "PATH": "/usr/bin"])
+        XCTAssertNil(env["SSH_AUTH_SOCK"])
+        XCTAssertNil(env["SSH_AGENT_PID"])
+        XCTAssertEqual(env["PATH"], "/usr/bin")
     }
 }

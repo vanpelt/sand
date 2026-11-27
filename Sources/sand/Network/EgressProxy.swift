@@ -58,6 +58,7 @@ final class EgressProxy: EgressProxying, @unchecked Sendable {
         var bytesUp = 0
         var bytesDown = 0
         var deniedByHost: [String: Int] = [:]
+        var suppressedDenyEvents = 0
     }
 
     init(policy: EgressPolicy, destinationGuard: DestinationGuard, resolver: HostResolving, audit: NetworkAudit, limits: Limits = Limits()) {
@@ -163,12 +164,46 @@ final class EgressProxy: EgressProxying, @unchecked Sendable {
         sessions.removeValue(forKey: ObjectIdentifier(session))
     }
 
+    /// Reason codes a guest may see in `X-Sand-Deny`. Anything else maps to `denied`.
+    static let publicDenyCodes: Set<String> = [
+        "not-allowlisted", "ip-literal", "blocked-address", "no-address", "resolve-failed",
+        "connect-failed", "method-not-allowed", "bad-request", "header-too-large",
+        "tunnel-limit", "header-timeout", "resolve-timeout", "connect-timeout"
+    ]
+
+    /// The fixed code for a (possibly detailed) internal deny reason, e.g.
+    /// `blocked-address(10.1.2.3=private)` becomes `blocked-address`.
+    static func publicDenyCode(_ reason: String) -> String {
+        let code = String(reason.prefix { $0 != "(" && $0 != ":" })
+        return publicDenyCodes.contains(code) ? code : "denied"
+    }
+
+    /// Bounds on deny bookkeeping so a guest looping over unique names cannot
+    /// fill the host disk with audit lines or grow memory without limit.
+    static let maxDeniedHostsTracked = 256
+    static let denyAuditBurst = 200
+    static let denyAuditSampleEvery = 100
+
     fileprivate func record(denied host: String?, _ fields: [String: String]) {
         counters.denied += 1
         if let host {
-            counters.deniedByHost[host, default: 0] += 1
+            if counters.deniedByHost[host] != nil || counters.deniedByHost.count < Self.maxDeniedHostsTracked {
+                counters.deniedByHost[host, default: 0] += 1
+            } else {
+                counters.deniedByHost["(other)", default: 0] += 1
+            }
         }
-        audit.emit("network.connect", level: .warning, fields.merging(["decision": "deny"]) { $1 })
+        // Full detail for the first burst, then one sampled line per N denies.
+        let overBurst = counters.denied - Self.denyAuditBurst
+        guard overBurst <= 0 || overBurst % Self.denyAuditSampleEvery == 0 else {
+            counters.suppressedDenyEvents += 1
+            return
+        }
+        var merged = fields.merging(["decision": "deny"]) { $1 }
+        if counters.suppressedDenyEvents > 0 {
+            merged["suppressed"] = String(counters.suppressedDenyEvents)
+        }
+        audit.emit("network.connect", level: .warning, merged)
     }
 
     fileprivate func record(allowed fields: [String: String], up: Int, down: Int) {
@@ -237,7 +272,13 @@ struct ConnectRequest: Equatable, Sendable {
             portText = authority[authority.index(after: colon)...]
         }
         host = DomainPattern.normalize(host)
-        guard !host.isEmpty, host.count <= 253, !portText.isEmpty, portText.allSatisfy({ $0.isASCII && $0.isNumber }),
+        // The host must be an inet_pton literal or a strict LDH name. Anything
+        // else (NUL, control bytes, '%', '/', '_', empty labels) is refused
+        // before it can reach the allowlist or getaddrinfo(3).
+        guard IPAddress(host) != nil || DomainPattern.isValidHostname(host) else {
+            throw ParseError.badRequest
+        }
+        guard !host.isEmpty, host.utf8.count <= 253, !portText.isEmpty, portText.allSatisfy({ $0.isASCII && $0.isNumber }),
               let port = Int(portText), (1...65_535).contains(port) else {
             throw ParseError.badRequest
         }
@@ -290,7 +331,11 @@ private final class ProxySession: @unchecked Sendable {
         if let port { fields["port"] = String(port) }
         proxy.record(denied: host, fields)
         let text = Self.statusText(status)
-        let response = "HTTP/1.1 \(status) \(text)\r\nX-Sand-Deny: \(NetworkAuditEvent.sanitize(reason))\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        // The guest only ever sees a fixed reason code. Resolved addresses,
+        // resolver and connect errors stay in the host audit log: echoing them
+        // would hand guest code a DNS read-back channel and the host's view of
+        // the network (e.g. VPN front addresses).
+        let response = "HTTP/1.1 \(status) \(text)\r\nX-Sand-Deny: \(EgressProxy.publicDenyCode(reason))\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         if client.state == .setup {
             client.start(queue: queue)
         }
@@ -381,11 +426,18 @@ private final class ProxySession: @unchecked Sendable {
         self.request = request
         let policy = proxy.policy
         if let literal = IPAddress(request.host) {
-            guard policy.allowsLiteral(literal, port: request.port) else {
+            guard let allowance = policy.literalAllowance(literal, port: request.port) else {
                 reject(status: 403, reason: "ip-literal", host: request.host, port: request.port)
                 return
             }
-            connect(to: literal, steered: false)
+            // Literals still go through the guard: allowPrivate only opens the
+            // reviewed private range, never the host, its LAN or loopback.
+            switch proxy.destinationGuard.checkLiteral(literal, allowPrivate: allowance.allowPrivate) {
+            case let .deny(reason):
+                reject(status: 403, reason: "blocked-address(\(literal)=\(reason))", host: request.host, port: request.port)
+            case let .allow(address, _):
+                connect(to: address, steered: false)
+            }
             return
         }
         guard policy.allows(host: request.host, port: request.port) else {

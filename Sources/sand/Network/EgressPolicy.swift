@@ -41,7 +41,7 @@ struct DomainPattern: Hashable, Sendable, Comparable, CustomStringConvertible {
         /// `*.actions.githubusercontent.com` stores `actions.githubusercontent.com`;
         /// matches one or more labels in front of it, never the apex itself.
         case suffix(String)
-        /// `productionresultssa*.blob.core.windows.net`: the first label must
+        /// `build*.example.com`: the first label must
         /// start with `prefix` and end with `suffix`; the remaining labels match exactly.
         case firstLabelGlob(prefix: String, suffix: String, rest: String)
     }
@@ -95,7 +95,9 @@ struct DomainPattern: Hashable, Sendable, Comparable, CustomStringConvertible {
 
     func matches(_ host: String) -> Bool {
         let candidate = Self.normalize(host)
-        guard !candidate.isEmpty, !IPAddress.isLiteral(candidate) else { return false }
+        // Every label (including the wildcard head) must be strict LDH, so a NUL,
+        // control byte, '%', '/' or empty label can never satisfy a pattern.
+        guard Self.isValidHostname(candidate), !IPAddress.isLiteral(candidate) else { return false }
         switch kind {
         case let .exact(name):
             return candidate == name
@@ -132,6 +134,22 @@ struct DomainPattern: Hashable, Sendable, Comparable, CustomStringConvertible {
             value.removeLast()
         }
         return value
+    }
+
+    /// Strict LDH hostname: 1-63 byte labels of `[a-z0-9-]` (no leading or
+    /// trailing '-'), dots only between labels, at most 253 bytes, and a
+    /// non-numeric last label. Rejects NUL and every other control byte, so the
+    /// string a pattern matched is exactly the string getaddrinfo(3) resolves.
+    static func isValidHostname(_ host: String) -> Bool {
+        guard !host.isEmpty, host.utf8.count <= 253 else { return false }
+        let labels = host.split(separator: ".", omittingEmptySubsequences: false)
+        for label in labels {
+            guard !label.isEmpty, label.utf8.count <= 63, label.allSatisfy(isLDH),
+                  !label.hasPrefix("-"), !label.hasSuffix("-") else {
+                return false
+            }
+        }
+        return labels.last.map { !isAllDigits(String($0)) } ?? false
     }
 
     private static func validateLabels(_ labels: [String], raw: String) throws {
@@ -201,7 +219,7 @@ enum EgressPreset: String, CaseIterable, Sendable {
     case cocoapods
     case swiftpm
 
-    static let policyVersion = "2026-11-27.1"
+    static let policyVersion = "2026-11-27.2"
 
     var domains: [String] {
         switch self {
@@ -216,9 +234,8 @@ enum EgressPreset: String, CaseIterable, Sendable {
                 "github-cloud.s3.amazonaws.com",
                 "ghcr.io",
                 "*.actions.githubusercontent.com",
-                "*.pkg.github.com",
-                "productionresultssa*.blob.core.windows.net"
-            ]
+                "*.pkg.github.com"
+            ] + Self.actionsResultsStorageAccounts
         case .githubAttestations:
             return ["fulcio.githubapp.com", "timestamp.githubapp.com", "tuf-repo.github.com"]
         case .npm:
@@ -236,6 +253,11 @@ enum EgressPreset: String, CaseIterable, Sendable {
             return []
         }
     }
+
+    /// GitHub's Actions results storage accounts, listed exactly. Azure storage
+    /// account names are first-come and globally registrable, so a glob such as
+    /// `productionresultssa*` would also admit an attacker's own account.
+    static let actionsResultsStorageAccounts: [String] = (0...19).map { "productionresultssa\($0).blob.core.windows.net" }
 
     /// The only names whose resolved private (VPN-steered) addresses may be used.
     /// On a host with split DNS (e.g. BlastShield) these resolve to private fronts.
@@ -300,8 +322,15 @@ struct EgressPolicy: Sendable, Equatable {
 
     /// IP-literal CONNECT targets are only allowed when an extra CIDR covers them.
     func allowsLiteral(_ address: IPAddress, port: Int) -> Bool {
-        extraCIDRs.contains { allow in
+        literalAllowance(address, port: port) != nil
+    }
+
+    /// The reviewed entry covering a literal target; an `allowPrivate` entry wins
+    /// when several cover it, since that range was explicitly reviewed.
+    func literalAllowance(_ address: IPAddress, port: Int) -> DirectCIDRAllow? {
+        let covering = extraCIDRs.filter { allow in
             allow.proto == .tcp && allow.port == port && (IPNetwork(allow.cidr)?.contains(address) ?? false)
         }
+        return covering.first { $0.allowPrivate } ?? covering.first
     }
 }

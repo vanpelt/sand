@@ -121,12 +121,12 @@ struct GuestEgressVerifier: Sendable {
           GW=$(ip route show default 2>/dev/null | awk '{print $3; exit}')
         fi
         tcp() {
-          if [ -z "$2" ]; then echo "SANDPROBE $1 CLOSED no-target"; return; fi
+          if [ -z "$2" ]; then echo "SANDPROBE $1 NOTARGET empty-target"; return; fi
           if ! command -v nc >/dev/null 2>&1; then echo "SANDPROBE $1 INCONCLUSIVE no-nc"; return; fi
           if ncz "$2" "$3"; then echo "SANDPROBE $1 OPEN $2:$3"; else echo "SANDPROBE $1 CLOSED $2:$3"; fi
         }
         dnsq() {
-          if [ -z "$2" ]; then echo "SANDPROBE $1 CLOSED no-target"; return; fi
+          if [ -z "$2" ]; then echo "SANDPROBE $1 NOTARGET empty-target"; return; fi
           if ! command -v dig >/dev/null 2>&1; then echo "SANDPROBE $1 INCONCLUSIVE no-dig"; return; fi
           if dig +time=2 +tries=1 +short @"$2" github.com A 2>/dev/null | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "SANDPROBE $1 OPEN $2"; else echo "SANDPROBE $1 CLOSED $2"; fi
