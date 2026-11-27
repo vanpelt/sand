@@ -194,6 +194,22 @@ func makePreflight(runner: ScriptedProcessRunner, fileSystem: FakeFileSystem = F
     }
 }
 
+@Suite struct StrictTargetTests {
+    @Test func derivesLANAndVPNTargetsWithoutMulticast() {
+        let routes = RouteInspector(netstatOutput: """
+        default            10.0.0.1           UGScg                en12
+        172.16             link#29            UCS                 utun8
+        224.0.0/4          link#29            UmCSI               utun8
+        100.64/10          link#25            UCS                 utun4
+        """)
+        let facts = HostFacts(interfaceAddresses: [IPAddress("10.0.0.152")!], onLinkSubnets: [IPNetwork("10.0.0.0/24")!])
+        let targets = GuestEgressVerifier.StrictTargets.derive(facts: facts, routes: routes)
+        #expect(targets.lanGateway == "10.0.0.1")
+        #expect(targets.hostLANAddress == "10.0.0.152")
+        #expect(targets.tunnelTargets == ["172.16.0.1", "100.64.0.1"])
+    }
+}
+
 @Suite struct NetworkWatchdogTests {
     final class Flag: @unchecked Sendable {
         private let lock = NSLock()

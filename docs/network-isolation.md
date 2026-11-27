@@ -296,6 +296,8 @@ and the most-denied hosts. Audit fields never contain tokens or request paths
   reason=not-allowlisted` line and add a preset or an `allowedDomains` entry.
 - **Plain HTTP and `git://` do not work.** Only TLS through CONNECT is
   supported. Use `https://` remotes. SSH checkout is not supported in Phase 1.
+- **Reproducing the guest check by hand.** `sand network probe-script --verify strict`
+  prints the exact probe script, and `--guest-setup` prints the guest proxy setup.
 - **Debugging the proxy alone.** Run
   `sand network proxy --config sand.yml --listen 127.0.0.1:18080`, then
   `curl -x http://127.0.0.1:18080 https://github.com`.
@@ -342,6 +344,57 @@ Still open:
 - the live failure-injection runs from the test plan;
 - security sign-off on the BlastShield exception above.
 
+## Live findings (BlastShield + Netskope host, 2026-11-27)
+
+These results come from a disposable `golden-gate` clone under shared NAT. That
+host did not have the softnet setup, so stages A, C and D could not run. The
+proxy and tunnel were run by hand as in stage B:
+
+- **Proxy and tunnel.** The guest reached `127.0.0.1:3128` over
+  `ssh -R`. The macOS guest's sshd allows TCP forwarding.
+  - `github.com` and `api.github.com` returned 200 with `steered=true` through
+    172.16.7.60 and 172.16.0.150 (BlastShield).
+  - `git ls-remote https://github.com/actions/runner` worked.
+  - `example.com`, `artifacts.coreweave.com` and `172.16.7.64` were refused
+    with 403.
+  - A macOS update check to `gdmf.apple.com` showed up as a deny line, which
+    is useful audit signal.
+  - Killing the tunnel made the guest's next request fail at once.
+- **System proxy.** `nscurl` (URLSession) followed the system proxy that Sand
+  set. With guest DNS pointed at 127.0.0.1, a direct name lookup timed out
+  after about 5 s rather than failing instantly.
+- **Throughput.** A 16 MB codeload download ran at about 18-19 MB/s through
+  the tunnel. Host-direct was about 38-43 MB/s, and the proxy alone on the
+  host was about 37 MB/s. The SSH tunnel costs roughly half the throughput.
+- **Netskope intercepts proxy flows (open blocker for this host).** Host
+  process flows to these hosts are TLS-intercepted by Netskope (goskope CA), so
+  the guest sees `self signed certificate in certificate chain`:
+  - `raw.githubusercontent.com`, `objects.githubusercontent.com`,
+    `release-assets.githubusercontent.com` and
+    `pkg-containers.githubusercontent.com`;
+  - `pipelines.actions.githubusercontent.com` and
+    `results-receiver.actions.githubusercontent.com`.
+
+  `github.com`, `api`, `codeload`, `uploads`, `lfs`, `ghcr.io`, S3 and Azure
+  blob storage were not intercepted. Because the runner needs the
+  `*.actions.githubusercontent.com` services, **jobs will fail on this host
+  until IT adds a Netskope bypass for these hosts for the sand process, or an
+  opt-in guest trust of the inspection CA is implemented** (deferred; see
+  residual risks). Under the old shared NAT, guest traffic bypassed Netskope.
+- **Verifier sanity check.** The strict probe script
+  (`sand network probe-script --verify strict`, about 15 s) was run in the
+  same shared-NAT guest. It reported OPEN for:
+  - 1.1.1.1;
+  - the BlastShield front 172.16.7.60:443;
+  - host ControlCenter on :5000 and gateway DNS;
+  - the LAN gateway;
+  - tailnet 100.100.100.100 and 192.168.68.1;
+  - the corporate resolver 172.16.0.1;
+  - the host's LAN address on :7000.
+
+  This is exactly the reach that `mode: shared` gives a guest. Sand would
+  refuse to register that VM.
+
 ## Live test plan (sacrificial Mac, after the one-time setup)
 
 Run every stage yourself. Clone test VMs with `tart clone`, which uses APFS
@@ -356,7 +409,8 @@ tart run --no-graphics --net-softnet --net-softnet-block=0.0.0.0/0 \
   "--net-softnet-allow=in proto tcp @host port 22" sand-nettest-proxy &
 IP=$(tart ip sand-nettest-proxy --wait 120)
 sshpass -p admin ssh -o StrictHostKeyChecking=no admin@$IP true       # SSH works
-# every direct probe must be closed: 1.1.1.1:443, 172.16.7.60:443, gateway:53, dig @8.8.8.8, curl -6 ...
+sand network probe-script --verify strict --no-proxy > probe.sh
+tart exec -i sand-nettest-proxy bash -s < probe.sh   # every SANDPROBE line must be CLOSED (tart exec uses the guest agent, not the network)
 
 # Stage B: proxy and tunnel by hand
 swift run sand network proxy --config fixtures/network_github_default.yml --listen 127.0.0.1:18080 &

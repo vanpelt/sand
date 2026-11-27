@@ -440,7 +440,7 @@ private final class ProxySession: @unchecked Sendable {
                 self.didConnect()
             case let .failed(error):
                 if self.established {
-                    self.close(reason: "upstream-failed")
+                    self.close(reason: "upstream-reset")
                 } else {
                     self.reject(status: 502, reason: "connect-failed:\(error)", host: request.host, port: request.port)
                 }

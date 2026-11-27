@@ -6,7 +6,7 @@ struct NetworkCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "network",
         abstract: "Inspect and debug VM network policies.",
-        subcommands: [Explain.self, Proxy.self, Preflight.self]
+        subcommands: [Explain.self, Proxy.self, Preflight.self, ProbeScript.self]
     )
 
     static func loadPolicy(configPath: String, runner: String?) throws -> (Config.RunnerConfig, NetworkPolicy) {
@@ -80,6 +80,41 @@ struct NetworkCommand: AsyncParsableCommand {
                 try await Task.sleep(nanoseconds: 1_000_000_000)
             }
             throw ExitCode(1)
+        }
+    }
+
+    struct ProbeScript: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "probe-script",
+            abstract: "Print the guest egress probe script (pipe it into a test VM: tart exec -i VM bash -s < probe.sh)."
+        )
+
+        @Option(help: "basic or strict.")
+        var verify: String = "strict"
+        @Flag(help: "Omit the proxied probes (for a VM without the tunnel).")
+        var noProxy = false
+        @Flag(help: "Print the guest proxy setup command (shell profiles, macOS system proxy) instead.")
+        var guestSetup = false
+
+        func run() async throws {
+            if guestSetup {
+                print(GuestEgressEnv.standard.guestSetupCommand)
+                return
+            }
+            guard let level = VerifyLevel(rawValue: verify), level != .off else {
+                throw ValidationError("--verify must be basic or strict")
+            }
+            let facts = HostFacts.current()
+            let routes = await RouteInspector.current(processRunner: SystemProcessRunner())
+            let github = (try? await SystemHostResolver().resolve("github.com")) ?? []
+            let targets = GuestEgressVerifier.StrictTargets.derive(facts: facts, routes: routes)
+            let verifier = GuestEgressVerifier(
+                level: level,
+                directGitHubAddress: github.first(where: \.isIPv4)?.description ?? "140.82.112.3",
+                strictTargets: targets,
+                expectsProxy: !noProxy
+            )
+            print(verifier.script)
         }
     }
 

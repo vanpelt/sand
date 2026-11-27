@@ -205,17 +205,7 @@ final class VMNetworkSession: @unchecked Sendable {
         let direct = github.first(where: \.isIPv4)?.description ?? "140.82.112.3"
         var targets = GuestEgressVerifier.StrictTargets()
         if policy.verify == .strict {
-            let routes = await dependencies.routes()
-            if let gateway = routes.defaultGateways.first, let gatewayIP = IPAddress(gateway) {
-                targets.lanGateway = gateway
-                if let subnet = facts.onLinkSubnets.first(where: { $0.contains(gatewayIP) }) {
-                    targets.hostLANAddress = facts.interfaceAddresses.first { subnet.contains($0) && $0 != gatewayIP }?.description
-                }
-            }
-            targets.tunnelTargets = routes.tunnelSubnets.compactMap { network, _ in
-                guard case let .v4(base) = network.address else { return nil }
-                return IPAddress.v4(base + 1).description
-            }
+            targets = .derive(facts: facts, routes: await dependencies.routes())
         }
         return GuestEgressVerifier(level: policy.verify, directGitHubAddress: direct, strictTargets: targets, expectsProxy: policy.egress != nil)
     }

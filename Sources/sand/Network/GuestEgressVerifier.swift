@@ -31,6 +31,26 @@ struct GuestEgressVerifier: Sendable {
         var lanGateway: String?
         var hostLANAddress: String?
         var tunnelTargets: [String] = []
+
+        /// Host-derived strict targets: the LAN gateway, the host's own LAN
+        /// address, and the first address of every VPN (utun) route.
+        static func derive(facts: HostFacts, routes: RouteInspector) -> StrictTargets {
+            var targets = StrictTargets()
+            if let gateway = routes.defaultGateways.first, let gatewayIP = IPAddress(gateway) {
+                targets.lanGateway = gateway
+                if let subnet = facts.onLinkSubnets.first(where: { $0.contains(gatewayIP) }) {
+                    targets.hostLANAddress = facts.interfaceAddresses.first { subnet.contains($0) && $0 != gatewayIP }?.description
+                }
+            }
+            let multicast = IPNetwork("224.0.0.0/3")!
+            var seen = Set<String>()
+            targets.tunnelTargets = routes.tunnelSubnets.compactMap { network, _ in
+                guard case let .v4(base) = network.address, !multicast.contains(network.address) else { return nil }
+                let target = IPAddress.v4(base + 1).description
+                return seen.insert(target).inserted ? target : nil
+            }
+            return targets
+        }
     }
 
     static let marker = "SANDPROBE"
