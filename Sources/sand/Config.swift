@@ -180,14 +180,16 @@ struct Config: Decodable, Sendable {
         let noClipboard: Bool
         let nested: Bool
         let rootDiskOpts: String?
+        let network: NetworkPolicy
 
         static let `default` = RunOptions(noGraphics: true, noClipboard: false, nested: false)
 
-        init(noGraphics: Bool, noClipboard: Bool, nested: Bool, rootDiskOpts: String? = nil) {
+        init(noGraphics: Bool, noClipboard: Bool, nested: Bool, rootDiskOpts: String? = nil, network: NetworkPolicy = .shared) {
             self.noGraphics = noGraphics
             self.noClipboard = noClipboard
             self.nested = nested
             self.rootDiskOpts = rootDiskOpts
+            self.network = network
         }
 
         init(from decoder: Decoder) throws {
@@ -196,6 +198,7 @@ struct Config: Decodable, Sendable {
             self.noClipboard = try container.decodeIfPresent(Bool.self, forKey: .noClipboard) ?? false
             self.nested = try container.decodeIfPresent(Bool.self, forKey: .nested) ?? false
             self.rootDiskOpts = try container.decodeIfPresent(String.self, forKey: .rootDiskOpts)
+            self.network = try container.decodeIfPresent(NetworkPolicy.self, forKey: .network) ?? .shared
         }
 
         private enum CodingKeys: String, CodingKey {
@@ -203,6 +206,7 @@ struct Config: Decodable, Sendable {
             case noClipboard
             case nested
             case rootDiskOpts
+            case network
         }
     }
 

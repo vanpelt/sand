@@ -33,9 +33,20 @@ struct Tart: Sendable {
         let noGraphics: Bool
         let noClipboard: Bool
         let nested: Bool
-        var rootDiskOpts: String? = nil
+        let rootDiskOpts: String?
+        let network: NetworkPolicy
 
         static let `default` = RunOptions(directoryMounts: [], noAudio: false, noGraphics: true, noClipboard: false, nested: false)
+
+        init(directoryMounts: [DirectoryMount], noAudio: Bool, noGraphics: Bool, noClipboard: Bool, nested: Bool, rootDiskOpts: String? = nil, network: NetworkPolicy = .shared) {
+            self.directoryMounts = directoryMounts
+            self.noAudio = noAudio
+            self.noGraphics = noGraphics
+            self.noClipboard = noClipboard
+            self.nested = nested
+            self.rootDiskOpts = rootDiskOpts
+            self.network = network
+        }
     }
 
     struct Display {
@@ -105,6 +116,7 @@ struct Tart: Sendable {
     @discardableResult
     func run(name: String, options: RunOptions = .default) throws -> ProcessHandle {
         var arguments = ["run", name]
+        arguments.append(contentsOf: options.network.tartArguments)
         if options.noGraphics {
             arguments.append("--no-graphics")
         }

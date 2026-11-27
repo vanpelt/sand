@@ -99,6 +99,7 @@ final class ConfigValidator {
         if let rootDiskOpts = vm.run.rootDiskOpts, rootDiskOpts.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             issues.append(.init(severity: .error, message: "vm.run.rootDiskOpts must not be empty when set."))
         }
+        validateNetwork(vm, issues: &issues)
 
         if vm.ssh.user.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             issues.append(.init(severity: .error, message: "vm.ssh.user must not be empty."))
@@ -125,6 +126,51 @@ final class ConfigValidator {
             }
             let resolvedName = Config.resolveMountName(hostPath: mount.hostPath, name: mount.name)
             validateMountName(resolvedName, label: "vm.mounts.name", issues: &issues)
+        }
+    }
+
+
+    private func validateNetwork(_ vm: Config.VM, issues: inout [ConfigValidationIssue]) {
+        let policy = vm.run.network
+        switch policy.mode {
+        case .shared, .softnet:
+            if !policy.allowCIDRs.isEmpty {
+                issues.append(.init(
+                    severity: .error,
+                    message: "vm.run.network.allowCIDRs is supported only when mode is restricted."
+                ))
+            }
+        case .restricted:
+            if policy.allowCIDRs.isEmpty {
+                issues.append(.init(
+                    severity: .error,
+                    message: "vm.run.network.restricted requires at least one explicit IPv4 allowCIDR (e.g. a proxy /32)."
+                ))
+            }
+            for cidr in policy.allowCIDRs where !NetworkPolicy.isAllowedCIDR(cidr) {
+                issues.append(.init(
+                    severity: .error,
+                    message: "vm.run.network.allowCIDRs entry '\(cidr)' must be an IPv4 CIDR with prefix /24 through /32."
+                ))
+            }
+            if !vm.run.noClipboard {
+                issues.append(.init(
+                    severity: .error,
+                    message: "vm.run.network.restricted requires vm.run.noClipboard: true."
+                ))
+            }
+            if vm.run.nested {
+                issues.append(.init(
+                    severity: .error,
+                    message: "vm.run.network.restricted requires vm.run.nested: false."
+                ))
+            }
+            if !vm.mounts.isEmpty {
+                issues.append(.init(
+                    severity: .error,
+                    message: "vm.run.network.restricted does not permit host directory mounts."
+                ))
+            }
         }
     }
 

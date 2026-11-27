@@ -195,6 +195,51 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(config.runners.first?.provisioner.github?.runnerGroup, "mac-fleet")
     }
 
+
+    func testRestrictedSoftnetNetworkDecodes() throws {
+        let yaml = """
+        runners:
+          - name: secure-vm
+            vm:
+              source:
+                type: local
+                name: golden
+              run:
+                noClipboard: true
+                network:
+                  mode: restricted
+                  allowCIDRs:
+                    - 10.42.10.25/32
+            provisioner:
+              type: script
+              config:
+                run: echo ok
+        """
+        let config = try Config.load(path: writeTempFile(contents: yaml).path)
+        let policy = try XCTUnwrap(config.runners.first?.vm.run.network)
+        XCTAssertEqual(policy.mode, .restricted)
+        XCTAssertEqual(policy.allowCIDRs, ["10.42.10.25/32"])
+    }
+
+    func testNetworkBlockRequiresExplicitMode() throws {
+        let yaml = """
+        runners:
+          - name: secure-vm
+            vm:
+              source:
+                type: local
+                name: golden
+              run:
+                network:
+                  allowCIDRs: [10.42.10.25/32]
+            provisioner:
+              type: script
+              config:
+                run: echo ok
+        """
+        XCTAssertThrowsError(try Config.load(path: writeTempFile(contents: yaml).path))
+    }
+
     func testFixturesLoad() throws {
         let fixtures = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
