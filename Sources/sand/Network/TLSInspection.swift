@@ -278,7 +278,11 @@ struct SystemTLSChainObserver: TLSChainObserving {
             capture.set(TLSChainObservation(host: host, certificates: chain.map { SecCertificateCopyData($0) as Data }, trusted: trusted))
             complete(false)
         }, queue)
-        let connection = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: NWParameters(tls: options))
+        let parameters = NWParameters(tls: options)
+        // Same path as the egress proxy's upstream sockets (getaddrinfo + connect),
+        // which never use a system proxy or PAC file.
+        parameters.preferNoProxies = true
+        let connection = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: parameters)
         let once = ChainOnce()
         let failure: HostEgressProbeError? = await withCheckedContinuation { continuation in
             connection.stateUpdateHandler = { state in
@@ -356,7 +360,9 @@ enum GuestInspectionTrust {
         for (index, ca) in authorities.enumerated() {
             let file = "\"$d/inspection-ca-\(index).pem\""
             let darwin = ca.isRoot
-                ? "sudo -n security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain \(file)"
+                // Trusted for TLS server authentication only (-p ssl, plus the basic
+                // X.509 policy it builds on), never for code signing, S/MIME, etc.
+                ? "sudo -n security add-trusted-cert -d -r trustRoot -p ssl -p basic -k /Library/Keychains/System.keychain \(file)"
                 : "sudo -n security add-certificates -k /Library/Keychains/System.keychain \(file)"
             lines.append("if [ \"$(uname -s)\" = Darwin ]; then \(darwin) >/dev/null 2>&1 || echo 'WARN: could not add inspection CA \(index) to the guest System keychain'; "
                 + "elif command -v update-ca-certificates >/dev/null 2>&1; then sudo -n cp \(file) /usr/local/share/ca-certificates/sand-inspection-ca-\(index).crt && sudo -n update-ca-certificates >/dev/null 2>&1 || echo 'WARN: could not add inspection CA \(index) to the guest CA store'; fi")

@@ -25,7 +25,9 @@ struct GuestEgressEnv: Sendable, Equatable {
         var variables = [
             ("https_proxy", proxyURL), ("http_proxy", proxyURL),
             ("HTTPS_PROXY", proxyURL), ("HTTP_PROXY", proxyURL),
-            ("no_proxy", noProxy), ("NO_PROXY", noProxy)
+            ("no_proxy", noProxy), ("NO_PROXY", noProxy),
+            // Node 24+ ignores https_proxy unless this is set (usability only).
+            ("NODE_USE_ENV_PROXY", "1")
         ]
         if trustsInspectionCA {
             // A combined bundle (guest defaults + inspection CA), never a replacement.

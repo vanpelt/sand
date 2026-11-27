@@ -450,7 +450,7 @@ struct FakeTrustStore: HostTrustStore {
         let root = InspectionCA(sha256: "AA", subject: "Inspection Root", pem: pem(inspectionRoot), isRoot: true)
         let intermediate = InspectionCA(sha256: "BB", subject: "Inspection Intermediate", pem: pem(inspectionIntermediate), isRoot: false)
         let command = GuestInspectionTrust.installCommand([root, intermediate])
-        #expect(command.contains("sudo -n security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain \"$d/inspection-ca-0.pem\""))
+        #expect(command.contains("sudo -n security add-trusted-cert -d -r trustRoot -p ssl -p basic -k /Library/Keychains/System.keychain \"$d/inspection-ca-0.pem\""))
         #expect(command.contains("sudo -n security add-certificates -k /Library/Keychains/System.keychain \"$d/inspection-ca-1.pem\""))
         #expect(command.contains("cat \"$base\" \"$d/inspection-ca.pem\" > \"$d/ca-bundle.pem.tmp\""))
         #expect(command.contains("/etc/ssl/cert.pem"))
