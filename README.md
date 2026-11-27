@@ -101,39 +101,55 @@ For `local` sources sand skips the registry pull and clones the named VM directl
 ### VM network isolation (secure by default)
 
 > **Breaking change:** a runner with no `vm.run.network` key now gets
-> `profile: github` instead of Tart's shared NAT. On a host without the one-time
-> softnet setup, `sand run` exits before cloning and prints the fix. To keep the
-> old unrestricted behaviour, opt out explicitly with `network: { mode: shared }`
-> (required for host `mounts`).
+> `profile: github` instead of Tart's shared NAT. It needs **no root and no host
+> setup**. To keep the old unrestricted behaviour, opt out explicitly with
+> `network: { mode: shared }` (required for host `mounts`).
 
-With no configuration, every VM is confined by Softnet (deny all guest IPv4,
-IPv6 dropped, host SSH only) and reaches the internet only through a per-VM,
-host-side HTTPS CONNECT proxy that Sand runs on loopback and forwards into the
-guest as `127.0.0.1:3128` over the SSH session. The proxy allows GitHub
-(github.com, the Actions service, release/LFS/package CDNs, ghcr.io) and
-nothing else, so the guest cannot reach the host, the LAN, the tailnet or
-corporate ranges. Because it resolves names with the host's own resolver, VPN
-split DNS (for example BlastShield steering github.com to a private front so
-traffic satisfies an org IP allow list) works with no configuration.
+With no configuration, every VM boots on Tart's host-only network
+(`tart run --net-host`: no route off the host, no DNS, no IPv6) and reaches the
+internet only through a per-VM, host-side HTTPS CONNECT proxy that Sand runs on
+loopback and forwards into the guest as `127.0.0.1:3128` over the SSH session.
+The proxy allows GitHub (github.com, the Actions service, release/LFS/package
+CDNs, ghcr.io) and nothing else, so the guest cannot reach the LAN, the
+tailnet, corporate ranges or the internet directly. Because it resolves names
+with the host's own resolver, VPN split DNS (for example BlastShield steering
+github.com to a private front so traffic satisfies an org IP allow list) works
+with no configuration.
+
+The host-only network does not isolate host services bound to all interfaces
+(for example AirPlay Receiver on `:5000`/`:7000`) or other VMs on the same
+bridge. Sand reports those services before registering a runner
+(`hostListeners: deny` refuses the VM) and warns when several runners share
+the bridge. For full host and peer isolation use `backend: softnet`, which
+needs a privileged softnet (one-time `sudo` setup in the docs), or
+`backend: auto` to use softnet only where it is privileged.
 
 ```yaml
 vm:
   run:
     network:
       profile: github                # default; or offline (no egress at all)
+      backend: hostOnly              # default (no root) | softnet | auto
       presets: [npm, pypi, homebrew] # optional extra destination bundles
       allowedDomains:                # optional; port defaults to 443
         - registry.example-artifacts.com
         - "*.cdn.example.com"
+      hostListeners: warn            # or deny (hostOnly)
+      tlsInspection: fail            # or trustHostCA (Netskope/Zscaler hosts)
+      maxEnforcementFailures: 3      # then sand run exits 78
 ```
 
-One-time host setup (run it yourself; Sand never runs sudo):
+**TLS-inspecting endpoint agents.** If an agent such as Netskope re-signs the
+proxy's upstream TLS, preflight detects it generically (the chain ends in a CA
+that Apple does not ship) and `sand run` exits 78, listing the hosts to ask IT
+to exempt. Opt in with `tlsInspection: trustHostCA` to install only that CA's
+public certificate in the guest (keychain plus a combined bundle exported as
+`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO` and
+`NODE_EXTRA_CA_CERTS`). Its SHA-256 fingerprint is written to the audit log.
 
-```sh
-brew install openai/tools/softnet
-sudo chown root:wheel "$(realpath "$(which softnet)")" && sudo chmod u+s "$(realpath "$(which softnet)")"
-sand doctor   # or: sand network preflight --config sand.yml
-```
+`sand doctor` or `sand network preflight --config sand.yml` checks the host.
+Repeated network enforcement failures at runtime (for example softnet dying
+after preflight) stop `sand run` with exit 78 instead of re-cloning forever.
 
 `sand network explain --config sand.yml` prints each runner's compiled policy
 and hash. See [docs/network-isolation.md](docs/network-isolation.md) for the

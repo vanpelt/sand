@@ -1,13 +1,18 @@
 # VM network isolation
 
-Sand isolates every VM's network **by default**. A runner with no
-`vm.run.network` key gets `profile: github`:
+Sand isolates every VM's network **by default**, with **no root and no host
+setup**. A runner with no `vm.run.network` key gets `profile: github` on the
+`hostOnly` backend:
 
-1. **Softnet deny-all.** Tart starts the VM with
-   `--net-softnet --net-softnet-block=0.0.0.0/0 "--net-softnet-allow=in proto tcp @host port 22"`.
-   The guest's IPv4 traffic is dropped except for host-to-guest SSH replies.
-   Softnet drops all IPv6. Guest DNS to the gateway is blocked as well, so
-   there is no split-DNS leak and no DNS tunnel.
+1. **No direct egress.** An enforcement backend removes every route from the
+   guest to anything but the host:
+   - `hostOnly` (default): `tart run --net-host`. The VM sits on a host-only
+     vmnet bridge (for example `bridge100`, 192.168.128.0/24) with no default
+     route, no DNS and no NAT. Needs no root.
+   - `softnet` (opt-in): `--net-softnet --net-softnet-block=0.0.0.0/0
+     "--net-softnet-allow=in proto tcp @host port 22"`. Also blocks host
+     services and peer VMs, but needs a privileged softnet (setuid root or
+     passwordless sudo).
 2. **A host-side allowlisting proxy.** Sand runs a per-VM HTTPS CONNECT proxy
    bound to `127.0.0.1` on the host. It checks the hostname against the
    policy, resolves it with the host's system resolver, refuses private or
@@ -15,7 +20,7 @@ Sand isolates every VM's network **by default**. A runner with no
    CONNECT host.
 3. **An SSH reverse tunnel.** The guest reaches the proxy as `127.0.0.1:3128`
    through `ssh -N -R 127.0.0.1:3128:127.0.0.1:<port>`, which runs over the
-   SSH session Sand already uses. Nothing on the host listens on the VM bridge.
+   SSH session Sand already uses. The proxy never listens on the VM bridge.
    If the tunnel dies, egress dies with it.
 4. **Guest settings for usability only.** Sand writes `https_proxy`,
    `http_proxy` and `no_proxy` into the runner's `.env` and the login shell
@@ -23,9 +28,10 @@ Sand isolates every VM's network **by default**. A runner with no
    loopback. Enforcement never depends on these settings: a tool that ignores
    them just fails to connect.
 5. **Fail closed at every stage:**
-   - preflight before any clone;
-   - a guest egress check before any runner registers;
-   - a watchdog from SSH-ready until teardown.
+   - preflight before any clone (exit 78);
+   - a host-listener report and a guest egress check before any runner registers;
+   - a watchdog from SSH-ready until teardown;
+   - a bounded number of consecutive enforcement failures, then exit 78.
 
    Sand never falls back to shared NAT.
 
@@ -35,21 +41,41 @@ The guest runs untrusted workflow code as a root-capable user. The guest must
 be able to reach GitHub (and approved package hosts) to run Actions jobs. It
 must never reach:
 
-- the host's own services (ControlCenter, rapportd, a local sshd, agents);
-- the developer's LAN, Tailscale/tailnet (100.64/10) or peer VMs;
+- the developer's LAN, Tailscale/tailnet (100.64/10) or other networks;
 - corporate networks reachable over the host's VPN (for example BlastShield
   172.16/12 routes, or 172.16.0.1 resolvers);
 - cloud metadata (169.254.169.254) or anything link-local;
 - arbitrary internet destinations, over UDP/QUIC, IPv6 or DNS.
 
-The guest is not trusted to honour proxy variables. Softnet removes every
-direct path, so the only way out is the host proxy, and the proxy enforces the
-policy outside the guest.
+The guest is not trusted to honour proxy variables. The backend removes every
+direct path off the host, so the only way out is the host proxy, and the proxy
+enforces the policy outside the guest.
 
-## One-time host setup
+**Host services and peer VMs depend on the backend.** Under `softnet` the guest
+cannot reach the host (other than SSH replies) or other VMs. Under `hostOnly`:
 
-Softnet needs root to create its vmnet interface. It drops privileges after
-setup. Run this in your own terminal; Sand never runs `sudo` for you:
+- **Host services bound to all interfaces (or to the bridge address) are
+  reachable** on the bridge address, for example ControlCenter/AirPlay on
+  `:5000`/`:7000`, rapportd, a dev server on `*:3000`, or sshd if Remote Login
+  is on. Sand reports them before registration (`hostListeners`, below) and
+  can refuse the VM (`hostListeners: deny`). Services bound to `127.0.0.1`,
+  including Sand's own proxy, are never reachable.
+- **There is no peer-VM isolation.** VMs on the same host-only bridge can reach
+  each other. `sand run` warns when more than one runner uses `hostOnly`. Use
+  `backend: softnet` (or one VM per host) when concurrent jobs must not see
+  each other.
+- Host services are not egress: a host listener cannot forward the guest to
+  the internet unless it is itself a proxy or resolver. Host DNS on `:53` is
+  therefore treated as egress and must be closed (probe N3b/N4a).
+
+## Host setup
+
+None for the default `hostOnly` backend. `sand doctor` or
+`sand network preflight --config sand.yml` shows what the host supports.
+
+Only `backend: softnet` (or `auto`, see below) needs softnet with root. Softnet
+needs root to create its vmnet interface and drops privileges after setup. Run
+this in your own terminal; Sand never runs `sudo` for you:
 
 ```sh
 brew install cirruslabs/cli/tart openai/tools/softnet
@@ -75,31 +101,66 @@ vm:
   run:
     network:
       profile: github                 # github (default) | offline
+      backend: hostOnly               # hostOnly (default) | softnet | auto
       presets: [npm, pypi, homebrew]  # optional extra built-in bundles
       allowedDomains:                 # optional; port defaults to 443
         - registry.example-artifacts.com
         - "*.cdn.example.com"
         - "git.example.org:8443"
       verify: basic                   # basic (default) | strict
-      allowedCIDRs:                   # expert escape hatch, see below
+      hostListeners: warn             # hostOnly: warn (default) | deny
+      acceptedHostListeners: []       # with deny: e.g. [tcp/7000, udp/5353, udp/*]
+      tlsInspection: fail             # fail (default) | trustHostCA
+      maxEnforcementFailures: 3       # consecutive failures before exit 78 (1-100)
+      allowedCIDRs:                   # expert escape hatch, softnet backend only
         - { cidr: 203.0.113.10/32, port: 443, proto: tcp }
 ```
 
-- **No `network` key** is the same as `profile: github`.
-- **`profile: offline`** applies softnet deny-all with no proxy; only host SSH
+- **No `network` key** is the same as `profile: github` with `backend: hostOnly`.
+- **`backend`** applies to profiles:
+  - `hostOnly` works everywhere tart supports `--net-host` (preflight P1).
+  - `softnet` requires a privileged softnet (P2, P3) and adds host-service and
+    peer-VM isolation.
+  - `auto` uses softnet when it is installed, new enough and privileged, and
+    hostOnly otherwise. It is resolved at startup and again before every clone,
+    so a `brew upgrade softnet` that drops the setuid bit falls back to
+    hostOnly (still isolated) instead of failing. The policy hash differs per
+    backend, and `network.policy.compiled` names the backend.
+    `sand network explain` prints what `auto` resolved to.
+- **`hostListeners`** (hostOnly only). After boot and before registration,
+  Sand lists host TCP listeners and unconnected UDP sockets reachable on the
+  bridge (bound to `*` or to the bridge address) and logs
+  `network.host.listeners`. With `warn` it continues; with `deny` it destroys
+  the VM unless every listener matches `acceptedHostListeners`
+  (`tcp/PORT`, `udp/PORT`, `tcp/*`, `udp/*`). The guest egress check also probes
+  each TCP listener from the guest and records what it actually reached
+  (`host_services_reachable=` on `network.guest.verified`).
+  Sources, all unprivileged: `netstat -an` (every user's sockets, when the host
+  lets the caller see them), `lsof` (this user's sockets, with process names),
+  and, when netstat is blind, a TCP connect probe of the bridge address on
+  well-known service ports. The audit line names the method. In
+  `lsof+sweep` mode another user's (root) listener on an uncommon port, or a
+  root UDP socket, can be missed: use `softnet` if that matters.
+- **`tlsInspection`**: see [TLS-inspecting endpoint agents](#tls-inspecting-endpoint-agents-netskope-zscaler).
+- **`maxEnforcementFailures`**: see [What happens at runtime](#what-happens-at-runtime).
+- **`profile: offline`** removes direct egress with no proxy; only host SSH
   works. Use it for script provisioners that need no network. It is the only
   profile that accepts `verify: off`.
 - **`mode: shared`** is the only way to get Tart's unrestricted shared NAT. It
   is required for host `mounts`. Sand warns on validate and on every boot.
-- **`mode: softnet` and `mode: restricted`** keep their prototype meaning.
-  Restricted now also allows host SSH. Under a VPN with split DNS, plain
-  softnet makes the steered GitHub names unreachable, because it blocks
-  private destinations. Prefer the profile.
+- **`mode: softnet` and `mode: restricted`** keep their prototype meaning and
+  always use softnet. Restricted also allows host SSH. Under a VPN with split
+  DNS, plain softnet makes the steered GitHub names unreachable, because it
+  blocks private destinations. Prefer the profile.
 
 Validation rules:
 
 - Setting both `profile` and `mode` is an error, and so is an empty
-  `network: {}`. An unknown profile, mode or preset is also an error.
+  `network: {}`. An unknown profile, mode, preset, backend, `hostListeners` or
+  `tlsInspection` value is also an error.
+- `backend`, `hostListeners`, `acceptedHostListeners` and `tlsInspection`
+  require a profile; `tlsInspection` requires `profile: github`.
+  `maxEnforcementFailures` must be 1-100 and is rejected with `mode: shared`.
 - `allowedDomains` entries are lowercased and any trailing dot is stripped.
   - Each entry must use valid hostname labels. Give IDN names in punycode.
   - Two wildcard forms are allowed: a leading `*.` (at least two labels after
@@ -109,7 +170,9 @@ Validation rules:
     register a name there, so the wildcard admits their endpoints too.
   - These are rejected: IP literals, a bare `*`, `*.com`, `a.*.b`, and ports
     outside 1-65535. Ports 22 and 25 produce a warning.
-- `allowedCIDRs` must be IPv4 /24 to /32 and must set `port`.
+- `allowedCIDRs` requires `backend: softnet` (hostOnly has no route off the
+  host, and `auto` may resolve to hostOnly). Entries must be IPv4 /24 to /32
+  and must set `port`.
   - Ranges that overlap private or CGNAT space are rejected unless
     `allowPrivate: true` is set, and that also warns.
   - Loopback, `0/8`, link-local/metadata (169.254/16), multicast and
@@ -123,8 +186,8 @@ Validation rules:
   supports HTTPS checkout only.
 
 `sand network explain --config sand.yml` prints each runner's compiled policy:
-the tart arguments, every allowed destination, the steered names and the
-policy hash that audit lines carry.
+the backend, the tart arguments, every allowed destination, the steered names
+and the policy hash that audit lines carry.
 
 ## Presets
 
@@ -214,46 +277,116 @@ blocked. The guest never gets the VPN route itself.
 Other interactions:
 
 - **Netskope (or another TLS-inspecting client).** Proxy connections are host
-  process flows, so the endpoint agent may intercept them. A guest then sees
-  the inspection CA and fails TLS. This fails closed, but jobs break. Either
-  ask IT for a bypass for the affected hosts, or wait for the planned opt-in to
-  install the inspection CA in the guest. Guest traffic under the old shared
-  NAT bypassed Netskope entirely.
+  process flows, so the endpoint agent may intercept them. See
+  [TLS-inspecting endpoint agents](#tls-inspecting-endpoint-agents-netskope-zscaler).
 - **Disconnecting the VPN mid-run.** New connections resolve to public
   addresses and go out directly. A GitHub IP allow list then answers 403
   inside the job. That is a visible failure, not a leak.
-- **VM subnet collisions.** Softnet picks the VM's subnet. If it overlaps a
+- **VM subnet collisions.** The backend picks the VM's subnet (hostOnly:
+  vmnet's host-only range, typically 192.168.128.0/24). If it overlaps a
   host route, such as the VPN's 172.16/16, it would shadow the steered fronts.
   Sand recreates the VM (up to three times) and fails if it keeps colliding.
   The watchdog also ends a job if a later route change creates an overlap.
 
+## TLS-inspecting endpoint agents (Netskope, Zscaler)
+
+The proxy's upstream connections are host-process flows, so an endpoint agent
+may re-sign them with its own CA. The host trusts that CA (it is in the System
+keychain with admin trust); the guest does not, so jobs fail TLS for exactly
+the intercepted hosts. On the verification host, Netskope intercepted
+`*.actions.githubusercontent.com`, `objects`, `raw`, `release-assets` and
+`pkg-containers.githubusercontent.com`, but not `github.com` or `ghcr.io`.
+
+**Detection (preflight P10, generic).** For a representative set of
+allowlisted hosts (the GitHub preset's concrete names, including
+`pipelines`/`results-receiver.actions.githubusercontent.com` and
+`productionresultssa0.blob.core.windows.net`, plus up to eight exact
+user/preset names), the host completes a TLS handshake (no request is sent)
+and builds the chain with its own trust settings. A chain whose anchor is not
+an Apple-shipped root (not in
+`/System/Library/Keychains/SystemRootCertificates.keychain`) was re-signed
+locally. Nothing about any vendor or certificate is hardcoded. Hosts the host
+cannot reach are a warning, not evidence of interception.
+
+**`tlsInspection: fail` (default).** Interception fails preflight and
+`sand run` exits 78 before any clone. The message lists the intercepted hosts
+and the CA subject and SHA-256, and gives the two fixes: ask IT to exempt those
+hosts from inspection, or opt in below.
+
+**`tlsInspection: trustHostCA` (opt-in).**
+
+- Sand exports only the intercepting CA certificate(s) seen in those chains
+  (every non-leaf certificate that is not an Apple root), and only the public
+  certificate, with `security find-certificate -a -Z -p
+  /Library/Keychains/System.keychain`. The PEM's SHA-256 must match the
+  observed certificate.
+- It refuses (P10 fails) when a CA is not in the System keychain, when the
+  chain is a single self-signed leaf, or when the host holds a private key for
+  the CA (`security find-identity`): a CA the host could sign with is never
+  trusted in a guest.
+- The fingerprints and subjects go to the audit log at startup
+  (`network.tls.inspection`) and per VM (`network.tls.inspection.trusted`).
+- In the guest, after the proxy settings and before preRun or registration:
+  - the CA files and `~/.sand/ca-bundle.pem` = the guest's default bundle
+    (`/etc/ssl/cert.pem` or the Linux equivalents) plus the CA. The default
+    bundle is never replaced;
+  - macOS: the root with `sudo -n security add-trusted-cert -d -r trustRoot -k
+    /Library/Keychains/System.keychain`, intermediates with
+    `security add-certificates` (URLSession tools, Xcode, SwiftPM). Linux:
+    `update-ca-certificates`. This step is best effort and logs WARN lines;
+  - `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` and `GIT_SSL_CAINFO`
+    point at the combined bundle and `NODE_EXTRA_CA_CERTS` at the CA file. They
+    go wherever the proxy variables go: the runner's `.env`, the `config.sh`
+    environment and the login shell profiles.
+
+  If the combined bundle cannot be built, the VM is destroyed before
+  registration.
+- Trade-off: the inspection vendor can read the job's TLS to the intercepted
+  hosts, as it already can for the host's own traffic. `sand validate` warns.
+
 ## What happens at runtime
 
-1. `sand run` compiles each runner's policy and logs `network.policy.compiled`
-   with the hash. It then runs the full preflight once per distinct policy.
-   The checks are:
-   - tart supports `--net-softnet-allow`;
-   - softnet supports stateful rules (`proto`, `@host`);
-   - softnet is privileged;
-   - the host resolves GitHub and completes a TLS handshake to
+1. `sand run` compiles each runner's policy (resolving `backend: auto`) and
+   logs `network.policy.compiled` with the hash and backend. It then runs the
+   full preflight once per distinct policy. The checks are:
+   - P1: tart supports `--net-host` (hostOnly) or `--net-softnet-allow` (softnet);
+   - P2, P3 (softnet only): softnet supports stateful rules (`proto`,
+     `@host`) and is privileged;
+   - P4: the host resolves GitHub and completes a TLS handshake to
      `api.github.com` (no API call, because of rate limits);
-   - an in-process proxy self-test (`github.com` → 200, `example.com` → 403,
-     `172.16.0.1:53` → 403);
-   - ssh tools are present and there is enough disk space.
+   - P5: an in-process proxy self-test (`github.com` → 200, `example.com` →
+     403, `172.16.0.1:53` → 403);
+   - P6, P7: ssh tools are present and there is enough disk space (statfs
+     `f_bavail`: space available now, not purgeable space);
+   - P9: `allowedCIDRs` clear of host subnets;
+   - P10: TLS interception (above).
 
-   Any failure exits with code 78 before a clone. Each later boot re-checks
-   privilege and resolution.
-2. Clone, then `tart run` with the softnet arguments. Tart runs with
+   Any failure exits with code 78 before a clone. With more than one hostOnly
+   runner, `sand run` warns that there is no peer-VM isolation
+   (`network.peer.isolation`). Each later boot re-checks resolution (and
+   softnet privilege for softnet).
+2. Clone, then `tart run` with the backend's arguments. Tart runs with
    `SENTRY_DSN` and `CIRRUS_SENTRY_TAGS` removed from its environment.
 3. Wait for an IP that answers SSH. A stale softnet lease is re-resolved.
+   **If tart exits first** (for example `Softnet process terminated
+   prematurely`, or a `--net-host`/vmnet failure), the failure is classified
+   (`softnet-terminated`, `softnet-privilege`, `softnet-failed`,
+   `host-network-failed`, `tart-exited-early`) and audited as
+   `network.enforcement.failed`.
 4. Check the VM subnet against host routes.
 5. Start the proxy and the tunnel. Wait for guest `127.0.0.1:3128`.
-6. Verify the guest, before preRun or registration. Each negative probe runs
-   with the proxy variables unset and must fail:
+6. hostOnly: report host listeners on the bridge (`network.host.listeners`);
+   `hostListeners: deny` refuses the VM here.
+7. Verify the guest, before preRun or registration. Each negative probe runs
+   with the proxy variables unset and must fail. Under hostOnly the guest has
+   no default route, so "the gateway" is the host's bridge address.
    - `basic`:
      - 1.1.1.1:443;
      - the resolved GitHub front on :443;
-     - the gateway on :5000, :53 and :22;
+     - the gateway on :53 (always closed), :5000 and :22 (softnet: must be
+       closed; hostOnly: host services, reported, and failing only under
+       `hostListeners: deny` for an unaccepted port);
+     - hostOnly: each host TCP listener found in step 6 (up to 8), reported;
      - DNS via the gateway and via 8.8.8.8;
      - IPv6.
    - `strict` adds:
@@ -267,14 +400,24 @@ Other interactions:
 
    `api.github.com/zen` through the proxy must answer. An open, failing or
    missing probe destroys the VM and nothing is registered.
-7. Provision. The GitHub provisioner writes `~/actions-runner/.env` before
+8. `tlsInspection: trustHostCA`: install the CA (above).
+9. Provision. The GitHub provisioner writes `~/actions-runner/.env` before
    `config.sh`, runs `config.sh` with the proxy variables and
    `--disableupdate`, then runs `run.sh`.
-8. The watchdog polls every 2 s. These events end the job: tart exits, the
-   softnet child disappears, the tunnel exits, the proxy listener fails, or a
-   route overlap appears. The VM is stopped and deleted, the runner is
-   deregistered (`network.enforcement.lost`), and the next VM is subject to the
-   restart backoff.
+10. The watchdog polls every 2 s. These events end the job: tart exits, the
+    softnet child disappears (softnet), the tunnel exits, the proxy listener
+    fails, or a route overlap appears. The VM is stopped and deleted, the
+    runner is deregistered (`network.enforcement.lost`), and the next VM is
+    subject to the restart backoff. Expected teardown is not reported.
+
+**Bounded failures.** Steps 3-8 failing (tart exiting before the VM is
+reachable, tunnel, verification, host listeners, CA install, subnet overlap)
+count as consecutive network enforcement failures. Each one is audited as
+`network.enforcement.failed` with `attempt`, `max` and `final`. A VM that passes
+verification resets the count. After `maxEnforcementFailures` (default 3) in a
+row, `sand run` stops every slot's VM and exits 78, like a failed preflight,
+instead of re-cloning forever. With `stopAfter` set, the first enforcement
+failure already ends the run with 78.
 
 ## Reading audit lines
 
@@ -284,8 +427,14 @@ written as JSON lines to `X.network.jsonl`.
 ```
 network.connect bytes_down=548251 bytes_up=583 decision=allow duration=0.3 host=github.com ip=172.16.7.60 port=443 steered=true
 network.connect decision=deny host=example.com port=443 reason=not-allowlisted
-network.connect decision=deny host=registry.npmjs.org port=443 reason=blocked-address(172.16.7.60=private)
+network.connect decision=deny host=registry.npmjs.org port=443 reason="blocked-address(172.16.7.60=private)"
+network.policy.compiled backend=hostOnly domains=39 hash=... profile=profile:github runner=r1 tart_args=--net-host
+network.host.listeners count=2 listeners="tcp/5000 (ControlCe:1311),tcp/7000 (ControlCe:1311)" method=lsof+sweep policy=warn ...
+network.enforcement.failed attempt=2 backend=softnet final=true max=2 reason=softnet-terminated stage=before-ip ...
 ```
+
+Values with spaces, `=` or quotes are double-quoted (with `"` and `\` escaped)
+in the text log; the JSON lines carry the raw value.
 
 Deny reasons:
 
@@ -311,8 +460,17 @@ and the most-denied hosts. Audit fields never contain tokens or request paths
 
 ## Troubleshooting
 
-- **"Network preflight failed".** Run the printed `sudo` commands, or
-  `sand network preflight --config sand.yml` for the full report.
+- **"Network preflight failed".** Run `sand network preflight --config sand.yml`
+  for the full report. P3 (softnet privilege) only appears for `backend:
+  softnet`; drop that key to use the root-free default. P10 (TLS inspection):
+  ask IT for a bypass of the listed hosts or set `tlsInspection: trustHostCA`.
+- **`sand run` exits 78 after a few boots.** `network.enforcement.failed`
+  lines name the stage and reason (for example `softnet-terminated` when
+  softnet loses its privilege). Fix the cause; Sand will not keep re-cloning.
+- **Which host services can a hostOnly VM reach?** Boot a VM, then
+  `sand network listeners --vm-ip "$(tart ip VM)"` prints exactly what the
+  post-boot check reports. Rebind services to `127.0.0.1`, turn off AirPlay
+  Receiver, or use `hostListeners: deny` with `acceptedHostListeners`.
 - **A tool ignores the proxy.** Most tools honour `https_proxy`: git, curl,
   `@actions/*`, npm, pip, and brew (through curl). URLSession tools
   (xcodebuild, SwiftPM) use the macOS system proxy that Sand sets. For
@@ -334,6 +492,10 @@ and the most-denied hosts. Audit fields never contain tokens or request paths
 - To keep shared NAT, add `network: { mode: shared }`. Do this for runners
   with host `mounts`, which isolated VMs reject.
 - A legacy `mode: restricted` config keeps working and now allows host SSH.
+- Profiles now default to `backend: hostOnly`, which needs no root. To keep
+  the previous softnet enforcement (host-service and peer-VM isolation), add
+  `backend: softnet` (required for `allowedCIDRs`), or `backend: auto` to use
+  softnet only where it is privileged.
 
 ## Residual risks
 
@@ -353,10 +515,24 @@ and the most-denied hosts. Audit fields never contain tokens or request paths
   Mismatches are refused, but the inner name cannot be checked.
 - **Shared BlastShield identity.** The guest shares the host's BlastShield
   identity for the six steered GitHub names. See the reviewed exception above.
+- **hostOnly: host services and peer VMs.** Host services bound to all
+  interfaces are reachable from the guest, and VMs on the bridge can reach
+  each other. Both are reported (`network.host.listeners`,
+  `network.peer.isolation`); `hostListeners: deny` refuses the VM, and
+  `backend: softnet` removes both. A host service that is itself a proxy or
+  resolver on `*` would be an egress path; DNS on the bridge is probed as
+  egress, other proxies are only reported.
+- **hostOnly relies on vmnet host mode.** There is no rule set to inspect;
+  the guarantee is that vmnet's host-only network has no NAT or route off the
+  host. The guest verifier re-checks it on every boot. Host IP forwarding
+  (`net.inet.ip.forwarding=1`) did not create a path in testing, but a host
+  firewall/NAT configuration that bridges `bridge100` would.
+- **trustHostCA.** The inspection vendor can read job TLS to intercepted hosts.
 - **No softnet policy attestation yet.** The watchdog checks that processes are
   alive; it cannot read back the rules softnet enforces.
 - **IPv4-only rules.** Softnet rules are IPv4 only. IPv6 is dropped entirely
-  rather than filtered.
+  rather than filtered. hostOnly gives the guest no IPv6 route either (only
+  link-local to the host, which counts for host listeners).
 - **sshpass.** The `sshpass` password is still visible in the host process
   list (pre-existing).
 - **Host SSH config.** Every ssh, scp and tunnel session runs with
@@ -372,14 +548,19 @@ and the most-denied hosts. Audit fields never contain tokens or request paths
 
 This branch delivers these Phase 1 items:
 
-- Softnet and Tart preflight before VM boot, with no shared-network fallback.
+- A root-free default enforcement backend (tart `--net-host`), with softnet as
+  an opt-in for host-service and peer-VM isolation.
+- Tart (and, for softnet, softnet) preflight before VM boot, with no
+  shared-network fallback.
+- Generic detection of TLS-inspecting endpoint agents, failing closed or,
+  opt-in, trusting only the detected CA's public certificate in the guest.
 - Host SSH provisioning that is separate from guest egress (the `in proto tcp
   @host port 22` rule versus the proxy tunnel).
 - Allowed GitHub traffic through an approved proxy, and denied
   host/LAN/VPN/corporate/internet traffic, including IPv6, DNS and UDP. The
   in-guest verifier checks both on every boot.
 - Fail-closed behaviour when softnet, the proxy or the tunnel crashes, and on
-  route changes.
+  route changes, with a bounded retry count and exit 78.
 
 Still open:
 
@@ -387,7 +568,42 @@ Still open:
 - the live failure-injection runs from the test plan;
 - security sign-off on the BlastShield exception above.
 
-## Verified on this host (2026-11-27)
+## Verified on this host: hostOnly backend (2026-11-27)
+
+Same host as below (tart 2.42.0, BlastShield, Netskope, no root, no
+passwordless sudo). Disposable clones named `sand-nettest-*`, all deleted.
+
+- **Raw `tart run --no-graphics --net-host`, no root.** The guest got
+  192.168.128.3 on host `bridge100` 192.168.128.1, with no default route. From
+  the guest these were CLOSED: 1.1.1.1:443, 140.82.112.3:443, the BlastShield
+  GitHub front 172.16.7.60:443, a corporate 172.16.7.64:443, the LAN gateway
+  10.0.0.1:80, 100.100.100.100:53 and the host's LAN address 10.0.0.152:5000.
+  DNS to 8.8.8.8 and to the bridge timed out, and IPv6 failed. Host-to-guest
+  SSH worked. Host services bound to all interfaces were OPEN on the bridge
+  address (ControlCenter `:5000`, `:7000`), and there is no peer-VM isolation.
+- **`sand run`, default policy.** Preflight P10 detected Netskope generically:
+  the chains for `*.actions.githubusercontent.com`, `objects`, `raw`,
+  `release-assets` and `pkg-containers.githubusercontent.com` ended in the
+  admin-trusted `certadmin` root via `ca.coreweave.goskope.com`, neither of
+  them an Apple root. `sand run` exited 78 before cloning, listing the hosts
+  and both fingerprints.
+- **`sand run` with `verify: strict` and `tlsInspection: trustHostCA`.**
+  - `network.host.listeners` reported 14 listeners using `lsof+sweep`: netstat
+    shows no Internet sockets to a child process on this macOS release.
+  - The strict guest check passed (23 probes) and recorded
+    `host_services_reachable=tcp/5000,tcp/7000,tcp/57765`.
+  - `sudo -n security add-trusted-cert` over SSH succeeded (`keychain=ok`).
+  - In the job, curl to `objects.githubusercontent.com` and
+    `pipelines.actions.githubusercontent.com` (both intercepted) completed TLS,
+    with `SSL_CERT_FILE=/Users/admin/.sand/ca-bundle.pem`.
+- **Runtime backend failure.** `backend: softnet` with a non-escalating test
+  shim in place of sudo let preflight pass, then softnet died
+  (`RuntimeFailed(why: "Softnet process terminated prematurely")`). Sand
+  logged `network.enforcement.failed reason=softnet-terminated stage=before-ip`
+  twice (`maxEnforcementFailures: 2`), deleted the VM each time, never used
+  shared NAT, and exited 78.
+
+## Verified on this host: softnet backend (2026-11-27)
 
 The test host was an Apple silicon Mac running tart 2.42.0 and softnet 0.26.0,
 with BlastShield signed in, a Netskope client and a personal tailnet. Softnet
@@ -444,17 +660,17 @@ domains (redacted) resolve through BlastShield's own resolvers. Consequences:
 
 **Open blockers and caveats on this host:**
 
-- **Netskope intercepts proxy flows.** The host proxy's upstream connections
+- **Netskope intercepts proxy flows** (now detected by P10 and handled by
+  `tlsInspection`, see above). The host proxy's upstream connections
   to `*.actions.githubusercontent.com` (pipelines, results-receiver),
   `objects.githubusercontent.com` and `raw.githubusercontent.com` are
   TLS-intercepted. The guest sees the inspection CA and fails TLS. Sand fails
   closed, but **Actions jobs will not work on this host** until IT adds a
   bypass for these hosts or an opt-in guest trust of the inspection CA is
   approved.
-- **Runtime softnet failure.** When softnet cannot start after preflight
-  passed, sand recreates the VM with backoff indefinitely, logging "ip not
-  ready". It never uses shared NAT, but it does not yet classify this as
-  `network.enforcement.lost` or stop after N attempts.
+- **Runtime softnet failure** (fixed). Sand used to recreate the VM forever
+  when softnet died after preflight. It now classifies the failure, audits
+  `network.enforcement.failed` and exits 78 after `maxEnforcementFailures`.
 - **IPv6.** Softnet rules are IPv4 only, so the guest's IPv6 is dropped. The
   proxy can still connect to public IPv6 upstreams for allowlisted names.
   NAT64, 6to4, Teredo and IPv4-compatible forms are denied.
@@ -465,7 +681,23 @@ domains (redacted) resolve through BlastShield's own resolvers. Consequences:
 - **Throughput.** The SSH tunnel roughly halves throughput: about 18 MB/s
   through the tunnel versus about 40 MB/s host-direct.
 
-## Live test plan (sacrificial Mac, after the one-time setup)
+## Live test plan (sacrificial Mac)
+
+Stages A and B below are for the softnet backend (after the one-time setup).
+For the default hostOnly backend, no setup is needed:
+
+```sh
+tart clone ghcr.io/cirruslabs/macos-runner:golden-gate sand-nettest-ho
+tart run --no-graphics --net-host sand-nettest-ho &
+IP=$(tart ip sand-nettest-ho --wait 120)
+sand network listeners --vm-ip "$IP"                     # what the post-boot check reports
+sand network probe-script --verify strict --no-proxy --host-gateway "${IP%.*}.1" > probe.sh   # host-only has no default route
+tart exec -i sand-nettest-ho bash -s < probe.sh   # all CLOSED except host services on $GW (reported)
+tart stop sand-nettest-ho; tart delete sand-nettest-ho
+sand network preflight --config fixtures/network_enterprise_hostonly.yml   # P1 --net-host, P10 TLS inspection
+```
+
+Softnet stages:
 
 Run every stage yourself. Clone test VMs with `tart clone`, which uses APFS
 copy-on-write, and delete them afterwards.
