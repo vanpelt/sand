@@ -8,6 +8,10 @@ runners:
         ramGb: 4
       run:
         noGraphics: true
+        # Host mounts are not allowed with the secure network default, so this
+        # config opts out explicitly (sand warns about unrestricted reach).
+        network:
+          mode: shared
       mounts:
         - host: ~/.cache/sand/gha-cache
           name: gha-cache
@@ -36,6 +40,10 @@ runners:
         ramGb: 4
       run:
         noGraphics: true
+        # Host mounts are not allowed with the secure network default, so this
+        # config opts out explicitly (sand warns about unrestricted reach).
+        network:
+          mode: shared
       mounts:
         - host: ~/.cache/sand/gha-cache
           name: gha-cache

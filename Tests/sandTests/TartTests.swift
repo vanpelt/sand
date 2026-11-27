@@ -80,7 +80,7 @@ final class TartTests: XCTestCase {
         let options = Tart.RunOptions(
             directoryMounts: [], noAudio: true, noGraphics: true,
             noClipboard: true, nested: false,
-            network: NetworkPolicy(mode: .softnet)
+            network: try NetworkConfig(mode: .softnet).compile()
         )
         _ = try tart.run(name: "ephemeral", options: options)
         XCTAssertEqual(runner.startCalls.last?.arguments, [
@@ -94,12 +94,12 @@ final class TartTests: XCTestCase {
         let options = Tart.RunOptions(
             directoryMounts: [], noAudio: true, noGraphics: true,
             noClipboard: true, nested: false,
-            network: NetworkPolicy(mode: .restricted, allowCIDRs: ["10.42.10.25/32", "10.42.11.0/24"])
+            network: try NetworkConfig(mode: .restricted, allowCIDRs: ["10.42.10.25/32", "10.42.11.0/24"]).compile()
         )
         _ = try tart.run(name: "ephemeral", options: options)
         XCTAssertEqual(runner.startCalls.last?.arguments, [
             "run", "ephemeral", "--net-softnet", "--net-softnet-block=0.0.0.0/0",
-            "--net-softnet-allow=10.42.10.25/32,10.42.11.0/24",
+            "--net-softnet-allow=in proto tcp @host port 22,out 10.42.10.25/32,out 10.42.11.0/24",
             "--no-graphics", "--no-audio", "--no-clipboard"
         ])
     }

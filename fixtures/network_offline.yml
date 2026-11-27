@@ -1,0 +1,15 @@
+# No guest network at all: softnet deny-all with only host-to-guest SSH.
+# For script provisioners that need no network access.
+runners:
+  - name: offline-build
+    vm:
+      source:
+        type: local
+        name: golden
+      run:
+        network:
+          profile: offline
+    provisioner:
+      type: script
+      config:
+        run: echo "no network needed"

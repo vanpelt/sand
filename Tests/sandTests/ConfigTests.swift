@@ -115,7 +115,9 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(config.runners.first?.vm.source.type, .oci)
         XCTAssertEqual(config.runners.first?.vm.source.resolvedSource, "ghcr.io/acme/vm:latest")
         XCTAssertEqual(config.runners.first?.vm.run.noGraphics, true)
-        XCTAssertEqual(config.runners.first?.vm.run.noClipboard, false)
+        // No network key: the secure default profile, which also disables the clipboard.
+        XCTAssertEqual(config.runners.first?.vm.run.noClipboard, true)
+        XCTAssertEqual(config.runners.first?.vm.run.network, .secureDefault)
         XCTAssertEqual(config.runners.first?.vm.run.nested, false)
         XCTAssertNil(config.runners.first?.vm.run.rootDiskOpts)
         XCTAssertEqual(config.runners.first?.vm.ssh.user, "runner")

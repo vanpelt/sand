@@ -1,0 +1,18 @@
+# Zero-config secure networking: no vm.run.network key is the same as
+# `network: { profile: github }`. The guest is confined by softnet deny-all and
+# reaches only GitHub (plus the github preset's CDN/blob hosts) through Sand's
+# host-side allowlisting HTTPS proxy. Requires the one-time softnet setup in
+# docs/network-isolation.md.
+runners:
+  - name: secure-default
+    vm:
+      source:
+        type: oci
+        image: ghcr.io/cirruslabs/macos-runner:golden-gate
+    provisioner:
+      type: github
+      config:
+        appId: 123456
+        organization: my-org
+        privateKeyKeychainLabel: sand-github-app
+        runnerName: secure-default

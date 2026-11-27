@@ -178,15 +178,25 @@ struct Config: Decodable, Sendable {
     struct RunOptions: Decodable, Sendable {
         let noGraphics: Bool
         let noClipboard: Bool
+        /// True when `noClipboard` was written in the config (used for warnings).
+        let noClipboardExplicit: Bool
         let nested: Bool
         let rootDiskOpts: String?
-        let network: NetworkPolicy
+        let network: NetworkConfig
 
-        static let `default` = RunOptions(noGraphics: true, noClipboard: false, nested: false)
+        static let `default` = RunOptions(noGraphics: true, noClipboard: true, nested: false)
 
-        init(noGraphics: Bool, noClipboard: Bool, nested: Bool, rootDiskOpts: String? = nil, network: NetworkPolicy = .shared) {
+        init(
+            noGraphics: Bool,
+            noClipboard: Bool,
+            nested: Bool,
+            rootDiskOpts: String? = nil,
+            network: NetworkConfig = .secureDefault,
+            noClipboardExplicit: Bool = false
+        ) {
             self.noGraphics = noGraphics
             self.noClipboard = noClipboard
+            self.noClipboardExplicit = noClipboardExplicit
             self.nested = nested
             self.rootDiskOpts = rootDiskOpts
             self.network = network
@@ -195,10 +205,14 @@ struct Config: Decodable, Sendable {
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             self.noGraphics = try container.decodeIfPresent(Bool.self, forKey: .noGraphics) ?? true
-            self.noClipboard = try container.decodeIfPresent(Bool.self, forKey: .noClipboard) ?? false
             self.nested = try container.decodeIfPresent(Bool.self, forKey: .nested) ?? false
             self.rootDiskOpts = try container.decodeIfPresent(String.self, forKey: .rootDiskOpts)
-            self.network = try container.decodeIfPresent(NetworkPolicy.self, forKey: .network) ?? .shared
+            // No network key means the secure default (profile: github), never shared NAT.
+            self.network = try container.decodeIfPresent(NetworkConfig.self, forKey: .network) ?? .secureDefault
+            let explicitClipboard = try container.decodeIfPresent(Bool.self, forKey: .noClipboard)
+            self.noClipboardExplicit = explicitClipboard != nil
+            // Clipboard sharing is a host channel; isolated VMs disable it unless asked.
+            self.noClipboard = explicitClipboard ?? network.isIsolated
         }
 
         private enum CodingKeys: String, CodingKey {

@@ -137,6 +137,13 @@ struct Runner: Sendable {
             await shutdownCoordinator.cleanup(reason: "apply VM config failed")
             throw error
         }
+        let networkPolicy: NetworkPolicy
+        do {
+            networkPolicy = try vm.run.network.compile(sshPort: vm.ssh.port)
+        } catch {
+            await shutdownCoordinator.cleanup(reason: "network policy invalid")
+            throw error
+        }
         let runOptions = Tart.RunOptions(
             directoryMounts: directoryMounts,
             noAudio: vm.hardware?.audio == false,
@@ -144,7 +151,7 @@ struct Runner: Sendable {
             noClipboard: vm.run.noClipboard,
             nested: vm.run.nested,
             rootDiskOpts: vm.run.rootDiskOpts,
-            network: vm.run.network
+            network: networkPolicy
         )
         logRunOptions(name: name, options: runOptions)
         logger.info("boot VM \(name)")
@@ -898,7 +905,7 @@ struct Runner: Sendable {
     }
 
     private func logRunOptions(name: String, options: Tart.RunOptions) {
-        logger.info("VM \(name) run options: noGraphics=\(options.noGraphics) noAudio=\(options.noAudio) noClipboard=\(options.noClipboard) nested=\(options.nested) rootDiskOpts=\(options.rootDiskOpts ?? "default") network=\(options.network.mode.rawValue)")
+        logger.info("VM \(name) run options: noGraphics=\(options.noGraphics) noAudio=\(options.noAudio) noClipboard=\(options.noClipboard) nested=\(options.nested) rootDiskOpts=\(options.rootDiskOpts ?? "default") network=\(options.network.name)")
         if options.directoryMounts.isEmpty {
             logger.info("VM \(name) mounts: none")
             return

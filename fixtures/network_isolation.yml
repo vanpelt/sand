@@ -1,4 +1,7 @@
-# Prototype-only configuration: use a real isolated proxy endpoint before running.
+# Legacy explicit mode: softnet deny-all plus direct IPv4 allows (all ports).
+# Sand also allows host-to-guest SSH (`in proto tcp @host port <ssh port>`).
+# Prefer the default `profile: github`; this mode is for an externally run,
+# dedicated egress proxy. Replace the EXAMPLE address before running.
 runners:
   - name: restricted-prototype
     vm:
@@ -13,7 +16,7 @@ runners:
         network:
           mode: restricted
           allowCIDRs:
-            - 10.42.10.25/32
+            - 10.42.10.25/32 # EXAMPLE ONLY: dedicated egress proxy
     provisioner:
       type: script
       config:

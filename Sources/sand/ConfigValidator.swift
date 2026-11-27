@@ -131,47 +131,103 @@ final class ConfigValidator {
 
 
     private func validateNetwork(_ vm: Config.VM, issues: inout [ConfigValidationIssue]) {
-        let policy = vm.run.network
-        switch policy.mode {
-        case .shared, .softnet:
-            if !policy.allowCIDRs.isEmpty {
-                issues.append(.init(
-                    severity: .error,
-                    message: "vm.run.network.allowCIDRs is supported only when mode is restricted."
-                ))
+        let network = vm.run.network
+        func error(_ message: String) {
+            issues.append(.init(severity: .error, message: message))
+        }
+        func warning(_ message: String) {
+            issues.append(.init(severity: .warning, message: message))
+        }
+        let profileOnlyKeysUsed = !network.presets.isEmpty || !network.allowedDomains.isEmpty || !network.allowedCIDRs.isEmpty
+        switch network.selection {
+        case .mode(.shared):
+            warning("vm.run.network.mode is shared: VM has unrestricted host/LAN/VPN/corporate network reach.")
+        case .mode(.softnet):
+            warning("vm.run.network.mode softnet blocks private ranges, so VPN split-DNS (e.g. BlastShield) GitHub fronts are unreachable; prefer the default profile: github.")
+        case .mode(.restricted):
+            if network.allowCIDRs.isEmpty {
+                error("vm.run.network.restricted requires at least one explicit IPv4 allowCIDR (e.g. a proxy /32).")
             }
-        case .restricted:
-            if policy.allowCIDRs.isEmpty {
-                issues.append(.init(
-                    severity: .error,
-                    message: "vm.run.network.restricted requires at least one explicit IPv4 allowCIDR (e.g. a proxy /32)."
-                ))
+            for cidr in network.allowCIDRs where !NetworkPolicy.isAllowedCIDR(cidr) {
+                error("vm.run.network.allowCIDRs entry '\(cidr)' must be an IPv4 CIDR with prefix /24 through /32.")
             }
-            for cidr in policy.allowCIDRs where !NetworkPolicy.isAllowedCIDR(cidr) {
-                issues.append(.init(
-                    severity: .error,
-                    message: "vm.run.network.allowCIDRs entry '\(cidr)' must be an IPv4 CIDR with prefix /24 through /32."
-                ))
+        case .profile(.offline):
+            if profileOnlyKeysUsed {
+                error("vm.run.network.profile offline does not allow presets, allowedDomains or allowedCIDRs.")
             }
-            if !vm.run.noClipboard {
-                issues.append(.init(
-                    severity: .error,
-                    message: "vm.run.network.restricted requires vm.run.noClipboard: true."
-                ))
+        case .profile(.github):
+            if network.verify == .off {
+                error("vm.run.network.verify: off is only allowed with profile: offline; guest egress must be verified before registration.")
             }
-            if vm.run.nested {
-                issues.append(.init(
-                    severity: .error,
-                    message: "vm.run.network.restricted requires vm.run.nested: false."
-                ))
+            for domain in network.allowedDomains {
+                do {
+                    let rule = try DomainRule.parse(domain)
+                    if rule.port == 22 || rule.port == 25 {
+                        warning("vm.run.network.allowedDomains entry '\(domain)' opens port \(rule.port); the proxy only forwards TLS, so SSH/SMTP will not work and this is likely a mistake.")
+                    }
+                } catch {
+                    self.appendDomainError(domain, error, issues: &issues)
+                }
             }
-            if !vm.mounts.isEmpty {
-                issues.append(.init(
-                    severity: .error,
-                    message: "vm.run.network.restricted does not permit host directory mounts."
-                ))
+            for allow in network.allowedCIDRs {
+                do {
+                    try NetworkConfig.checkDirectCIDR(allow)
+                    if allow.allowPrivate {
+                        warning("vm.run.network.allowedCIDRs entry \(allow.cidr) uses allowPrivate: true; the guest can reach that private range directly.")
+                    } else {
+                        warning("vm.run.network.allowedCIDRs entry \(allow.cidr) port \(allow.port) bypasses the egress proxy and its audit log.")
+                    }
+                } catch let failure {
+                    error("vm.run.network.allowedCIDRs: \(failure)")
+                }
             }
         }
+        if network.mode != nil {
+            if profileOnlyKeysUsed || network.verify != nil {
+                error("vm.run.network presets, allowedDomains, allowedCIDRs and verify require a profile, not mode.")
+            }
+        }
+        if network.mode != .restricted, !network.allowCIDRs.isEmpty {
+            error("vm.run.network.allowCIDRs is supported only when mode is restricted (use allowedCIDRs with a profile).")
+        }
+        if network.allowGitHubSSH {
+            error("vm.run.network.allowGitHubSSH is reserved; only HTTPS checkout is supported.")
+        }
+        if network.transport == .gateway {
+            error("vm.run.network.transport: gateway is reserved and not implemented; omit it to use the SSH tunnel.")
+        }
+        guard network.isIsolated else {
+            return
+        }
+        let label = network.label
+        if !vm.run.noClipboard {
+            if network.mode == .restricted {
+                error("vm.run.network.restricted requires vm.run.noClipboard: true.")
+            } else {
+                warning("vm.run.network \(label) with noClipboard: false shares the host clipboard with the guest.")
+            }
+        }
+        if vm.run.nested {
+            error("vm.run.network \(label) requires vm.run.nested: false.")
+        }
+        if !vm.mounts.isEmpty {
+            error("vm.run.network \(label) does not permit host directory mounts.")
+        }
+        do {
+            _ = try network.compile(sshPort: vm.ssh.port)
+        } catch let failure {
+            // Every individual rule was reported above; this catches anything else.
+            if !issues.contains(where: { $0.severity == .error }) {
+                error("vm.run.network policy failed to compile: \(failure)")
+            }
+        }
+    }
+
+    private func appendDomainError(_ domain: String, _ failure: Error, issues: inout [ConfigValidationIssue]) {
+        issues.append(.init(
+            severity: .error,
+            message: "vm.run.network.allowedDomains entry rejected: \(failure)."
+        ))
     }
 
     private func validateHealthCheck(_ healthCheck: Config.HealthCheck, issues: inout [ConfigValidationIssue]) {

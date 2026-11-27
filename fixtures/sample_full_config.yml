@@ -23,6 +23,10 @@ runners:
         noClipboard: false
         nested: false
         rootDiskOpts: null
+        # Host mounts and the clipboard need unrestricted shared NAT; this is an
+        # explicit opt-out of the secure default and logs a warning on every boot.
+        network:
+          mode: shared
       diskSizeGb: null
       ssh:
         user: admin
@@ -50,6 +54,23 @@ runners:
         image: "ghcr.io/cirruslabs/ubuntu:latest"
       cache:
         host: ~/.cache/sand/actions-runner
+      run:
+        noGraphics: true
+        # Omitting network is the same as profile: github. Written out in full here.
+        network:
+          profile: github          # github (default) | offline
+          presets: [npm, pypi]     # extra built-in domain bundles
+          allowedDomains:          # user additions; port defaults to 443
+            - registry.example-artifacts.com
+            - "*.cdn.example.com"
+            - "git.example.org:8443"
+          allowGitHubSSH: false    # reserved; HTTPS checkout only
+          verify: basic            # basic (default) | strict
+          transport: tunnel        # tunnel (default); gateway is reserved
+          allowedCIDRs:            # expert escape hatch: direct allows that bypass the proxy
+            - cidr: 203.0.113.10/32
+              port: 443
+              proto: tcp
       ssh:
         user: admin
         password: admin
