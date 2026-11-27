@@ -25,6 +25,7 @@ runners:
         port: ${SAND_E2E_SSH_PORT}
       run:
         noGraphics: true
+        network: ${SAND_E2E_NETWORK}
     provisioner:
       type: script
       config:
@@ -37,7 +38,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-run_with_timeout "$SAND_E2E_TIMEOUT_SEC" "$SAND_BIN" run --dry-run --config "$config"
+output=$(run_with_timeout "$SAND_E2E_TIMEOUT_SEC" "$SAND_BIN" run --dry-run --config "$config")
+assert_match "network policy: " "$output"
+assert_match "policy hash: [0-9a-f]\{64\}" "$output"
 
 state=$(tart_vm_state "$runner")
 assert_eq "missing" "$state"

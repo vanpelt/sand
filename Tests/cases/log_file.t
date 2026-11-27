@@ -26,6 +26,7 @@ runners:
         port: ${SAND_E2E_SSH_PORT}
       run:
         noGraphics: true
+        network: ${SAND_E2E_NETWORK}
     provisioner:
       type: script
       config:
