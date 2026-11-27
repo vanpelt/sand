@@ -103,12 +103,19 @@ Validation rules:
 - `allowedDomains` entries are lowercased and any trailing dot is stripped.
   - Each entry must use valid hostname labels. Give IDN names in punycode.
   - Two wildcard forms are allowed: a leading `*.` (at least two labels after
-    it), and one `*` inside the first label (`productionresultssa*.blob.core.windows.net`).
+    it), and one `*` inside the first label (`build*.example.com`). Avoid
+    either form on multi-tenant suffixes (`*.blob.core.windows.net`,
+    `*.s3.amazonaws.com`, `*.cloudfront.net`, `*.github.io`): anyone can
+    register a name there, so the wildcard admits their endpoints too.
   - These are rejected: IP literals, a bare `*`, `*.com`, `a.*.b`, and ports
     outside 1-65535. Ports 22 and 25 produce a warning.
 - `allowedCIDRs` must be IPv4 /24 to /32 and must set `port`.
-  - Ranges that overlap private, CGNAT, loopback, link-local or multicast
-    space are rejected unless `allowPrivate: true` is set, and that also warns.
+  - Ranges that overlap private or CGNAT space are rejected unless
+    `allowPrivate: true` is set, and that also warns.
+  - Loopback, `0/8`, link-local/metadata (169.254/16), multicast and
+    reserved space are rejected even with `allowPrivate`.
+  - Preflight (P9) also fails if an entry contains a host address or overlaps
+    a subnet attached to the host (the LAN, the vmnet bridge).
   - These rules bypass the proxy: there is no hostname check and no audit line.
 - Isolated VMs may not use host mounts or `nested: true`. `noClipboard`
   defaults to true; setting it to false produces a warning.
@@ -137,8 +144,12 @@ Its wildcards are:
 - `*.actions.githubusercontent.com`: pipelines, results, token and other
   Actions services
 - `*.pkg.github.com`: GitHub Packages
-- `productionresultssa*.blob.core.windows.net`: Actions artifacts, logs and
-  cache
+
+Actions artifacts, logs and cache use GitHub's results storage accounts,
+listed exactly as `productionresultssa0` to `productionresultssa19`
+`.blob.core.windows.net`. A `productionresultssa*` glob is deliberately not
+used: Azure storage account names are first-come, so a glob would also admit
+an attacker-registered account such as `productionresultssaxyz12`.
 
 Optional presets:
 
@@ -171,9 +182,18 @@ exception:
 - the name is one of the six **steered names** above; and
 - the answer is RFC1918; and
 - the answer is not the host's own address, not on a directly attached
-  subnet, and not inside the VM's subnet.
+  subnet, and not inside the VM's subnet; and
+- the host routes the answer out the same interface the steered names used
+  when the VM's proxy started (for example the BlastShield utun). Sand learns
+  that interface per VM and logs it as `network.steering.learned`. A resolver
+  that answers `github.com` with a tailnet or other VPN address is refused
+  with `steered-route-mismatch`. If BlastShield reconnects on a different
+  interface, steered connections fail closed until the next VM.
 
-When all three hold, the connection is allowed and audited with
+Point-to-point (utun) interfaces count only their own address as on-link,
+whatever netmask the VPN client sets.
+
+When all of these hold, the connection is allowed and audited with
 `steered=true`. Any other allowlisted name that resolves to a private address
 is denied. This is how DNS rebinding of user domains to corporate services is
 blocked. The guest never gets the VPN route itself.
@@ -273,10 +293,17 @@ Deny reasons:
 | --- | --- |
 | `not-allowlisted` | The name and port are not in the policy. Add a preset or an `allowedDomains` entry if the job really needs it. |
 | `ip-literal` | The client connected by IP address. Allowlist the name, or (after review) add an `allowedCIDRs` entry. |
-| `blocked-address(...)` | The name resolved only to private, host, on-link or reserved addresses. This is rebinding protection. |
+| `blocked-address(...)` | The name resolved only to private, host, on-link or reserved addresses. This is rebinding protection. A covered IP literal that hits the host, its LAN, loopback or link-local is also refused here. |
+| `steered-route-mismatch` | A steered GitHub name resolved to a private address the host does not route out the learned VPN interface. |
 | `sni-mismatch`, `no-sni`, `not-tls` | The tunnel did not start with a TLS ClientHello for the CONNECT host. Plain HTTP over CONNECT and domain fronting are refused. |
-| `method-not-allowed`, `bad-request`, `header-too-large` | The request was not a well-formed `CONNECT host:port`. |
+| `method-not-allowed`, `bad-request`, `header-too-large` | The request was not a well-formed `CONNECT host:port`. The host must be an IP literal or a strict hostname (letters, digits, `-`, dots between non-empty labels), so NUL bytes, `%`, `_` and control characters are refused here. |
 | `tunnel-limit` | The VM already has 256 open tunnels. |
+
+The guest sees only the bare reason code, in an `X-Sand-Deny` response header
+(for example `blocked-address`). Resolved addresses and resolver or connect
+errors stay in the host log, so guest code cannot use deny responses to read
+DNS answers back. After 200 deny lines per VM, only one in 100 is logged (with
+a `suppressed=` count), and at most 256 distinct denied hosts are tracked.
 
 `network.session.summary` at teardown lists allowed and denied counts, bytes,
 and the most-denied hosts. Audit fields never contain tokens or request paths
@@ -314,6 +341,14 @@ and the most-denied hosts. Audit fields never contain tokens or request paths
   itself or to shared CDNs and blob storage (Fastly, Azure Front Door, Azure
   blob storage). SNI equality and byte counts in the audit log reduce this.
   Secrets isolation (plan §8 and §9) is still required.
+- **Domain fronting on shared front ends.** The proxy checks SNI, not the
+  encrypted HTTP `Host` header. On S3, Azure blob storage and Fastly-fronted
+  hosts, a client can send an allowed SNI and route to another tenant by
+  `Host`. Only a TLS-terminating proxy could close this.
+- **Upstream connect before SNI check.** The proxy opens the upstream TCP
+  connection before it reads the ClientHello. The name is already allowlisted
+  and resolved through the guard at that point, but a refused tunnel still
+  costs one host-originated SYN.
 - **ECH.** With Encrypted Client Hello, the proxy sees only the outer SNI.
   Mismatches are refused, but the inner name cannot be checked.
 - **Shared BlastShield identity.** The guest shares the host's BlastShield
@@ -324,6 +359,14 @@ and the most-denied hosts. Audit fields never contain tokens or request paths
   rather than filtered.
 - **sshpass.** The `sshpass` password is still visible in the host process
   list (pre-existing).
+- **Host SSH config.** Every ssh, scp and tunnel session runs with
+  `-F /dev/null`, `ForwardAgent=no`, `ForwardX11=no`, `ControlMaster=no` and
+  `PermitLocalCommand=no`, and without `SSH_AUTH_SOCK`. Exec and scp sessions
+  also set `ClearAllForwardings=yes`. A `Host *` entry in `~/.ssh/config` can
+  therefore no longer hand the guest the user's agent or extra forwards.
+- **Point-in-time host facts.** Host addresses and routes are read when each
+  VM's proxy starts. An IPv6 temporary address or a VPN that appears later is
+  not in the guard's host list until the next VM.
 
 ## Enterprise plan, Phase 1 status
 
@@ -344,56 +387,83 @@ Still open:
 - the live failure-injection runs from the test plan;
 - security sign-off on the BlastShield exception above.
 
-## Live findings (BlastShield + Netskope host, 2026-11-27)
+## Verified on this host (2026-11-27)
 
-These results come from a disposable `golden-gate` clone under shared NAT. That
-host did not have the softnet setup, so stages A, C and D could not run. The
-proxy and tunnel were run by hand as in stage B:
+The test host was an Apple silicon Mac running tart 2.42.0 and softnet 0.26.0,
+with BlastShield signed in, a Netskope client and a personal tailnet. Softnet
+was **not** yet setuid on this host and passwordless sudo was not available.
+Tests used disposable `tart clone`s, all deleted afterwards.
 
-- **Proxy and tunnel.** The guest reached `127.0.0.1:3128` over
-  `ssh -R`. The macOS guest's sshd allows TCP forwarding.
-  - `github.com` and `api.github.com` returned 200 with `steered=true` through
-    172.16.7.60 and 172.16.0.150 (BlastShield).
-  - `git ls-remote https://github.com/actions/runner` worked.
-  - `example.com`, `artifacts.coreweave.com` and `172.16.7.64` were refused
-    with 403.
-  - A macOS update check to `gdmf.apple.com` showed up as a deny line, which
-    is useful audit signal.
-  - Killing the tunnel made the guest's next request fail at once.
-- **System proxy.** `nscurl` (URLSession) followed the system proxy that Sand
-  set. With guest DNS pointed at 127.0.0.1, a direct name lookup timed out
-  after about 5 s rather than failing instantly.
-- **Throughput.** A 16 MB codeload download ran at about 18-19 MB/s through
-  the tunnel. Host-direct was about 38-43 MB/s, and the proxy alone on the
-  host was about 37 MB/s. The SSH tunnel costs roughly half the throughput.
-- **Netskope intercepts proxy flows (open blocker for this host).** Host
-  process flows to these hosts are TLS-intercepted by Netskope (goskope CA), so
-  the guest sees `self signed certificate in certificate chain`:
-  - `raw.githubusercontent.com`, `objects.githubusercontent.com`,
-    `release-assets.githubusercontent.com` and
-    `pkg-containers.githubusercontent.com`;
-  - `pipelines.actions.githubusercontent.com` and
-    `results-receiver.actions.githubusercontent.com`.
+**BlastShield split DNS.** Through the system resolver, `github.com` and
+`codeload.github.com` resolved to private fronts in 172.16/12, routed out the
+BlastShield utun. `api.github.com`, `lfs.github.com` and other names flipped
+between a private front and public 140.82.x within one session. `dig`, which
+bypasses the system resolver, always returned public addresses. Corporate
+domains (redacted) resolve through BlastShield's own resolvers. Consequences:
 
-  `github.com`, `api`, `codeload`, `uploads`, `lfs`, `ghcr.io`, S3 and Azure
-  blob storage were not intercepted. Because the runner needs the
-  `*.actions.githubusercontent.com` services, **jobs will fail on this host
-  until IT adds a Netskope bypass for these hosts for the sand process, or an
-  opt-in guest trust of the inspection CA is implemented** (deferred; see
-  residual risks). Under the old shared NAT, guest traffic bypassed Netskope.
-- **Verifier sanity check.** The strict probe script
-  (`sand network probe-script --verify strict`, about 15 s) was run in the
-  same shared-NAT guest. It reported OPEN for:
-  - 1.1.1.1;
-  - the BlastShield front 172.16.7.60:443;
-  - host ControlCenter on :5000 and gateway DNS;
-  - the LAN gateway;
-  - tailnet 100.100.100.100 and 192.168.68.1;
-  - the corporate resolver 172.16.0.1;
-  - the host's LAN address on :7000.
+- The proxy follows the host resolver for each connection and logs
+  `steered=true|false`. When a name resolves publicly, that connection does
+  not leave through BlastShield. A GitHub IP allow list may then refuse API
+  calls from the job. That is a visible failure, not a leak.
+- The preflight P4 "steered" result is a snapshot, not a guarantee.
 
-  This is exactly the reach that `mode: shared` gives a guest. Sand would
-  refuse to register that VM.
+**What works:**
+
+| Check | Result |
+| --- | --- |
+| Policy compiles from zero config (`sand network explain`) | deny-all plus host SSH 22, GitHub preset, stable hash |
+| Preflight on a host without the softnet privilege | P3 fails with the one-time fix; `sand run` exits 78 before any clone |
+| Softnet dies after preflight passed | tart exits, sand deletes the VM, and every retry keeps the deny-all arguments (never shared NAT) |
+| Proxy plus `ssh -R` tunnel from a real guest | `github.com`, `codeload` (steered), `api.github.com`, `ghcr.io`, `uploads`, `lfs` and `git ls-remote` work |
+| Certificates seen in the guest for steered names | public CA (TLS passes through BlastShield untouched) |
+| `mode: shared` | allowed only when explicit, and `sand validate` warns |
+
+**What is denied through the proxy:**
+
+- names that are not allowlisted, including corporate domains (403
+  `not-allowlisted`);
+- suffix tricks such as `x.actions.githubusercontent.com.evil.example` (403);
+- IP literals, including BlastShield fronts, the corporate resolver, the LAN
+  gateway, the tailnet resolver and public IPv6 (403 `ip-literal`);
+- plain `GET` proxying, including the metadata address (405);
+- `github.com:22` (403);
+- an SNI that differs from the CONNECT host (tunnel closed, `sni-mismatch`);
+- a NUL byte or other non-hostname byte in the CONNECT host (400);
+- with the proxy or the tunnel killed, the guest's next request fails at once.
+
+**Not yet verified live:**
+
+- Direct guest egress under softnet. With softnet unprivileged, no VM could
+  boot under `--net-softnet-block=0.0.0.0/0`.
+- The strict probe script under shared NAT reported OPEN for 1.1.1.1, a
+  BlastShield front, host services, gateway DNS, the LAN gateway, the tailnet
+  and the corporate resolver. That is exactly the reach that `mode: shared`
+  gives a guest, and the verifier caught every path. Under softnet each of
+  these must be CLOSED. The verifier now reports `NOTARGET`, which fails, when
+  a probe has no target (for example, no default gateway in the guest).
+
+**Open blockers and caveats on this host:**
+
+- **Netskope intercepts proxy flows.** The host proxy's upstream connections
+  to `*.actions.githubusercontent.com` (pipelines, results-receiver),
+  `objects.githubusercontent.com` and `raw.githubusercontent.com` are
+  TLS-intercepted. The guest sees the inspection CA and fails TLS. Sand fails
+  closed, but **Actions jobs will not work on this host** until IT adds a
+  bypass for these hosts or an opt-in guest trust of the inspection CA is
+  approved.
+- **Runtime softnet failure.** When softnet cannot start after preflight
+  passed, sand recreates the VM with backoff indefinitely, logging "ip not
+  ready". It never uses shared NAT, but it does not yet classify this as
+  `network.enforcement.lost` or stop after N attempts.
+- **IPv6.** Softnet rules are IPv4 only, so the guest's IPv6 is dropped. The
+  proxy can still connect to public IPv6 upstreams for allowlisted names.
+  NAT64, 6to4, Teredo and IPv4-compatible forms are denied.
+- **DNS.** The guest has no direct DNS. Names are resolved only on the host,
+  for allowlisted names, and the answers are never returned to the guest.
+  A guest that ignores the proxy settings times out on DNS (about 5 s) rather
+  than failing at once.
+- **Throughput.** The SSH tunnel roughly halves throughput: about 18 MB/s
+  through the tunnel versus about 40 MB/s host-direct.
 
 ## Live test plan (sacrificial Mac, after the one-time setup)
 
@@ -413,7 +483,7 @@ sand network probe-script --verify strict --no-proxy > probe.sh
 tart exec -i sand-nettest-proxy bash -s < probe.sh   # every SANDPROBE line must be CLOSED (tart exec uses the guest agent, not the network)
 
 # Stage B: proxy and tunnel by hand
-swift run sand network proxy --config fixtures/network_github_default.yml --listen 127.0.0.1:18080 &
+swift run sand network proxy --config fixtures/network_github_default.yml --listen 127.0.0.1:18080 --log-file proxy.log &
 sshpass -p admin ssh -N -o ExitOnForwardFailure=yes -R 127.0.0.1:3128:127.0.0.1:18080 admin@$IP &
 sshpass -p admin ssh admin@$IP 'curl -x http://127.0.0.1:3128 -sI https://github.com | head -1'   # 200, steered=true in the proxy log
 sshpass -p admin ssh admin@$IP 'curl -x http://127.0.0.1:3128 -s -o /dev/null -w "%{http_connect}" https://example.com'  # 403
