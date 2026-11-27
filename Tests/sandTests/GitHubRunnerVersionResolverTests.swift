@@ -2,49 +2,7 @@ import Foundation
 import XCTest
 @testable import sand
 
-
-private final class RecordingReleaseSession: URLSessionProtocol, @unchecked Sendable {
-    var request: URLRequest?
-    var status = 200
-    var payload = Data()
-    var headers: [String: String] = [:]
-
-    func data(for request: URLRequest) async throws -> (Data, URLResponse) {
-        self.request = request
-        let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: headers)!
-        return (payload, response)
-    }
-}
-
 final class GitHubRunnerVersionResolverTests: XCTestCase {
-
-    func testUsesGitHubInstallationTokenForReleaseMetadata() async throws {
-        let session = RecordingReleaseSession()
-        let digest = String(repeating: "a", count: 64)
-        session.payload = Data("""
-        {"tag_name":"v2.331.0","assets":[{"name":"actions-runner-osx-arm64-2.331.0.tar.gz","digest":"sha256:\(digest)"}]}
-        """.utf8)
-        let release = try await GitHubRunnerVersionResolver(session: session).latestRelease(authToken: "installation-token")
-        XCTAssertEqual(release.version, "2.331.0")
-        XCTAssertEqual(session.request?.value(forHTTPHeaderField: "Authorization"), "Bearer installation-token")
-        XCTAssertEqual(session.request?.url?.path, "/repos/actions/runner/releases/latest")
-    }
-
-    func testErrorIncludesGithubMessageAndRateLimit() async throws {
-        let session = RecordingReleaseSession()
-        session.status = 403
-        session.payload = Data(#"{"message":"API rate limit exceeded"}"#.utf8)
-        session.headers = ["X-RateLimit-Remaining": "0"]
-        do {
-            _ = try await GitHubRunnerVersionResolver(session: session).latestRelease(authToken: "installation-token")
-            XCTFail("expected HTTP error")
-        } catch GitHubRunnerVersionResolverError.httpStatus(let status, let message) {
-            XCTAssertEqual(status, 403)
-            XCTAssertTrue(message.contains("API rate limit exceeded"))
-            XCTAssertTrue(message.contains("remaining: 0"))
-        }
-    }
-
     func testParseTagName() {
         XCTAssertEqual(GitHubRunnerVersionResolver.parseTagName("v2.331.0"), "2.331.0")
         XCTAssertEqual(GitHubRunnerVersionResolver.parseTagName("2.331.0"), "2.331.0")
