@@ -794,8 +794,9 @@ To go back to an unmanaged Mac: `sudo deploy/jamf/uninstall-managed-softnet.sh`.
 
 This branch delivers these Phase 1 items:
 
-- A root-free default enforcement backend (tart `--net-host`), with softnet as
-  an opt-in for host-service and peer-VM isolation.
+- A root-free enforcement backend (tart `--net-host`), and softnet for
+  host-service and peer-VM isolation, chosen by the default `backend: auto`
+  when a managed softnet is installed where only root can replace it.
 - Tart (and, for softnet, softnet) preflight before VM boot, with no
   shared-network fallback.
 - Generic detection of TLS-inspecting endpoint agents, failing closed or,
@@ -967,8 +968,11 @@ domains (redacted) resolve through BlastShield's own resolvers. Consequences:
 
 ## Live test plan (sacrificial Mac)
 
-Stages A and B below are for the softnet backend (after the one-time setup).
-For the default hostOnly backend, no setup is needed:
+Stages A and B below are for the softnet backend (after
+[Simulate a managed Mac locally](#simulate-a-managed-mac-locally); put the
+managed softnet first on PATH for the raw tart commands, as Sand does:
+`export PATH=/usr/local/libexec/sand:$PATH`). For the hostOnly backend, no
+setup is needed:
 
 ```sh
 tart clone ghcr.io/cirruslabs/macos-runner:golden-gate sand-nettest-ho

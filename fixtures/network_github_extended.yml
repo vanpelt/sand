@@ -1,7 +1,7 @@
 # The github profile extended with built-in presets, extra domains and one
 # reviewed direct CIDR allow. Direct CIDR allows need the softnet backend
-# (a privileged softnet; see docs/network-isolation.md): the default hostOnly
-# backend has no route off the host. `sand network explain --config <this file>` prints
+# (a managed privileged softnet; see docs/network-isolation.md): the hostOnly
+# backend that auto falls back to has no route off the host. `sand network explain --config <this file>` prints
 # the compiled policy and its hash.
 runners:
   - name: secure-extended
