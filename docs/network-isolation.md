@@ -105,9 +105,13 @@ shows what the host supports and which backend `auto` picks.
 - **Unmanaged Mac:** nothing to install. `auto` uses `hostOnly`, which needs
   no root but does need host IP forwarding off (P11).
 
-Softnet needs root to create its vmnet interface and drops privileges after
-setup. Sand never runs `sudo` for you, never changes host settings, and only
-uses a privileged softnet that a non-root user cannot replace:
+Softnet needs root to create its vmnet interface, then drops privileges to
+the user and group given by `--user`/`--group` (tart passes the invoking
+user). Those flags are honored from any caller, so whoever may run the
+privileged softnet can keep it running as root; the managed installer limits
+that to one group (see [Jamf / managed deployment](#jamf--managed-deployment)).
+Sand never runs `sudo` for you, never changes host settings, and only uses a
+privileged softnet that a non-root user cannot replace:
 
 - **Never make the Homebrew softnet setuid root or sudoers-allowed.**
   `/opt/homebrew` (and every Cellar directory under it) belongs to the user
@@ -121,10 +125,14 @@ uses a privileged softnet that a non-root user cannot replace:
   `/usr/local/libexec/sand/softnet`, then the first `softnet` on PATH. An
   explicit path never falls back; a present managed install is used even if
   it fails (so it fails instead of silently trying PATH). Whatever is found
-  must pass P12.
-- Sand launches tart with the chosen binary's directory first on `PATH`
-  (tart 2.42 execs the first `softnet` on its PATH), so tart execs exactly the
-  binary Sand checked. Nothing else in tart's environment changes.
+  must pass P12. A path containing `:` is rejected (tart splits PATH on it).
+- Sand starts `tart run` by absolute path with `PATH` set to the checked
+  binary's directory followed only by `/usr/bin:/bin:/usr/sbin:/sbin` (tart
+  2.42 execs the first `softnet` on its PATH and needs nothing else from it
+  for `run`), so tart execs exactly the binary Sand checked, and if that binary
+  disappears tart fails instead of finding another one. Sand refuses to start
+  tart under softnet without a checked binary. Nothing else in tart's
+  environment changes.
 - Disclosure: softnet runs its setup as root. It also rewrites the system
   bootpd preferences (`DHCPLeaseTimeSecs=600`) so ephemeral VMs do not exhaust
   DHCP leases.
@@ -163,9 +171,13 @@ vm:
     `sand run`. If the managed softnet later disappears, loses its privilege
     or stops matching its pin, the per-VM preflight fails and counts as an
     enforcement failure; Sand never silently downgrades later VMs to
-    hostOnly. A SHA-256 mismatch (P13) is never a reason to fall back: `auto`
-    keeps softnet and the preflight fails closed. When `auto` picks hostOnly
-    because a softnet was present but rejected (for example setuid root in a
+    hostOnly. A managed install (or a `softnetPath`) is never a reason to
+    fall back: when one is present, `auto` keeps softnet whatever is wrong
+    with it (unsafe path P12, too old P2, unprivileged or not executable by
+    this user P3, SHA-256 mismatch P13, old tart P1), and the preflight fails
+    closed (exit 78). Only a softnet found on PATH, or none, lets `auto` pick
+    hostOnly. When `auto` picks hostOnly
+    because a PATH softnet was present but rejected (for example setuid root in a
     user-writable directory), startup logs a `WARNING`, preflight shows a
     `P0 backend auto` warning, and `network.backend.fallback` is audited. The
     policy hash differs per backend, and `network.policy.compiled` names the
@@ -173,8 +185,8 @@ vm:
     resolved to and why.
   - `hostOnly` works everywhere tart supports `--net-host` (preflight P1).
   - `softnet` requires a safely installed privileged softnet (P2, P3, P12,
-    P13) and adds host-service and peer-VM isolation. Pin it on managed
-    fleets so a broken install fails closed instead of falling back.
+    P13) and adds host-service and peer-VM isolation. Pin it where a Mac
+    without any softnet installed must fail closed instead of using hostOnly.
 - **`softnetPath`** (absolute, named `softnet`): use this binary instead of
   the managed path or PATH. **`softnetSHA256`**: the binary must hash to this
   value before every VM, in addition to the installer's manifest
@@ -611,7 +623,7 @@ fail-closed exit 78, never an insecure run. Everything is in
 
 | File | Runs as | Does |
 | --- | --- | --- |
-| `install-managed-softnet.sh` | root (Jamf policy) | downloads the pinned softnet release, verifies the tarball and binary SHA-256, installs `/usr/local/libexec/sand/softnet` root:wheel 4555 (or 0555 plus `/etc/sudoers.d/sand-softnet` with `--sudoers`), writes `softnet.sha256`; optional `--enforce-no-forwarding` LaunchDaemon |
+| `install-managed-softnet.sh` | root (Jamf policy) | downloads the pinned softnet release, verifies the tarball and binary SHA-256, installs `/usr/local/libexec/sand/softnet` root:GROUP 4550 (runner group, default `staff`; or 0555 plus `/etc/sudoers.d/sand-softnet` for `%GROUP` with `--sudoers`), re-checks the installed file against the pin, writes `softnet.sha256`; optional `--enforce-no-forwarding` LaunchDaemon |
 | `uninstall-managed-softnet.sh` | root | removes all of the above |
 | `sand-readiness-ea.sh` | root (extension attribute) | reports `ready` / `ready-hostonly` / `not-ready` without executing softnet or tart |
 
@@ -631,10 +643,17 @@ What a fleet gets with no Sand config changes:
 - Default `backend: auto` picks the managed softnet (P12, P2, P3, P13 all
   `ok`), so VMs get host-service and peer-VM isolation, and host IP
   forwarding (Tailscale, VPN clients) no longer matters (P11 is hostOnly-only).
-- If the install is missing or not privileged, `auto` uses hostOnly; a
-  rejected install (for example a stray setuid Homebrew copy) is a loud
-  warning plus `network.backend.fallback`. Configs that must never run without
-  softnet set `backend: softnet` (see `fixtures/network_managed_softnet.yml`).
+- If the managed install is missing, `auto` uses hostOnly. If it is present
+  but broken (not privileged, not executable by the runner account, directory
+  loosened, binary changed), `auto` keeps softnet and fails closed: a fleet
+  Mac is never quietly downgraded. A rejected PATH softnet (for example a stray
+  setuid Homebrew copy) is a loud warning plus `network.backend.fallback`.
+  Configs that must never run without softnet, even where it is not installed,
+  set `backend: softnet` (see `fixtures/network_managed_softnet.yml`).
+- The account that runs sand must be in the installer's runner group (`$8`,
+  default `staff`); members of that group can run softnet as root with any
+  arguments (including `--user root`, which keeps it from dropping
+  privileges), so use a dedicated group where local accounts are untrusted.
 - A modified managed binary fails P13 and exits 78 under either backend.
 - Upgrading softnet: bump the pinned version and digests in the installer
   (or pass Jamf `$6`/`$7`), re-run the policy. Pinned `softnetSHA256` values
@@ -657,7 +676,8 @@ ls -l "$(realpath "$(which softnet)")"   # must not be root-owned or show 's'; e
 ls /etc/sudoers.d/                        # remove any NOPASSWD rule for /opt/homebrew/.../softnet
 
 # 1. What the Jamf policy does: pinned softnet 0.26.0 release, tarball and binary
-#    SHA-256 verified, installed setuid root with a manifest.
+#    SHA-256 verified, installed setuid root (root:staff 4550) with a manifest.
+#    Plain sudo, not sudo -E.
 sudo deploy/jamf/install-managed-softnet.sh
 #    Offline alternative from the Homebrew keg (must hash to the pinned 0.26.0 binary):
 #    sudo deploy/jamf/install-managed-softnet.sh --from /opt/homebrew/Cellar/softnet/0.26.0/bin/softnet
@@ -671,7 +691,7 @@ Verify as yourself, without `sudo`:
 
 ```sh
 ls -l /usr/local/libexec/sand
-# -r-sr-xr-x  root  wheel  softnet
+# -r-sr-x---  root  staff  softnet
 # -r--r--r--  root  wheel  softnet.sha256
 swift run sand network explain --config fixtures/network_github_default.yml | head -12
 # "backend: auto resolved to softnet on this host"; "enforcement backend: softnet";
@@ -679,6 +699,10 @@ swift run sand network explain --config fixtures/network_github_default.yml | he
 swift run sand network preflight --config fixtures/network_github_default.yml
 # P12 softnet path ok, P2 softnet ok, P3 softnet privilege ok (setuid root),
 # P13 softnet pin ok (matches /usr/local/libexec/sand/softnet.sha256); no P11
+# Behind a TLS-inspecting proxy (Netskope) P10 still fails for this fixture:
+# softnet does not change that. Add vm.run.network.tlsInspection: trustHostCA
+# or get the GitHub hosts exempted; the live boot below uses profile: offline,
+# which has no egress and so no P10.
 ```
 
 Optional live boot (deletes the clone afterwards):
@@ -773,8 +797,17 @@ To go back to an unmanaged Mac: `sudo deploy/jamf/uninstall-managed-softnet.sh`.
 - **Managed softnet trust.** P12 trusts root and the binary's directory
   chain, and P13 trusts the manifest written by root. Anyone with root (or an
   admin who can `sudo`) can replace both; that is outside Sand's threat model.
-  Under the sudoers mode, members of the named group can run softnet as root
-  with any arguments, as they can a setuid binary.
+  The manifest catches drift and partial upgrades; `softnetSHA256` in the
+  config is the pin that root on the host cannot silently change.
+- **Privileged softnet arguments.** In both install modes, members of the
+  runner group can run softnet as root with any arguments. softnet 0.26 takes
+  `--user`/`--group` from its caller, so `--user root` keeps it root for its
+  whole life with a vmnet interface the caller feeds (L2 frames onto the VM
+  bridge, reaching other sand VMs and the host's bridge address) and
+  `--expose` forwards. The installer limits this to one group (default
+  `staff`, so not service accounts); use a dedicated runner group on Macs with
+  untrusted local accounts. Upstream fix: ignore or refuse `--user`/`--group`
+  naming uid 0 when the real uid is not 0.
 - **IPv4-only rules.** Softnet rules are IPv4 only. IPv6 is dropped entirely
   rather than filtered. hostOnly gives the guest no IPv6 route by default; a
   guest route via the host's link-local address is probed (R6), and IPv6
