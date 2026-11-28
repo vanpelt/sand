@@ -1,4 +1,5 @@
-# No guest network at all: softnet deny-all with only host-to-guest SSH.
+# No guest network at all, only host-to-guest SSH: softnet deny-all on a Mac
+# with a managed softnet (backend auto), tart --net-host elsewhere.
 # For script provisioners that need no network access.
 runners:
   - name: offline-build

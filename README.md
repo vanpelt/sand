@@ -101,12 +101,14 @@ For `local` sources sand skips the registry pull and clones the named VM directl
 ### VM network isolation (secure by default)
 
 > **Breaking change:** a runner with no `vm.run.network` key now gets
-> `profile: github` instead of Tart's shared NAT. It needs **no root and no host
-> setup**. To keep the old unrestricted behaviour, opt out explicitly with
+> `profile: github` instead of Tart's shared NAT. It needs **no per-user setup**.
+> To keep the old unrestricted behaviour, opt out explicitly with
 > `network: { mode: shared }` (required for host `mounts`).
 
-With no configuration, every VM boots on Tart's host-only network
-(`tart run --net-host`: no route off the host, no DNS, no IPv6) and reaches the
+With no configuration (`backend: auto`), every VM boots with no direct route
+off the host: under softnet deny-all when the Mac has a managed softnet (see
+below), otherwise on Tart's host-only network (`tart run --net-host`: no route
+off the host, no DNS, no IPv6, needs host IP forwarding off). It reaches the
 internet only through a per-VM, host-side HTTPS CONNECT proxy that Sand runs on
 loopback and forwards into the guest as `127.0.0.1:3128` over the SSH session.
 The proxy allows GitHub (github.com, the Actions service, release/LFS/package
@@ -120,16 +122,22 @@ The host-only network does not isolate host services bound to all interfaces
 (for example AirPlay Receiver on `:5000`/`:7000`) or other VMs on the same
 bridge. Sand reports those services before registering a runner
 (`hostListeners: deny` refuses the VM) and warns when several runners share
-the bridge. For full host and peer isolation use `backend: softnet`, which
-needs a privileged softnet (one-time `sudo` setup in the docs), or
-`backend: auto` to use softnet only where it is privileged.
+the bridge. Softnet isolates both. It needs a privileged softnet that only
+root can replace, installed at `/usr/local/libexec/sand/softnet` by
+[`deploy/jamf/install-managed-softnet.sh`](deploy/jamf/README.md) (a Jamf
+policy, or once with `sudo`). With that in place the default `auto` picks
+softnet with no user steps. Sand refuses a setuid or sudoers-allowed Homebrew
+softnet, because `/opt/homebrew` is user-writable and that would be a local
+privilege escalation. `backend: softnet` requires softnet and fails closed
+otherwise.
 
 ```yaml
 vm:
   run:
     network:
       profile: github                # default; or offline (no egress at all)
-      backend: hostOnly              # default (no root) | softnet | auto
+      backend: auto                  # default | hostOnly (no root) | softnet
+      softnetSHA256: 2ea5572268f814317bc3944d1352032f1f4dafe00bfe453eefc64e9dc32627a3  # optional pin (softnet 0.26.0)
       presets: [npm, pypi, homebrew] # optional extra destination bundles
       allowedDomains:                # optional; port defaults to 443
         - registry.example-artifacts.com

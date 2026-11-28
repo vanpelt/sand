@@ -1,20 +1,24 @@
 # VM network isolation
 
-Sand isolates every VM's network **by default**, with **no root and no host
-setup**. A runner with no `vm.run.network` key gets `profile: github` on the
-`hostOnly` backend:
+Sand isolates every VM's network **by default**, with **no per-user setup**.
+A runner with no `vm.run.network` key gets `profile: github` with
+`backend: auto`: softnet on a Mac where IT (or an admin, once) installed a
+root-owned privileged softnet at `/usr/local/libexec/sand/softnet`
+([Jamf / managed deployment](#jamf--managed-deployment)), otherwise the
+root-free `hostOnly` backend:
 
 1. **No direct egress.** An enforcement backend removes every route from the
    guest to anything but the host:
-   - `hostOnly` (default): `tart run --net-host`. The VM sits on a host-only
+   - `hostOnly` (auto's fallback): `tart run --net-host`. The VM sits on a host-only
      vmnet bridge (for example `bridge100`, 192.168.128.0/24) with no default
      gateway, no DNS and no NAT. Needs no root. A guest with root can still
      add a route via the host's bridge address, so host IP forwarding must be
      off (preflight P11) unless `ipForwarding: accept` is set.
-   - `softnet` (opt-in): `--net-softnet --net-softnet-block=0.0.0.0/0
+   - `softnet` (auto's choice on a managed Mac): `--net-softnet --net-softnet-block=0.0.0.0/0
      "--net-softnet-allow=in proto tcp @host port 22"`. Also blocks host
-     services and peer VMs, but needs a privileged softnet (setuid root or
-     passwordless sudo).
+     services and peer VMs, and does not depend on host IP forwarding, but
+     needs a privileged softnet (setuid root or passwordless sudo) that only
+     root can replace (preflight P12).
 2. **A host-side allowlisting proxy.** Sand runs a per-VM HTTPS CONNECT proxy
    bound to `127.0.0.1` on the host. It checks the hostname against the
    policy, resolves it with the host's system resolver, refuses private or
@@ -90,26 +94,37 @@ cannot reach the host (other than SSH replies) or other VMs. Under `hostOnly`:
 
 ## Host setup
 
-None for the default `hostOnly` backend. `sand doctor` or
-`sand network preflight --config sand.yml` shows what the host supports.
+None per user. `sand doctor` or `sand network preflight --config sand.yml`
+shows what the host supports and which backend `auto` picks.
 
-Only `backend: softnet` (or `auto`, see below) needs softnet with root. Softnet
-needs root to create its vmnet interface and drops privileges after setup. Run
-this in your own terminal; Sand never runs `sudo` for you:
+- **Managed Mac (recommended):** IT deploys softnet to
+  `/usr/local/libexec/sand/softnet` with
+  [`deploy/jamf/install-managed-softnet.sh`](../deploy/jamf/README.md). The
+  default `backend: auto` then uses softnet with zero user steps. To do the
+  same by hand, see [Simulate a managed Mac locally](#simulate-a-managed-mac-locally).
+- **Unmanaged Mac:** nothing to install. `auto` uses `hostOnly`, which needs
+  no root but does need host IP forwarding off (P11).
 
-```sh
-brew install cirruslabs/cli/tart openai/tools/softnet
-sudo chown root:wheel "$(realpath "$(which softnet)")" && sudo chmod u+s "$(realpath "$(which softnet)")"
-sand doctor          # or: sand network preflight --config sand.yml
-```
+Softnet needs root to create its vmnet interface and drops privileges after
+setup. Sand never runs `sudo` for you, never changes host settings, and only
+uses a privileged softnet that a non-root user cannot replace:
 
-- `brew upgrade softnet` installs a fresh binary without the setuid bit, so
-  re-run the two `sudo` commands after every upgrade. Sand re-checks before
-  every clone and refuses to boot until you do.
-- Instead of setuid you can add a sudoers `NOPASSWD` rule for both
-  `/opt/homebrew/bin/softnet` and its Cellar path. Tart then uses
-  `sudo --non-interactive softnet`. Sand's preflight checks the same thing
-  with `sudo -n <softnet> --help`, which never prompts.
+- **Never make the Homebrew softnet setuid root or sudoers-allowed.**
+  `/opt/homebrew` (and every Cellar directory under it) belongs to the user
+  who installed Homebrew, so any process running as that user can rename the
+  binary away and drop in its own: a local privilege escalation to root. P12
+  refuses such a softnet: `backend: softnet` fails closed, `backend: auto`
+  falls back to hostOnly with a warning and a `network.backend.fallback`
+  audit event. Earlier versions of this document recommended exactly that
+  `chown`/`chmod u+s`; undo it with `brew reinstall softnet`.
+- Discovery order: `vm.run.network.softnetPath`, then the managed path
+  `/usr/local/libexec/sand/softnet`, then the first `softnet` on PATH. An
+  explicit path never falls back; a present managed install is used even if
+  it fails (so it fails instead of silently trying PATH). Whatever is found
+  must pass P12.
+- Sand launches tart with the chosen binary's directory first on `PATH`
+  (tart 2.42 execs the first `softnet` on its PATH), so tart execs exactly the
+  binary Sand checked. Nothing else in tart's environment changes.
 - Disclosure: softnet runs its setup as root. It also rewrites the system
   bootpd preferences (`DHCPLeaseTimeSecs=600`) so ephemeral VMs do not exhaust
   DHCP leases.
@@ -121,7 +136,9 @@ vm:
   run:
     network:
       profile: github                 # github (default) | offline
-      backend: hostOnly               # hostOnly (default) | softnet | auto
+      backend: auto                   # auto (default) | hostOnly | softnet
+      softnetPath: /usr/local/libexec/sand/softnet  # optional; see discovery order
+      softnetSHA256: 2ea5572268f814317bc3944d1352032f1f4dafe00bfe453eefc64e9dc32627a3  # optional pin (0.26.0), checked before every VM
       presets: [npm, pypi, homebrew]  # optional extra built-in bundles
       allowedDomains:                 # optional; port defaults to 443
         - registry.example-artifacts.com
@@ -137,19 +154,31 @@ vm:
         - { cidr: 203.0.113.10/32, port: 443, proto: tcp }
 ```
 
-- **No `network` key** is the same as `profile: github` with `backend: hostOnly`.
+- **No `network` key** is the same as `profile: github` with `backend: auto`.
 - **`backend`** applies to profiles:
+  - `auto` (default) uses softnet when it is installed where only root can
+    replace it (P12), new enough (P2) and privileged (P3), and hostOnly
+    otherwise. It is resolved once at startup, where the full preflight and
+    the listener posture are computed for it, and then pinned for the life of
+    `sand run`. If the managed softnet later disappears, loses its privilege
+    or stops matching its pin, the per-VM preflight fails and counts as an
+    enforcement failure; Sand never silently downgrades later VMs to
+    hostOnly. A SHA-256 mismatch (P13) is never a reason to fall back: `auto`
+    keeps softnet and the preflight fails closed. When `auto` picks hostOnly
+    because a softnet was present but rejected (for example setuid root in a
+    user-writable directory), startup logs a `WARNING`, preflight shows a
+    `P0 backend auto` warning, and `network.backend.fallback` is audited. The
+    policy hash differs per backend, and `network.policy.compiled` names the
+    backend and the softnet binary. `sand network explain` prints what `auto`
+    resolved to and why.
   - `hostOnly` works everywhere tart supports `--net-host` (preflight P1).
-  - `softnet` requires a privileged softnet (P2, P3) and adds host-service and
-    peer-VM isolation.
-  - `auto` uses softnet when it is installed, new enough and privileged, and
-    hostOnly otherwise. It is resolved once at startup, where the full
-    preflight and the listener posture are computed for it, and then pinned
-    for the life of `sand run`. If a `brew upgrade softnet` later drops the
-    setuid bit, the per-VM preflight (P3) fails and counts as an enforcement
-    failure; Sand never silently downgrades later VMs to hostOnly. The policy
-    hash differs per backend, and `network.policy.compiled` names the backend.
-    `sand network explain` prints what `auto` resolved to.
+  - `softnet` requires a safely installed privileged softnet (P2, P3, P12,
+    P13) and adds host-service and peer-VM isolation. Pin it on managed
+    fleets so a broken install fails closed instead of falling back.
+- **`softnetPath`** (absolute, named `softnet`): use this binary instead of
+  the managed path or PATH. **`softnetSHA256`**: the binary must hash to this
+  value before every VM, in addition to the installer's manifest
+  (`softnet.sha256` next to the binary, root-owned), when there is one.
 - **`hostListeners`** (hostOnly only). After boot and before registration,
   Sand lists host TCP listeners and unconnected UDP sockets a guest can reach
   (bound to `*`, to the bridge address, or to any other non-loopback host
@@ -390,8 +419,18 @@ hosts from inspection, or opt in below.
    logs `network.policy.compiled` with the hash and backend. It then runs the
    full preflight once per distinct policy. The checks are:
    - P1: tart supports `--net-host` (hostOnly) or `--net-softnet-allow` (softnet);
+   - P0 (auto only): why `auto` chose hostOnly, a warning when a softnet was
+     present but rejected;
+   - P12 (softnet only): the softnet binary and every directory up to `/` are
+     root-owned and not group/world-writable (a root-owned sticky directory
+     such as `/private/tmp` is tolerated); symlinks are resolved first and
+     judged by their target. Nothing (not `--help`, not `sudo -n`) is run
+     from a path that fails;
    - P2, P3 (softnet only): softnet supports stateful rules (`proto`,
-     `@host`) and is privileged;
+     `@host`) and is privileged (setuid root, or `sudo -n <resolved path>`);
+   - P13 (softnet only): the binary matches `softnetSHA256` and the
+     installer's `softnet.sha256` manifest when present (a managed install
+     without a manifest is a warning);
    - P4: the host resolves GitHub and completes a TLS handshake to
      `api.github.com` (no API call, because of rate limits);
    - P5: an in-process proxy self-test (`github.com` → 200, `example.com` →
@@ -405,10 +444,12 @@ hosts from inspection, or opt in below.
    Any failure exits with code 78 before a clone, and every failed check's
    fix is printed. With more than one hostOnly runner, `sand run` warns that
    peer-VM isolation is not guaranteed (`network.peer.isolation`). Each later
-   boot re-checks resolution, softnet privilege (softnet) and IP forwarding
-   (hostOnly); a failure there counts as an enforcement failure.
+   boot re-checks resolution, softnet path, privilege and SHA-256 (softnet:
+   P12, P3, P13) and IP forwarding (hostOnly); a failure there counts as an
+   enforcement failure.
 2. Clone, then `tart run` with the backend's arguments. Tart runs with
-   `SENTRY_DSN` and `CIRRUS_SENTRY_TAGS` removed from its environment.
+   `SENTRY_DSN` and `CIRRUS_SENTRY_TAGS` removed from its environment and,
+   under softnet, with the checked softnet's directory first on `PATH`.
 3. Wait for an IP that answers SSH. A stale softnet lease is re-resolved.
    **If tart exits first** (for example `Softnet process terminated
    prematurely`, or a `--net-host`/vmnet failure), the failure is classified
@@ -525,8 +566,12 @@ and the most-denied hosts. Audit fields never contain tokens or request paths
 ## Troubleshooting
 
 - **"Network preflight failed".** Run `sand network preflight --config sand.yml`
-  for the full report. P3 (softnet privilege) only appears for `backend:
-  softnet`; drop that key to use the root-free default. P10 (TLS inspection):
+  for the full report. P3 (softnet privilege), P12 (softnet path) and P13
+  (softnet pin) only appear for the softnet backend. P12 means the softnet
+  is not root-owned all the way up: install it with
+  `deploy/jamf/install-managed-softnet.sh`, never by making the Homebrew copy
+  setuid. P13 means the binary changed: reinstall it, or review it and update
+  `softnetSHA256`. P10 (TLS inspection):
   ask IT for a bypass of the listed hosts or set `tlsInspection: trustHostCA`.
   P11 (host IP forwarding): check `sysctl net.inet.ip.forwarding
   net.inet6.ip6.forwarding`. VPN clients, Internet Sharing and container
@@ -557,16 +602,121 @@ and the most-denied hosts. Audit fields never contain tokens or request paths
   `sand network proxy --config sand.yml --listen 127.0.0.1:18080`, then
   `curl -x http://127.0.0.1:18080 https://github.com`.
 
+## Jamf / managed deployment
+
+Goal: on a managed Mac, secure softnet isolation with zero user steps; on an
+unmanaged Mac, a safe fallback (hostOnly with the forwarding check) or a
+fail-closed exit 78, never an insecure run. Everything is in
+[`deploy/jamf/`](../deploy/jamf/README.md):
+
+| File | Runs as | Does |
+| --- | --- | --- |
+| `install-managed-softnet.sh` | root (Jamf policy) | downloads the pinned softnet release, verifies the tarball and binary SHA-256, installs `/usr/local/libexec/sand/softnet` root:wheel 4555 (or 0555 plus `/etc/sudoers.d/sand-softnet` with `--sudoers`), writes `softnet.sha256`; optional `--enforce-no-forwarding` LaunchDaemon |
+| `uninstall-managed-softnet.sh` | root | removes all of the above |
+| `sand-readiness-ea.sh` | root (extension attribute) | reports `ready` / `ready-hostonly` / `not-ready` without executing softnet or tart |
+
+Why `/usr/local/libexec/sand`: `/usr/local` and `/usr/local/libexec` ship
+root:wheel 0755 on macOS (Homebrew on Apple Silicon lives in
+`/opt/homebrew`; Intel Homebrew takes over several `/usr/local`
+subdirectories, so on an Intel Mac check `ls -ld /usr/local/libexec`: if it is
+not root-owned the installer refuses, and you pass `--install-dir` plus
+`vm.run.network.softnetPath`), it is outside SIP, it is on nobody's
+`PATH` (other tools never pick up the setuid binary), and `libexec` is the
+conventional place for helper binaries. The installer refuses to install
+below any path component that is a symlink, not root-owned, or
+group/world-writable, and Sand checks the same thing (P12) before every VM.
+
+What a fleet gets with no Sand config changes:
+
+- Default `backend: auto` picks the managed softnet (P12, P2, P3, P13 all
+  `ok`), so VMs get host-service and peer-VM isolation, and host IP
+  forwarding (Tailscale, VPN clients) no longer matters (P11 is hostOnly-only).
+- If the install is missing or not privileged, `auto` uses hostOnly; a
+  rejected install (for example a stray setuid Homebrew copy) is a loud
+  warning plus `network.backend.fallback`. Configs that must never run without
+  softnet set `backend: softnet` (see `fixtures/network_managed_softnet.yml`).
+- A modified managed binary fails P13 and exits 78 under either backend.
+- Upgrading softnet: bump the pinned version and digests in the installer
+  (or pass Jamf `$6`/`$7`), re-run the policy. Pinned `softnetSHA256` values
+  in Sand configs must be updated in the same change.
+
+Choose `--enforce-no-forwarding` only for dedicated runner Macs: it keeps
+`net.inet.ip.forwarding` and `net.inet6.ip6.forwarding` at 0 (boot plus every
+60 s), which breaks Internet Sharing, Tailscale subnet routing and exit
+nodes, and VPN or VM tools that route through the Mac. It matters only for
+hosts that fall back to hostOnly.
+
+## Simulate a managed Mac locally
+
+Run these once, in your own terminal, from a sand checkout. Sand itself never
+runs `sudo`.
+
+```sh
+# 0. Undo any earlier Homebrew setuid/sudoers setup (P12 refuses it anyway).
+ls -l "$(realpath "$(which softnet)")"   # must not be root-owned or show 's'; else: brew reinstall softnet
+ls /etc/sudoers.d/                        # remove any NOPASSWD rule for /opt/homebrew/.../softnet
+
+# 1. What the Jamf policy does: pinned softnet 0.26.0 release, tarball and binary
+#    SHA-256 verified, installed setuid root with a manifest.
+sudo deploy/jamf/install-managed-softnet.sh
+#    Offline alternative from the Homebrew keg (must hash to the pinned 0.26.0 binary):
+#    sudo deploy/jamf/install-managed-softnet.sh --from /opt/homebrew/Cellar/softnet/0.26.0/bin/softnet
+#    Without root you can still check the download: deploy/jamf/install-managed-softnet.sh --verify-only
+
+# 2. What Jamf's extension attribute would report.
+sudo deploy/jamf/sand-readiness-ea.sh
+```
+
+Verify as yourself, without `sudo`:
+
+```sh
+ls -l /usr/local/libexec/sand
+# -r-sr-xr-x  root  wheel  softnet
+# -r--r--r--  root  wheel  softnet.sha256
+swift run sand network explain --config fixtures/network_github_default.yml | head -12
+# "backend: auto resolved to softnet on this host"; "enforcement backend: softnet";
+# "softnet binary: /usr/local/libexec/sand/softnet (managed) ..."
+swift run sand network preflight --config fixtures/network_github_default.yml
+# P12 softnet path ok, P2 softnet ok, P3 softnet privilege ok (setuid root),
+# P13 softnet pin ok (matches /usr/local/libexec/sand/softnet.sha256); no P11
+```
+
+Optional live boot (deletes the clone afterwards):
+
+```sh
+cat > /tmp/sand-managed.yml <<'YAML'
+runners:
+  - name: sand-nettest-managed
+    stopAfter: 1
+    vm:
+      source: { type: oci, image: ghcr.io/cirruslabs/macos-runner:golden-gate }
+      run:
+        network: { profile: offline, verify: strict }
+    provisioner:
+      type: script
+      config: { run: echo managed-softnet-ok }
+YAML
+swift run sand run --config /tmp/sand-managed.yml
+# network.policy.compiled backend=softnet softnet=/usr/local/libexec/sand/softnet softnet_source=managed
+# network.guest.verified ... backend=softnet; then the VM is stopped and deleted
+tart list | grep sand-nettest || echo "no leftover clones"
+```
+
+To go back to an unmanaged Mac: `sudo deploy/jamf/uninstall-managed-softnet.sh`.
+
 ## Migration
 
 - To keep shared NAT, add `network: { mode: shared }`. Do this for runners
   with host `mounts`, which isolated VMs reject.
 - A legacy `mode: restricted` config keeps working and now allows host SSH.
-- Profiles now default to `backend: hostOnly`, which needs no root. To keep
-  the previous softnet enforcement (host-service and peer-VM isolation), add
-  `backend: softnet` (required for `allowedCIDRs`), or `backend: auto` to use
-  softnet only where it is privileged. `auto` is now pinned at startup: a VM
-  never silently changes backend in the middle of a run.
+- Profiles now default to `backend: auto`: softnet where a managed softnet
+  is installed, hostOnly (no root) elsewhere. Add `backend: hostOnly` to keep
+  the previous default regardless of the host, or `backend: softnet`
+  (required for `allowedCIDRs`) to require softnet. `auto` is pinned at
+  startup: a VM never silently changes backend in the middle of a run.
+- A setuid or sudoers-allowed Homebrew softnet is no longer accepted (P12).
+  Run `brew reinstall softnet` to drop the setuid bit, remove any sudoers
+  rule for it, and install the managed copy instead.
 - Hosts with IP forwarding on (common with VPN clients) now fail preflight P11
   under hostOnly. Turn forwarding off, use `backend: softnet`, or set
   `ipForwarding: accept`.
@@ -610,7 +760,21 @@ and the most-denied hosts. Audit fields never contain tokens or request paths
   vmnet bridge without enabling forwarding is not detected.
 - **trustHostCA.** The inspection vendor can read job TLS to intercepted hosts.
 - **No softnet policy attestation yet.** The watchdog checks that processes are
-  alive; it cannot read back the rules softnet enforces.
+  alive; it cannot read back the rules softnet enforces. softnet 0.26 answers
+  `softnet.policy.get` on its JSON-RPC control channel, and tart 2.42 passes
+  one through with `--net-softnet-control-fd=N`, but N must be a connected
+  Unix stream socket inherited by tart. Sand starts tart through Foundation
+  `Process`, which closes every descriptor above 2 in the child, so this
+  needs a `posix_spawn` launcher with explicit file actions plus a small
+  JSON-RPC client. Follow-up: call `softnet.policy.get` after boot and compare
+  it with the compiled `SoftnetRuleSet` before registration. Until then the
+  binary itself is pinned (P12, P13) and the guest egress verifier checks the
+  behaviour on every boot.
+- **Managed softnet trust.** P12 trusts root and the binary's directory
+  chain, and P13 trusts the manifest written by root. Anyone with root (or an
+  admin who can `sudo`) can replace both; that is outside Sand's threat model.
+  Under the sudoers mode, members of the named group can run softnet as root
+  with any arguments, as they can a setuid binary.
 - **IPv4-only rules.** Softnet rules are IPv4 only. IPv6 is dropped entirely
   rather than filtered. hostOnly gives the guest no IPv6 route by default; a
   guest route via the host's link-local address is probed (R6), and IPv6

@@ -567,7 +567,8 @@ struct NetworkPreflight: Sendable {
     tailnet (for example a tailnet DNS resolver answers), outside the proxy, the allowlist and the audit log.
     Either turn forwarding off in your own terminal (sand never does this; a VPN client or Internet Sharing may turn it back on):
       sudo sysctl -w net.inet.ip.forwarding=0 net.inet6.ip6.forwarding=0
-    or use backend: softnet (privileged softnet filters guest packets before the host routes them),
+    or install the managed softnet (sudo deploy/jamf/install-managed-softnet.sh, or your Jamf policy) so the default
+    backend: auto uses softnet, which filters guest packets before the host routes them,
     or accept the exposure explicitly: vm.run.network.ipForwarding: accept (every VM logs and audits it).
     """
 
