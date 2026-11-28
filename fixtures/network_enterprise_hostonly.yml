@@ -1,4 +1,4 @@
-# Enterprise laptop/Mac mini without root: the default hostOnly backend
+# Enterprise laptop/Mac mini without root: the hostOnly backend pinned explicitly
 # (tart --net-host) plus the opt-ins an endpoint-managed host typically needs.
 # `sand network preflight --config <this file>` shows what this host detects.
 runners:
@@ -10,7 +10,7 @@ runners:
       run:
         network:
           profile: github
-          backend: hostOnly          # the default; needs no root
+          backend: hostOnly          # pinned (the default auto would use a managed softnet); needs no root
           verify: strict
           # Refuse the VM while host services listen on the VM bridge, except these.
           hostListeners: deny

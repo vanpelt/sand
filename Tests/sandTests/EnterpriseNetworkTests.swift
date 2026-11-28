@@ -581,4 +581,15 @@ struct FakeTrustStore: HostTrustStore {
         #expect(policy.options.tlsInspection == .trustHostCA)
         #expect(policy.options.ipForwarding == .deny)
     }
+
+    @Test func managedFixturePinsSoftnetAndTheBinary() throws {
+        let fixtures = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("fixtures")
+        let managed = try #require(try Config.load(path: fixtures.appendingPathComponent("network_managed_softnet.yml").path).runners.first).vm.run.network
+        #expect(managed.backendChoice == .softnet)
+        #expect(managed.softnetSHA256.map(SoftnetDiscovery.isSHA256) == true)
+        let full = try Config.load(path: fixtures.appendingPathComponent("sample_full_config.yml").path).runners.map(\.vm.run.network)
+        #expect(full.contains { $0.softnetPath == SoftnetDiscovery.managedPath && $0.softnetSHA256 != nil })
+        let zeroConfig = try #require(try Config.load(path: fixtures.appendingPathComponent("network_github_default.yml").path).runners.first).vm.run.network
+        #expect(zeroConfig.backendChoice == .auto)
+    }
 }
