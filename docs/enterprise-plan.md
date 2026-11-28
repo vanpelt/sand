@@ -3,7 +3,8 @@
 **Status:** Proposal / implementation roadmap (November 2026)  
 **Audience:** Endpoint Security, Infrastructure, Developer Productivity, GitHub administrators  
 **Scope:** Opt-in employee MacBooks as ephemeral macOS GitHub Actions runners, with a path to dedicated managed Macs  
-**Related work:** [Keychain signing and host logging (#1)](https://github.com/vanpelt/sand/pull/1) · [Softnet network-isolation prototype (#2)](https://github.com/vanpelt/sand/pull/2)
+**Related work:** [Keychain signing and host logging (#1)](https://github.com/vanpelt/sand/pull/1) · [Softnet network-isolation prototype (#2)](https://github.com/vanpelt/sand/pull/2) · [Secure-by-default VM egress and Jamf-managed Softnet (#5)](https://github.com/vanpelt/sand/pull/5)  
+**Progress:** Phase 1 network isolation implemented in #5 and verified live on one BlastShield + Netskope MacBook (see §9.1). Phases 2–5 not started.
 
 > This is a design proposal, **not** a statement that the current Sand implementation satisfies enterprise controls. Each security claim below is conditional on implementation, verification, monitoring, and organizational policy approval. A passing Swift test suite does not establish VM isolation.
 
@@ -37,7 +38,10 @@
 | macOS Keychain-based GitHub App signing | Proposed in #1 | Useful local prototype; **not** the enterprise credential distribution model |
 | Runner tarball digest verification/cache | Existing | Pin image/runner provenance and harden cache/update supply chain |
 | Terminal logs and smoke test | Proposed in #1 | Central structured audit, secret redaction and incident diagnostics |
-| Softnet IPv4 network modes | Prototype in #2 | Live negative tests; DNS/IPv6/host/BlastShield controls, enforced proxy, health monitoring |
+| Softnet IPv4 network modes | Prototype in #2 | Superseded by #5 |
+| Default-deny VM egress via host allowlisting proxy | Implemented in #5, live-verified on one host | Softnet policy read-back, red-team, multi-host evidence |
+| Root-free / Jamf-managed enforcement backend | Implemented in #5 (`auto`: managed Softnet, else hostOnly) | Jamf policy rollout, dedicated runner group, upstream Softnet `--user` fix |
+| TLS-inspection (Netskope) handling | Implemented in #5 (detect → fail, or opt-in trust of the intercepting CA) | Security decision: IT bypass vs. guest CA trust |
 | Employee/repository policy | Not implemented | Broker and identity/permission integration |
 | Per-job admission and owner attribution | Not implemented | Trigger-actor verification and race-free GitHub scheduling admission |
 | Touch ID approval leases | Not implemented | Secure Enclave/Keychain key, challenge protocol, lease lifecycle |
@@ -228,6 +232,26 @@ Use an enforced VM boundary (evaluate Tart Softnet plus system/network extension
 
 [PR #2](https://github.com/vanpelt/sand/pull/2) prototypes **IPv4** \`shared\`, \`softnet\` and \`restricted\` modes with CIDR validation and launch flags. It does **not** provide tested IPv6/DNS enforcement, complete proxy integration, BlastShield isolation or continuously verified enforcement.
 
+### 9.1 Verified findings (November 2026, one managed MacBook with BlastShield + Netskope)
+
+These are live observations from a single host, not fleet-wide guarantees. Evidence and commands are in `docs/network-isolation.md` on #5.
+
+| Assumption | Finding |
+| --- | --- |
+| The org GitHub IP allow list requires VM GitHub traffic to exit via BlastShield | **Confirmed.** BlastShield installs supplemental resolvers for `github.com`, `githubapp.com`, `githubassets.com` and `githubcopilot.com`. It steers only some names to private fronts: `github.com`, `api`, `codeload` and `lfs`. Others (`uploads`, `objects`, `*.actions.githubusercontent.com`, `pkg-containers`) resolve publicly, consistent with GitHub's allow list covering web, API and git but not Actions service hosts. TLS is passthrough. |
+| Tart's default shared NAT is acceptable | **Refuted.** A shared-NAT guest inherits split DNS and reached **other corporate 172.16.x services**, the host's listening ports, the LAN router and the tailnet. |
+| The endpoint agent (Netskope) covers VM traffic | **Refuted.** Guest NAT traffic bypasses Netskope and exits through the home ISP. Only host processes are steered and inspected. |
+| BlastShield steering is stable | **Mostly.** One unexplained window where `api`/`lfs` resolved publicly while `github.com` stayed steered. Also, BlastShield's resolver returns the public address when an alias is queried directly (e.g. `lfs.github.com` → `api.github.com`). The macOS system resolver handles that correctly. Sand logs `steered=` per connection. |
+| Softnet can be used without root | **Refuted.** It needs setuid root or `sudo -n`. Making the Homebrew copy setuid is a local privilege escalation, because `/opt/homebrew` is user-writable. |
+| Tart `--net-host` (no root) is sealed | **Only with IP forwarding off.** With `net.inet.ip.forwarding=1` (e.g. Tailscale), guest root can add routes through the host and reach tailnet DNS and host addresses. |
+
+**Resulting design (#5):**
+- **No direct guest egress.** The guest reaches the Internet only through an SSH reverse tunnel to a host-loopback allowlisting CONNECT proxy.
+- **The proxy resolves with the host resolver,** so BlastShield steering applies. It permits a steered private address only via the VPN interface it was learned on. All other corporate, host, LAN, tailnet and metadata destinations are denied.
+- **Answer to open decision 1 (§13), partial:** the VM uses BlastShield **only** for allowlisted GitHub names on port 443, and does not get the endpoint's general corporate reach. Security must still sign off on sharing the endpoint's BlastShield egress identity for those names.
+- **Enforcement: managed Softnet installed by Jamf** (root-owned, SHA-256 pinned, executable only by a runner group). Unmanaged Macs fall back to hostOnly with an IP-forwarding check, or fail closed. No user steps on managed Macs.
+- **Netskope** intercepts the proxy's upstream connections to Actions and `*.githubusercontent.com` hosts. Either IT bypasses those hosts for the Sand process, or Security approves `tlsInspection: trustHostCA` (guest trusts only the intercepting chain, SSL-only).
+
 Do not call the network design secure because unit tests pass. Run **live positive and negative tests** with host BlastShield on/off, corporate VPN on/off, guest root, DNS/IPv6, connectivity changes, service crashes, alternate network interfaces, host services and arbitrary public destinations.
 
 ## 10. Supply chain, operations, incident response
@@ -258,12 +282,12 @@ Do not call the network design secure because unit tests pass. Run **live positi
 
 **Deliver:** A reproducible egress policy, isolated proxy, packet-level verification harness, and failure-injection tests built on #2.
 
-- [ ] Softnet and Tart preflight before VM boot; no shared-network fallback.
-- [ ] Test host SSH provisioning separately from guest outbound access.
-- [ ] Demonstrate allowed GitHub checkout/artifacts/package requests via approved proxy.
-- [ ] Demonstrate denied host/LAN/VPN/BlastShield/corporate/peer VM and arbitrary Internet access, including IPv6, DNS and UDP.
-- [ ] Demonstrate fail-closed behavior on Softnet/proxy crash and interface changes.
-- [ ] Capture signed/retained evidence: test commands, host posture, packet traces and expected outcomes.
+- [x] Softnet and Tart preflight before VM boot; no shared-network fallback (#5; exit 78).
+- [x] Test host SSH provisioning separately from guest outbound access (inbound host SSH rule only; egress via tunnel).
+- [ ] Demonstrate allowed GitHub checkout/artifacts/package requests via approved proxy. *Partial:* checkout, API, codeload and objects verified. A full Actions job via a registered runner is not yet run under the new default.
+- [x] Demonstrate denied host/LAN/VPN/BlastShield/corporate and arbitrary Internet access, including IPv6, DNS and UDP (strict in-guest verifier, routed probes). *Peer-VM isolation:* observed but not guaranteed under hostOnly.
+- [ ] Demonstrate fail-closed behavior on Softnet/proxy crash and interface changes. *Partial:* Softnet death, tart failure and tunnel loss mid-job verified. Interface/VPN changes untested.
+- [ ] Capture signed/retained evidence: test commands, host posture, packet traces and expected outcomes. *Partial:* commands and audit JSONL captured; no packet traces or signed retention yet.
 
 **Gate:** Security can reproduce successful authorized traffic **and** every required denial with an untrusted root-capable guest. If IPv6 or host-path isolation cannot be demonstrated, do not proceed to MacBooks.
 
@@ -319,8 +343,8 @@ Do not call the network design secure because unit tests pass. Run **live positi
 
 Recommended starting tickets, in order:
 
-1. **Softnet integration test harness**: launch real Tart guest, assert deny/allow paths and fail-closed startup/teardown under fault injection.
-2. **Egress proxy proof-of-concept**: allow GitHub Actions + selected registries, block LAN/VPN and arbitrary domains, with per-job policy logs.
+1. ~~**Softnet integration test harness**~~: launch real Tart guest, assert deny/allow paths and fail-closed startup/teardown under fault injection. *Done in #5 (in-guest verifier, live scripts); not yet run in CI.*
+2. ~~**Egress proxy proof-of-concept**~~: allow GitHub Actions + selected registries, block LAN/VPN and arbitrary domains, with per-job policy logs. *Done in #5.*
 3. **Broker API contract and local mock**: schema for device identity, user/repo/job identity, policy version, JIT registration TTL and audit events; do not add privileged production GitHub credentials.
 4. **Jamf/attestation spike**: certificate provisioning and endpoint identity validation under macOS user/launchd contexts.
 5. **GitHub job-admission spike**: reproduce queued-job races and assess whether pre-execution authorization is technically enforceable.
