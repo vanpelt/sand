@@ -59,6 +59,11 @@ final class EgressProxy: EgressProxying, @unchecked Sendable {
         var bytesDown = 0
         var deniedByHost: [String: Int] = [:]
         var suppressedDenyEvents = 0
+        /// Denies of known background noise (`os-background`, `quiet-listed`),
+        /// counted separately and kept out of `deniedByHost`.
+        var quietDenied = 0
+        var quietByHost: [String: Int] = [:]
+        var suppressedQuietEvents = 0
     }
 
     init(policy: EgressPolicy, destinationGuard: DestinationGuard, resolver: HostResolving, audit: NetworkAudit, limits: Limits = Limits()) {
@@ -185,6 +190,29 @@ final class EgressProxy: EgressProxying, @unchecked Sendable {
     static let denyAuditSampleEvery = 100
 
     fileprivate func record(denied host: String?, _ fields: [String: String]) {
+        // Background noise (for example macOS asking for bag.itunes.apple.com)
+        // is still denied and still audited, but at debug level with its own
+        // budget so it cannot crowd real denies out of the warning burst.
+        if let host, fields["reason"] == "not-allowlisted", let quiet = policy.quietReason(for: host) {
+            counters.denied += 1
+            counters.quietDenied += 1
+            if counters.quietByHost[host] != nil || counters.quietByHost.count < Self.maxDeniedHostsTracked {
+                counters.quietByHost[host, default: 0] += 1
+            } else {
+                counters.quietByHost["(other)", default: 0] += 1
+            }
+            let overBurst = counters.quietDenied - Self.denyAuditBurst
+            guard overBurst <= 0 || overBurst % Self.denyAuditSampleEvery == 0 else {
+                counters.suppressedQuietEvents += 1
+                return
+            }
+            var merged = fields.merging(["decision": "deny", "reason": quiet]) { $1 }
+            if counters.suppressedQuietEvents > 0 {
+                merged["suppressed"] = String(counters.suppressedQuietEvents)
+            }
+            audit.emit("network.connect", level: .debug, merged)
+            return
+        }
         counters.denied += 1
         if let host {
             if counters.deniedByHost[host] != nil || counters.deniedByHost.count < Self.maxDeniedHostsTracked {

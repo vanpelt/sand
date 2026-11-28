@@ -158,6 +158,9 @@ vm:
       tlsInspection: fail             # fail (default) | trustHostCA
       ipForwarding: deny              # hostOnly: deny (default) | accept
       maxEnforcementFailures: 3       # consecutive failures before exit 78 (1-100)
+      quietOSBackground: true         # default; false logs macOS background denies as warnings
+      quietDenies: []                 # extra names denied quietly, e.g. ["*.telemetry.example.com"]
+      requireSteering: false          # default; true refuses public egress for steered GitHub names
       allowedCIDRs:                   # expert escape hatch, softnet backend only
         - { cidr: 203.0.113.10/32, port: 443, proto: tcp }
 ```
@@ -218,6 +221,9 @@ vm:
   validate` warns about `accept`. Sand never changes the sysctl itself; see
   [Troubleshooting](#troubleshooting).
 - **`tlsInspection`**: see [TLS-inspecting endpoint agents](#tls-inspecting-endpoint-agents-netskope-zscaler).
+- **`quietOSBackground`, `quietDenies`**: see
+  [OS background noise](#os-background-noise). Profile github only.
+- **`requireSteering`**: see [Steering flips](#steering-flips). Profile github only.
 - **`maxEnforcementFailures`**: see [What happens at runtime](#what-happens-at-runtime).
 - **`profile: offline`** removes direct egress with no proxy; only host SSH
   works. Use it for script provisioners that need no network. It is the only
@@ -570,6 +576,9 @@ Deny reasons:
 | `sni-mismatch`, `no-sni`, `not-tls` | The tunnel did not start with a TLS ClientHello for the CONNECT host. Plain HTTP over CONNECT and domain fronting are refused. |
 | `method-not-allowed`, `bad-request`, `header-too-large` | The request was not a well-formed `CONNECT host:port`. The host must be an IP literal or a strict hostname (letters, digits, `-`, dots between non-empty labels), so NUL bytes, `%`, `_` and control characters are refused here. |
 | `tunnel-limit` | The VM already has 256 open tunnels. |
+| `os-background` | A `not-allowlisted` deny of a built-in macOS background endpoint. Logged at debug level only; see [OS background noise](#os-background-noise). The guest sees `not-allowlisted`. |
+| `quiet-listed` | The same for a name in `quietDenies`. |
+| `steering-required` | `requireSteering: true` and a steered GitHub name resolved only to public addresses, even after the flip retry. See [Steering flips](#steering-flips). |
 
 The guest sees only the bare reason code, in an `X-Sand-Deny` response header
 (for example `blocked-address`). Resolved addresses and resolver or connect
@@ -578,8 +587,70 @@ DNS answers back. After 200 deny lines per VM, only one in 100 is logged (with
 a `suppressed=` count), and at most 256 distinct denied hosts are tracked.
 
 `network.session.summary` at teardown lists allowed and denied counts, bytes,
-and the most-denied hosts. Audit fields never contain tokens or request paths
-(CONNECT has none).
+and the most-denied hosts. `denied` counts every deny; `top_denied` lists only
+the ones that were not background noise, which `quiet_denied` and `top_quiet`
+count. Audit fields never contain tokens or request paths (CONNECT has none).
+
+### OS background noise
+
+A stock macOS guest keeps contacting Apple services on its own, and with the
+proxy in place those attempts reach it. In a real Actions job (one VM, about
+80 s) the proxy denied 110 connections and every one was the OS:
+`bag.itunes.apple.com` (55), `gs.apple.com` (12), `gateway.icloud.com`,
+`weather-edge`/`weatherkit`, `xp`, `iadsdk`, `*.ls.apple.com`,
+`sas.pcms.apple.com`, `swscan`, `gdmf`, `gsa`, `stocks-data-service`.
+Logged as warnings, they hide the deny that matters (the job's own
+`registry.example.com` that needs an `allowedDomains` entry).
+
+These names stay **denied**. Sand only classifies a built-in list of them
+(`OSBackgroundNoise` in `Sources/sand/Network/EgressPolicy.swift`) as known
+background noise:
+
+- the deny is logged at **debug** level instead of warning;
+- it is still written to the JSONL audit, with `reason=os-background` and
+  `level=debug`;
+- it has its own 200-line burst budget (then one in 100, with `suppressed=`),
+  so noise never uses up the budget for real denies;
+- it is counted in `network.session.summary` as `quiet_denied=` and
+  `top_quiet=` and kept out of `top_denied=`.
+
+Only a plain `not-allowlisted` deny is quieted. A name on the list that is
+refused for another reason (for example a rebinding `blocked-address`) is
+logged as a warning as usual. Names a build may legitimately need, such as
+`timestamp.apple.com` (codesign `--timestamp`) and the OCSP/CRL hosts, are
+deliberately not on the list, so their denies stay loud. The guest sees the
+same `X-Sand-Deny: not-allowlisted` either way.
+
+Configuration (profile github only):
+
+- `quietOSBackground: false` turns the built-in list off: those denies are
+  warnings again with `reason=not-allowlisted`.
+- `quietDenies: [...]` adds hostname patterns (same syntax as
+  `allowedDomains`, without a port) that are denied quietly with
+  `reason=quiet-listed`, for other known noise in your images.
+
+The list does not change the policy hash: it changes logging, not what is
+allowed.
+
+**Suppressing the noise in the guest (not done by Sand).** The attempts can
+also be stopped at the source in the golden image, which saves the proxy
+round trips and keeps the debug log short. Sand does not do this by default:
+it changes the image, the right set differs per macOS release, and some of
+these services (Software Update scans, MDM enrollment) are wanted on images
+that are also used interactively. Options, all applied when baking the image:
+
+- Disable the agents that generate most of it, for example with
+  `launchctl disable gui/501/com.apple.weather.menu` style overrides or by
+  turning off Location Services, Weather/Stocks widgets, App Store
+  automatic checks and iCloud sign-in (`softwareupdate --schedule off`,
+  `defaults write com.apple.commerce AutoUpdate -bool false`,
+  `defaults write com.apple.SoftwareUpdate AutomaticCheckEnabled -bool false`).
+- Pin the names to an unroutable address in the guest's `/etc/hosts`
+  (`0.0.0.0 bag.itunes.apple.com`): the client then fails locally and never
+  reaches the proxy. This hides the attempt from the audit log entirely,
+  so prefer it only for names you have reviewed.
+- Leave the guest as is and rely on the quiet classification above, which
+  keeps every attempt in the audit trail. This is the default.
 
 ## Troubleshooting
 

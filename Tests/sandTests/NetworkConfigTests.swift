@@ -111,6 +111,45 @@ private func vm(network: NetworkConfig, noClipboard: Bool = true, nested: Bool =
         }
     }
 
+    @Test func osBackgroundIsQuietByDefaultAndConfigurable() throws {
+        let defaults = try #require(try NetworkConfig.secureDefault.compile().egress)
+        #expect(defaults.quietReason(for: "bag.itunes.apple.com") == "os-background")
+        #expect(defaults.quietReason(for: "gsp57-ssl-background.ls.apple.com") == "os-background")
+        #expect(defaults.quietReason(for: "weatherkit.apple.com") == "os-background")
+        #expect(defaults.quietReason(for: "timestamp.apple.com") == nil)
+        #expect(defaults.quietReason(for: "example.com") == nil)
+        #expect(!defaults.requireSteering)
+        let vm = try loadRun("""
+              run:
+                network:
+                  quietOSBackground: false
+                  quietDenies: ["*.telemetry.example.com", "noise.example.org"]
+                  requireSteering: true
+        """)
+        let egress = try #require(try vm.run.network.compile().egress)
+        #expect(egress.quietReason(for: "bag.itunes.apple.com") == nil)
+        #expect(egress.quietReason(for: "a.telemetry.example.com") == "quiet-listed")
+        #expect(egress.quietReason(for: "noise.example.org") == "quiet-listed")
+        #expect(egress.requireSteering)
+        #expect(!validationMessages(vm).contains { $0.severity == .error })
+    }
+
+    @Test func everyBuiltInBackgroundNameParses() {
+        #expect(OSBackgroundNoise.patterns.count == OSBackgroundNoise.names.count)
+        // Never quiet a name the github preset allows.
+        let github = EgressPreset.github.domains
+        #expect(!github.contains { name in OSBackgroundNoise.patterns.contains { $0.matches(name.replacingOccurrences(of: "*.", with: "x.")) } })
+    }
+
+    @Test func quietDeniesAndRequireSteeringNeedTheGitHubProfile() {
+        let offline = validationMessages(vm(network: NetworkConfig(selection: .profile(.offline), quietDenies: ["noise.example.com"])))
+        #expect(offline.contains { $0.severity == .error && $0.message.contains("quietDenies") })
+        let mode = validationMessages(vm(network: NetworkConfig(selection: .mode(.softnet), requireSteering: true)))
+        #expect(mode.contains { $0.severity == .error && $0.message.contains("requireSteering") })
+        let bad = validationMessages(vm(network: NetworkConfig(selection: .profile(.github), quietDenies: ["*", "noise.example.com:443"])))
+        #expect(bad.filter { $0.severity == .error && $0.message.contains("quietDenies") }.count == 2)
+    }
+
     @Test func unknownKeyErrorNamesTheKey() {
         do {
             _ = try loadRun("""

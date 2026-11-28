@@ -314,14 +314,29 @@ final class VMNetworkSession: @unchecked Sendable {
         await tunnel?.terminate()
         proxy?.stop()
         if let summary = (proxy as? EgressProxy)?.summary {
-            audit.emit("network.session.summary", [
-                "allowed": String(summary.allowed),
-                "denied": String(summary.denied),
-                "bytes_up": String(summary.bytesUp),
-                "bytes_down": String(summary.bytesDown),
-                "top_denied": summary.deniedByHost.sorted { $0.value > $1.value }.prefix(5).map { "\($0.key):\($0.value)" }.joined(separator: ",")
-            ])
+            audit.emit("network.session.summary", Self.summaryFields(summary))
         }
+    }
+
+    /// `network.session.summary` fields. `denied` counts every deny;
+    /// `top_denied` lists only the ones that were not background noise, which
+    /// `quiet_denied` / `top_quiet` count instead.
+    static func summaryFields(_ summary: EgressProxy.Counters) -> [String: String] {
+        func top(_ hosts: [String: Int]) -> String {
+            hosts.sorted { ($0.value, $1.key) > ($1.value, $0.key) }.prefix(5).map { "\($0.key):\($0.value)" }.joined(separator: ",")
+        }
+        var fields = [
+            "allowed": String(summary.allowed),
+            "denied": String(summary.denied),
+            "bytes_up": String(summary.bytesUp),
+            "bytes_down": String(summary.bytesDown),
+            "top_denied": top(summary.deniedByHost)
+        ]
+        if summary.quietDenied > 0 {
+            fields["quiet_denied"] = String(summary.quietDenied)
+            fields["top_quiet"] = top(summary.quietByHost)
+        }
+        return fields
     }
 
     private func waitForTunnel(ssh: SSHClient, tunnel: ProcessHandle) async throws {

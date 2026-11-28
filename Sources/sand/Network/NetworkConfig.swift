@@ -100,6 +100,14 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
     let ipForwarding: IPForwardingPolicy?
     /// Consecutive network enforcement failures before `sand run` exits 78.
     let maxEnforcementFailures: Int?
+    /// Extra host patterns whose `not-allowlisted` denies are logged at debug
+    /// level and only counted (still denied, still in the JSONL audit).
+    let quietDenies: [String]
+    /// nil means true: deny the built-in macOS background endpoints quietly.
+    let quietOSBackground: Bool?
+    /// Refuse a steered GitHub name that resolves only to public addresses
+    /// instead of egressing directly (nil means false).
+    let requireSteering: Bool?
 
     static let defaultMaxEnforcementFailures = 3
 
@@ -121,7 +129,10 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
         acceptedHostListeners: [String] = [],
         tlsInspection: TLSInspectionMode? = nil,
         ipForwarding: IPForwardingPolicy? = nil,
-        maxEnforcementFailures: Int? = nil
+        maxEnforcementFailures: Int? = nil,
+        quietDenies: [String] = [],
+        quietOSBackground: Bool? = nil,
+        requireSteering: Bool? = nil
     ) {
         self.selection = selection
         self.presets = presets
@@ -139,6 +150,9 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
         self.tlsInspection = tlsInspection
         self.ipForwarding = ipForwarding
         self.maxEnforcementFailures = maxEnforcementFailures
+        self.quietDenies = quietDenies
+        self.quietOSBackground = quietOSBackground
+        self.requireSteering = requireSteering
     }
 
     /// Legacy convenience used by the softnet prototype and its tests.
@@ -210,6 +224,9 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
         tlsInspection = try Self.decodeEnum(TLSInspectionMode.self, key: .tlsInspection, in: container)
         ipForwarding = try Self.decodeEnum(IPForwardingPolicy.self, key: .ipForwarding, in: container)
         maxEnforcementFailures = try container.decodeIfPresent(Int.self, forKey: .maxEnforcementFailures)
+        quietDenies = try container.decodeIfPresent([String].self, forKey: .quietDenies) ?? []
+        quietOSBackground = try container.decodeIfPresent(Bool.self, forKey: .quietOSBackground)
+        requireSteering = try container.decodeIfPresent(Bool.self, forKey: .requireSteering)
     }
 
     private static func decodeEnum<T: RawRepresentable & CaseIterable>(_ type: T.Type, key: CodingKeys, in container: KeyedDecodingContainer<CodingKeys>) throws -> T? where T.RawValue == String {
@@ -230,6 +247,7 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
     private enum CodingKeys: String, CodingKey, CaseIterable {
         case profile, mode, presets, allowedDomains, allowedCIDRs, allowCIDRs, verify, allowGitHubSSH, transport
         case backend, softnetPath, softnetSHA256, hostListeners, acceptedHostListeners, tlsInspection, ipForwarding, maxEnforcementFailures
+        case quietDenies, quietOSBackground, requireSteering
     }
 
     var profile: Profile? {
@@ -333,12 +351,17 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
             let direct = allowedCIDRs.map {
                 SoftnetRule(direction: .outbound, proto: $0.proto, target: .cidr($0.cidr), port: $0.port)
             }
-            let egress = EgressPolicy(
+            var egress = EgressPolicy(
                 rules: rules.sorted(),
                 steeredNames: EgressPreset.steeredNames,
                 verify: effectiveVerify,
                 extraCIDRs: allowedCIDRs
             )
+            egress.quietDenies = try quietDenies.map(DomainPattern.parse)
+            if quietOSBackground ?? true {
+                egress.osBackground = OSBackgroundNoise.patterns
+            }
+            egress.requireSteering = requireSteering ?? false
             return NetworkPolicy(
                 kind: .egressProxy(egress),
                 softnet: backend == .softnet ? try .denyAll(allowing: [ssh] + direct) : nil,

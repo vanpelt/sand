@@ -57,11 +57,14 @@ private struct Harness {
     let echoPort: UInt16
     let recorder: AuditRecorder
 
-    static func make(maxTunnels: Int = 256, extraCIDRs: [DirectCIDRAllow] = [], hostFacts: HostFacts = HostFacts(), testAllowance: Set<sand.IPAddress>? = nil) async throws -> Harness {
+    static func make(
+        maxTunnels: Int = 256, extraCIDRs: [DirectCIDRAllow] = [], hostFacts: HostFacts = HostFacts(), testAllowance: Set<sand.IPAddress>? = nil,
+        configure: (inout EgressPolicy) -> Void = { _ in }
+    ) async throws -> Harness {
         let echo = try EchoServer()
         let echoPort = try await echo.start()
         let loopback = IPAddress("127.0.0.1")!
-        let policy = EgressPolicy(
+        var policy = EgressPolicy(
             rules: [
                 DomainRule(pattern: DomainPattern(kind: .exact("echo.test")), port: Int(echoPort)),
                 DomainRule(pattern: DomainPattern(kind: .exact("rebind.test")), port: Int(echoPort)),
@@ -72,6 +75,7 @@ private struct Harness {
             verify: .basic,
             extraCIDRs: extraCIDRs
         )
+        configure(&policy)
         let resolver = StaticHostResolver(table: [
             "echo.test": [loopback],
             "rebind.test": [IPAddress("10.0.0.1")!],
@@ -128,6 +132,50 @@ private func background<T: Sendable>(_ work: @escaping @Sendable () throws -> T)
         let allow = harness.recorder.events.first { $0.fields["decision"] == "allow" }
         #expect(allow?.fields["host"] == "echo.test")
         #expect(Int(allow?.fields["bytes_up"] ?? "0") == hello.count)
+    }
+
+    @Test func osBackgroundDeniesAreDebugLevelAndCountedSeparately() async throws {
+        let harness = try await Harness.make { policy in
+            policy.osBackground = OSBackgroundNoise.patterns
+            policy.quietDenies = [try! DomainPattern.parse("*.telemetry.example")]
+        }
+        defer { harness.stop() }
+        let port = harness.proxyPort
+        let statuses = try await background {
+            ["bag.itunes.apple.com:443", "gsp57-ssl-background.ls.apple.com:443", "bag.itunes.apple.com:443", "a.telemetry.example:443", "example.com:443"]
+                .map { LoopbackClient.connectStatus(port: port, target: $0) }
+        }
+        // Still denied, every one.
+        #expect(statuses == [403, 403, 403, 403, 403])
+        let denies = harness.recorder.events.filter { $0.name == "network.connect" && $0.fields["decision"] == "deny" }
+        let quiet = denies.filter { $0.fields["host"] != "example.com" }
+        #expect(quiet.count == 4)
+        #expect(quiet.allSatisfy { $0.level == .debug })
+        #expect(quiet.filter { $0.fields["reason"] == "os-background" }.count == 3)
+        #expect(quiet.contains { $0.fields["host"] == "a.telemetry.example" && $0.fields["reason"] == "quiet-listed" })
+        let loud = try #require(denies.first { $0.fields["host"] == "example.com" })
+        #expect(loud.level == .warning)
+        #expect(loud.fields["reason"] == "not-allowlisted")
+        let summary = harness.proxy.summary
+        #expect(summary.denied == 5)
+        #expect(summary.quietDenied == 4)
+        #expect(summary.quietByHost["bag.itunes.apple.com"] == 2)
+        #expect(summary.deniedByHost == ["example.com": 1])
+        let fields = VMNetworkSession.summaryFields(summary)
+        #expect(fields["quiet_denied"] == "4")
+        #expect(fields["top_denied"] == "example.com:1")
+        #expect(fields["top_quiet"]?.hasPrefix("bag.itunes.apple.com:2") == true)
+    }
+
+    @Test func backgroundNamesAreLoudWhenQuietingIsOff() async throws {
+        let harness = try await Harness.make()
+        defer { harness.stop() }
+        let status = try await background { LoopbackClient.connectStatus(port: harness.proxyPort, target: "bag.itunes.apple.com:443") }
+        #expect(status == 403)
+        let deny = try #require(harness.recorder.events.first { $0.fields["decision"] == "deny" })
+        #expect(deny.level == .warning)
+        #expect(deny.fields["reason"] == "not-allowlisted")
+        #expect(harness.proxy.summary.quietDenied == 0)
     }
 
     @Test func deniedHostGets403AndAnAuditEvent() async throws {

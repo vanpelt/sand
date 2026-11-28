@@ -219,6 +219,20 @@ final class ConfigValidator {
         if network.profile == .offline, network.tlsInspection != nil {
             error("vm.run.network.tlsInspection applies to profile: github only (offline has no proxy).")
         }
+        if network.profile != .github, !network.quietDenies.isEmpty || network.quietOSBackground != nil || network.requireSteering != nil {
+            error("vm.run.network quietDenies, quietOSBackground and requireSteering apply to profile: github only (they configure the egress proxy).")
+        }
+        for entry in network.quietDenies {
+            if entry.contains(":") {
+                error("vm.run.network.quietDenies entry '\(entry)' must be a hostname pattern without a port.")
+                continue
+            }
+            do {
+                _ = try DomainPattern.parse(entry)
+            } catch let failure {
+                error("vm.run.network.quietDenies entry '\(entry)': \(failure)")
+            }
+        }
         if !network.allowedCIDRs.isEmpty, network.profile != nil, network.backendChoice != .softnet {
             error("vm.run.network.allowedCIDRs requires backend: softnet; the \(network.backendChoice.rawValue) backend \(network.backendChoice == .auto ? "may resolve to hostOnly, which has" : "has") no direct route off the host.")
         }

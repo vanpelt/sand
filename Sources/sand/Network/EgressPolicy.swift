@@ -312,6 +312,13 @@ struct EgressPolicy: Sendable, Equatable {
     let steeredNames: Set<String>
     let verify: VerifyLevel
     let extraCIDRs: [DirectCIDRAllow]
+    /// Known OS background endpoints (empty under `quietOSBackground: false`).
+    /// Still denied; only their logging is quieter.
+    var osBackground: [DomainPattern] = []
+    /// `quietDenies` from the config. Still denied; only their logging is quieter.
+    var quietDenies: [DomainPattern] = []
+    /// Refuse a steered name whose answer stays public after the flip retry.
+    var requireSteering = false
 
     func allows(host: String, port: Int) -> Bool {
         rules.contains { $0.matches(host: host, port: port) }
@@ -319,6 +326,14 @@ struct EgressPolicy: Sendable, Equatable {
 
     func isSteered(_ host: String) -> Bool {
         steeredNames.contains(DomainPattern.normalize(host))
+    }
+
+    /// The audit reason for a `not-allowlisted` deny of known background noise
+    /// (`os-background` or `quiet-listed`), or nil for an ordinary deny.
+    func quietReason(for host: String) -> String? {
+        if osBackground.contains(where: { $0.matches(host) }) { return "os-background" }
+        if quietDenies.contains(where: { $0.matches(host) }) { return "quiet-listed" }
+        return nil
     }
 
     /// IP-literal CONNECT targets are only allowed when an extra CIDR covers them.
@@ -334,4 +349,26 @@ struct EgressPolicy: Sendable, Equatable {
         }
         return covering.first { $0.allowPrivate } ?? covering.first
     }
+}
+
+/// Endpoints a stock macOS guest contacts on its own (App Store bag, Apple
+/// ID/iCloud, Location Services, Weather/Stocks widgets, ad SDK, software
+/// update and MDM scans). Under the github profile they
+/// are denied like any other unlisted name; this list only moves their deny
+/// lines from warning to debug and into a per-VM count. Names a build may
+/// legitimately need (timestamp.apple.com for codesign, OCSP/CRL hosts,
+/// developer services) are deliberately not here, so their denies stay loud.
+enum OSBackgroundNoise {
+    static let names: [String] = [
+        "bag.itunes.apple.com", "init.itunes.apple.com", "init-p01md.apple.com", "init-p01st.push.apple.com",
+        "gs.apple.com", "gsa.apple.com", "gsas.apple.com", "gdmf.apple.com", "xp.apple.com",
+        "swscan.apple.com", "swdist.apple.com", "mesu.apple.com",
+        "sas.pcms.apple.com", "iadsdk.apple.com", "*.iadsdk.apple.com",
+        "*.ls.apple.com", "weather*.apple.com", "stocks*.apple.com",
+        "gateway.icloud.com", "p*-ckdatabase.icloud.com", "keyvalueservice.icloud.com",
+        "configuration.apple.com", "api.smoot.apple.com", "smp-device-content.apple.com",
+        "experiments.apple.com", "metrics.icloud.com"
+    ]
+
+    static let patterns: [DomainPattern] = names.compactMap { try? DomainPattern.parse($0) }
 }
