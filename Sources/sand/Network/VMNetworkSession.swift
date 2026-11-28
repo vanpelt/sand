@@ -154,9 +154,17 @@ final class VMNetworkSession: @unchecked Sendable {
         }
         if let egress = policy.egress {
             let routes = await dependencies.routes()
-            let steeredInterfaces = await DestinationGuard.learnSteeredInterfaces(names: egress.steeredNames, resolver: dependencies.resolver, routes: routes)
-            audit.emit("network.steering.learned", ["interfaces": steeredInterfaces.sorted().joined(separator: ","), "policy_hash": policy.policyHash])
-            let guardrail = DestinationGuard(hostFacts: facts, routes: routes, steeredInterfaces: steeredInterfaces)
+            let steering = await DestinationGuard.learnSteering(names: egress.steeredNames, resolver: dependencies.resolver, routes: routes)
+            var learned = [
+                "interfaces": steering.interfaces.sorted().joined(separator: ","),
+                "steered": steering.steeredNames.sorted().joined(separator: ","),
+                "policy_hash": policy.policyHash
+            ]
+            if !steering.publicNames.isEmpty {
+                learned["public"] = steering.publicNames.sorted().joined(separator: ",")
+            }
+            audit.emit("network.steering.learned", learned)
+            let guardrail = DestinationGuard(hostFacts: facts, routes: routes, steeredInterfaces: steering.interfaces, steeredNamesAtStart: steering.steeredNames)
             let proxy = dependencies.makeProxy(egress, guardrail, audit)
             lock.withLock { self.proxy = proxy }
             let port = try await proxy.start(port: 0)

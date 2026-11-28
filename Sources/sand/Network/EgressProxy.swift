@@ -36,6 +36,9 @@ final class EgressProxy: EgressProxying, @unchecked Sendable {
         var clientHelloTimeout: TimeInterval = 10
         var connectTimeout: TimeInterval = 15
         var idleTimeout: TimeInterval = 600
+        /// Backoff between re-resolutions of an expected-steered name whose
+        /// answer is public-only (a steering flip). ~5 s in total by default.
+        var steeringRetryDelays: [TimeInterval] = SteeringResolver.defaultRetryDelays
     }
 
     let policy: EgressPolicy
@@ -51,6 +54,8 @@ final class EgressProxy: EgressProxying, @unchecked Sendable {
     private var stopped = false
     private var sweepTimer: DispatchSourceTimer?
     private var counters = Counters()
+    private var steeringMemory: SteeringMemory
+    private let createdAt = Date()
 
     struct Counters: Sendable, Equatable {
         var allowed = 0
@@ -72,6 +77,7 @@ final class EgressProxy: EgressProxying, @unchecked Sendable {
         self.resolver = resolver
         self.audit = audit
         self.limits = limits
+        steeringMemory = SteeringMemory(seed: destinationGuard.steeredNamesAtStart)
     }
 
     var hasFailed: Bool {
@@ -173,7 +179,7 @@ final class EgressProxy: EgressProxying, @unchecked Sendable {
     static let publicDenyCodes: Set<String> = [
         "not-allowlisted", "ip-literal", "blocked-address", "no-address", "resolve-failed",
         "connect-failed", "method-not-allowed", "bad-request", "header-too-large",
-        "tunnel-limit", "header-timeout", "resolve-timeout", "connect-timeout"
+        "tunnel-limit", "header-timeout", "resolve-timeout", "connect-timeout", "steering-required"
     ]
 
     /// The fixed code for a (possibly detailed) internal deny reason, e.g.
@@ -242,6 +248,39 @@ final class EgressProxy: EgressProxying, @unchecked Sendable {
     }
 
     fileprivate var proxyQueue: DispatchQueue { queue }
+
+    /// On `queue`: whether a steered name is expected to resolve to a private
+    /// front (seen steered at proxy start or earlier in this VM session).
+    fileprivate func expectsSteering(_ host: String) -> Bool {
+        policy.requireSteering || steeringMemory.contains(host)
+    }
+
+    /// On `queue`: a steered connection to `host` was made.
+    fileprivate func noteSteered(_ host: String) {
+        steeringMemory.note(host)
+    }
+
+    /// Test/inspection hook: the names this proxy expects to be steered.
+    var steeredNamesSeen: Set<String> {
+        queue.sync { steeringMemory.names }
+    }
+
+    /// On `queue`: audits a steering flip (`network.steering.flip`).
+    /// `outcome` is `recovered` (a later answer was steered), `public` (the
+    /// connection egresses directly) or `denied` (`requireSteering`).
+    fileprivate func recordFlip(host: String, port: Int, resolution: SteeringResolver.Outcome, outcome: String) {
+        audit.emit("network.steering.flip", level: outcome == "recovered" ? .info : .warning, [
+            "host": host,
+            "port": String(port),
+            "outcome": outcome,
+            "attempts": String(resolution.attempts),
+            "waited_ms": String(Int((resolution.waited * 1000).rounded())),
+            "since_proxy_start_ms": String(Int((Date().timeIntervalSince(createdAt) * 1000).rounded())),
+            "first": resolution.firstAnswer.map(\.description).joined(separator: ","),
+            "final": resolution.addresses.map(\.description).joined(separator: ","),
+            "require_steering": String(policy.requireSteering)
+        ])
+    }
 
     private func startSweep() {
         let timer = DispatchSource.makeTimerSource(queue: queue)
@@ -472,22 +511,43 @@ private final class ProxySession: @unchecked Sendable {
             reject(status: 403, reason: "not-allowlisted", host: request.host, port: request.port)
             return
         }
-        let resolver = proxy.resolver
         let guardrail = proxy.destinationGuard
         let steeredName = policy.isSteered(request.host)
+        let expectSteered = steeredName && proxy.expectsSteering(request.host)
+        let steering = SteeringResolver(resolver: proxy.resolver, retryDelays: proxy.limits.steeringRetryDelays)
         armTimer(proxy.limits.connectTimeout, reason: "resolve-timeout")
         Task { [weak self] in
-            let result: Result<[IPAddress], Error> = await Result { try await resolver.resolve(request.host) }
+            let result: Result<SteeringResolver.Outcome, Error> = await Result { try await steering.resolve(request.host, expectSteered: expectSteered) }
             self?.queue.async { [weak self] in
                 guard let self, !self.closed else { return }
                 switch result {
                 case let .failure(error):
                     self.reject(status: 502, reason: "resolve-failed:\(error)", host: request.host, port: request.port)
-                case let .success(addresses):
+                case let .success(resolution):
+                    var addresses = resolution.addresses
+                    if steeredName {
+                        let publicOnly = !resolution.steered
+                        if resolution.flipped || (expectSteered && publicOnly) {
+                            let outcome = !publicOnly ? "recovered" : (policy.requireSteering ? "denied" : "public")
+                            self.proxy.recordFlip(host: request.host, port: request.port, resolution: resolution, outcome: outcome)
+                        }
+                        if policy.requireSteering, publicOnly {
+                            self.reject(status: 502, reason: "steering-required", host: request.host, port: request.port)
+                            return
+                        }
+                        // requireSteering: only the VPN fronts, never a public
+                        // fallback if a front is refused (e.g. route mismatch).
+                        addresses = policy.requireSteering
+                            ? addresses.filter { SteeringResolver.hasSteerable([$0]) }
+                            : SteeringResolver.preferSteered(addresses)
+                    }
                     switch guardrail.check(host: request.host, port: request.port, resolved: addresses, steeredName: steeredName) {
                     case let .deny(reason):
                         self.reject(status: 403, reason: reason, host: request.host, port: request.port)
                     case let .allow(address, steered):
+                        if steered {
+                            self.proxy.noteSteered(request.host)
+                        }
                         self.connect(to: address, steered: steered)
                     }
                 }

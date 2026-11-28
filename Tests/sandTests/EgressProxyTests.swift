@@ -59,6 +59,7 @@ private struct Harness {
 
     static func make(
         maxTunnels: Int = 256, extraCIDRs: [DirectCIDRAllow] = [], hostFacts: HostFacts = HostFacts(), testAllowance: Set<sand.IPAddress>? = nil,
+        steeredAtStart: Set<String> = [], resolver customResolver: HostResolving? = nil,
         configure: (inout EgressPolicy) -> Void = { _ in }
     ) async throws -> Harness {
         let echo = try EchoServer()
@@ -86,10 +87,11 @@ private struct Harness {
         limits.maxTunnels = maxTunnels
         limits.headerTimeout = 3
         limits.clientHelloTimeout = 3
+        limits.steeringRetryDelays = [0.01, 0.01, 0.01]
         let proxy = EgressProxy(
             policy: policy,
-            destinationGuard: DestinationGuard(hostFacts: hostFacts, testAllowance: testAllowance ?? [loopback]),
-            resolver: resolver,
+            destinationGuard: DestinationGuard(hostFacts: hostFacts, testAllowance: testAllowance ?? [loopback], steeredNamesAtStart: steeredAtStart),
+            resolver: customResolver ?? resolver,
             audit: recorder.audit,
             limits: limits
         )
@@ -165,6 +167,54 @@ private func background<T: Sendable>(_ work: @escaping @Sendable () throws -> T)
         #expect(fields["quiet_denied"] == "4")
         #expect(fields["top_denied"] == "example.com:1")
         #expect(fields["top_quiet"]?.hasPrefix("bag.itunes.apple.com:2") == true)
+    }
+
+    private static func steering(_ policy: inout EgressPolicy, require: Bool = false) {
+        var steered = EgressPolicy(rules: policy.rules, steeredNames: ["echo.test"], verify: policy.verify, extraCIDRs: policy.extraCIDRs)
+        steered.requireSteering = require
+        policy = steered
+    }
+
+    @Test func expectedSteeredNameThatStaysPublicIsRetriedThenEgressesAndIsAudited() async throws {
+        // echo.test always resolves to the (public-classified, test-allowed) loopback echo server.
+        let harness = try await Harness.make(steeredAtStart: ["echo.test"]) { Self.steering(&$0) }
+        defer { harness.stop() }
+        let target = "echo.test:\(harness.echoPort)"
+        let status = try await background { LoopbackClient.connectStatus(port: harness.proxyPort, target: target) }
+        #expect(status == 200)
+        let flip = try #require(harness.recorder.events.first { $0.name == "network.steering.flip" })
+        #expect(flip.fields["outcome"] == "public")
+        #expect(flip.fields["attempts"] == "4")
+        #expect(flip.fields["first"] == "127.0.0.1")
+        #expect(flip.level == .warning)
+        #expect(flip.fields["since_proxy_start_ms"] != nil && flip.fields["waited_ms"] != nil)
+    }
+
+    @Test func steeredNameNotSeenSteeredIsNotRetried() async throws {
+        let harness = try await Harness.make { Self.steering(&$0) }
+        defer { harness.stop() }
+        let target = "echo.test:\(harness.echoPort)"
+        let status = try await background { LoopbackClient.connectStatus(port: harness.proxyPort, target: target) }
+        #expect(status == 200)
+        #expect(!harness.recorder.events.contains { $0.name == "network.steering.flip" })
+    }
+
+    @Test func requireSteeringRefusesAPublicOnlyAnswer() async throws {
+        let harness = try await Harness.make { Self.steering(&$0, require: true) }
+        defer { harness.stop() }
+        let target = "echo.test:\(harness.echoPort)"
+        let (status, header) = try await background { () -> (Int?, String) in
+            let client = try harness.client()
+            try client.send("CONNECT \(target) HTTP/1.1\r\nHost: echo.test\r\n\r\n")
+            let header = try client.readHeader()
+            return (LoopbackClient.statusCode(of: header), header)
+        }
+        #expect(status == 502)
+        #expect(header.contains("X-Sand-Deny: steering-required"))
+        let flip = try #require(harness.recorder.events.first { $0.name == "network.steering.flip" })
+        #expect(flip.fields["outcome"] == "denied")
+        #expect(flip.fields["require_steering"] == "true")
+        #expect(harness.recorder.events.contains { $0.fields["decision"] == "deny" && $0.fields["reason"] == "steering-required" })
     }
 
     @Test func backgroundNamesAreLoudWhenQuietingIsOff() async throws {

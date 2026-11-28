@@ -70,27 +70,54 @@ struct DestinationGuard: Sendable {
     /// resolver from pointing github.com at a tailnet or other VPN subnet.
     let steeredInterfaces: Set<String>?
     let routes: RouteInspector?
+    /// Steered names that resolved to a private front when the VM's proxy
+    /// started. A later public-only answer for one of them is treated as a
+    /// steering flip and re-resolved (see `SteeringResolver`).
+    let steeredNamesAtStart: Set<String>
 
-    init(hostFacts: HostFacts, testAllowance: Set<IPAddress> = [], routes: RouteInspector? = nil, steeredInterfaces: Set<String>? = nil) {
+    init(hostFacts: HostFacts, testAllowance: Set<IPAddress> = [], routes: RouteInspector? = nil, steeredInterfaces: Set<String>? = nil, steeredNamesAtStart: Set<String> = []) {
         self.hostFacts = hostFacts
         self.testAllowance = testAllowance
         self.routes = routes
         self.steeredInterfaces = steeredInterfaces
+        self.steeredNamesAtStart = steeredNamesAtStart
     }
 
-    /// Resolves the steered names now and records which interfaces carry their
-    /// private (VPN-front) answers. Public answers contribute nothing.
-    static func learnSteeredInterfaces(names: Set<String>, resolver: HostResolving, routes: RouteInspector) async -> Set<String> {
-        var interfaces = Set<String>()
+    struct SteeringObservation: Sendable, Equatable {
+        /// Interfaces that carry the steered names' private answers.
+        var interfaces: Set<String> = []
+        /// Steered names that resolved to a private (steerable) address.
+        var steeredNames: Set<String> = []
+        /// Steered names that resolved only to public addresses.
+        var publicNames: Set<String> = []
+    }
+
+    /// Resolves the steered names now and records which ones resolved to a
+    /// private (VPN-front) answer and which interfaces carry those answers.
+    static func learnSteering(names: Set<String>, resolver: HostResolving, routes: RouteInspector) async -> SteeringObservation {
+        var observation = SteeringObservation()
         for name in names.sorted() {
             guard let addresses = try? await resolver.resolve(name) else { continue }
+            var steered = false
             for address in addresses where steerableRanges.contains(where: { $0.contains(address) }) {
+                steered = true
                 if let interface = routes.interface(for: address) {
-                    interfaces.insert(interface)
+                    observation.interfaces.insert(interface)
                 }
             }
+            if steered {
+                observation.steeredNames.insert(name)
+            } else if !addresses.isEmpty {
+                observation.publicNames.insert(name)
+            }
         }
-        return interfaces
+        return observation
+    }
+
+    /// The interfaces that carry the steered names' private answers. Public
+    /// answers contribute nothing.
+    static func learnSteeredInterfaces(names: Set<String>, resolver: HostResolving, routes: RouteInspector) async -> Set<String> {
+        await learnSteering(names: names, resolver: resolver, routes: routes).interfaces
     }
 
     /// Returns the first acceptable address. `steeredName` says whether the
