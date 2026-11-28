@@ -84,3 +84,37 @@ final class ProcessRunnerTests: XCTestCase {
         }
     }
 }
+
+final class ProcessRunnerStdinTests: XCTestCase {
+    /// Secrets go to the child on stdin (closed after), never in arguments.
+    func testStdinIsDeliveredAndClosed() async throws {
+        let secret = String(repeating: "s", count: 100_000) // larger than a pipe buffer
+        let handle = try SystemProcessRunner().start(executable: "/bin/bash", arguments: ["-c", "wc -c"], environment: nil, stdin: Data(secret.utf8))
+        let result = try await handle.waitAsync()
+        XCTAssertEqual(result.stdout.trimmingCharacters(in: .whitespacesAndNewlines), "100000")
+    }
+}
+
+final class SSHClientStdinTests: XCTestCase {
+    final class StdinRecorder: ProcessRunning, @unchecked Sendable {
+        var arguments: [String] = []
+        var stdin: Data?
+        func run(executable: String, arguments: [String], wait: Bool) async throws -> ProcessResult? { nil }
+        func start(executable: String, arguments: [String]) throws -> ProcessHandle {
+            self.arguments = arguments
+            return ProcessHandle(waitAsync: { ProcessResult(stdout: "", stderr: "", exitCode: 0) }, terminate: {})
+        }
+        func start(executable: String, arguments: [String], environment: [String: String]?, stdin: Data?) throws -> ProcessHandle {
+            self.stdin = stdin
+            return try start(executable: executable, arguments: arguments)
+        }
+    }
+
+    func testStdinIsPassedAndNeverInArguments() throws {
+        let runner = StdinRecorder()
+        let ssh = SSHClient(processRunner: runner, host: "10.0.0.1", config: .init(user: "admin", password: "pw", port: 22))
+        _ = try ssh.start(command: GitHubProvisioner.jitRunCommand(prefix: ""), stdin: "JIT-SECRET\n")
+        XCTAssertEqual(runner.stdin, Data("JIT-SECRET\n".utf8))
+        XCTAssertFalse(runner.arguments.joined(separator: " ").contains("JIT-SECRET"))
+    }
+}

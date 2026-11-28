@@ -269,7 +269,7 @@ final class ConfigTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent("fixtures")
-        let files = try FileManager.default.contentsOfDirectory(atPath: fixtures.path).filter { $0.hasSuffix(".yml") }
+        let files = try FileManager.default.contentsOfDirectory(atPath: fixtures.path).filter { $0.hasSuffix(".yml") && !$0.hasPrefix("broker_mock") }
         XCTAssertFalse(files.isEmpty)
         for file in files {
             XCTAssertNoThrow(try Config.load(path: fixtures.appendingPathComponent(file).path), file)

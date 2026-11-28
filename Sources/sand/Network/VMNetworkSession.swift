@@ -348,27 +348,10 @@ final class VMNetworkSession: @unchecked Sendable {
     }
 
     private func waitForTunnel(ssh: SSHClient, tunnel: ProcessHandle) async throws {
-        let deadline = Date().addingTimeInterval(dependencies.tunnelReadyTimeout)
-        let probe = "(exec 3<>/dev/tcp/127.0.0.1/\(NetworkPolicy.guestProxyPort)) 2>/dev/null && echo SAND_TUNNEL_OK || true"
-        while Date() < deadline {
-            if await tunnel.hasExited() {
-                let stderr: String
-                do {
-                    stderr = try await tunnel.waitAsync(terminateOnCancel: false).stderr
-                } catch let ProcessRunnerError.failed(_, _, message, _) {
-                    stderr = message
-                } catch {
-                    stderr = "\(error)"
-                }
-                throw NetworkEnforcementError.tunnelFailed("ssh -R exited: \(stderr.trimmingCharacters(in: .whitespacesAndNewlines)) (guest sshd must allow TCP forwarding)")
-            }
-            if let output = try? await ssh.exec(command: probe)?.stdout, output.contains("SAND_TUNNEL_OK") {
-                logger.info("guest proxy tunnel ready on guest 127.0.0.1:\(NetworkPolicy.guestProxyPort)")
-                return
-            }
-            try await Task.sleep(nanoseconds: 500_000_000)
-        }
-        throw NetworkEnforcementError.tunnelFailed("guest 127.0.0.1:\(NetworkPolicy.guestProxyPort) not reachable after \(Int(dependencies.tunnelReadyTimeout))s")
+        try await ReverseTunnel.waitUntilReady(
+            ssh: ssh, tunnel: tunnel, guestPort: NetworkPolicy.guestProxyPort,
+            timeout: dependencies.tunnelReadyTimeout, logger: logger, label: "guest proxy tunnel"
+        )
     }
 
     private func makeVerifier(facts: HostFacts, hostServicePorts: [Int], gateway: String?, gatewayV6: String?) async -> GuestEgressVerifier {
@@ -399,5 +382,32 @@ final class VMNetworkSession: @unchecked Sendable {
             hostGateway: gateway,
             routed: routed
         )
+    }
+}
+
+/// Readiness of an `ssh -N -R` tunnel: the guest can open its loopback port.
+enum ReverseTunnel {
+    static func waitUntilReady(ssh: SSHClient, tunnel: ProcessHandle, guestPort: Int, timeout: TimeInterval, logger: Logger, label: String) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        let probe = "(exec 3<>/dev/tcp/127.0.0.1/\(guestPort)) 2>/dev/null && echo SAND_TUNNEL_OK || true"
+        while Date() < deadline {
+            if await tunnel.hasExited() {
+                let stderr: String
+                do {
+                    stderr = try await tunnel.waitAsync(terminateOnCancel: false).stderr
+                } catch let ProcessRunnerError.failed(_, _, message, _) {
+                    stderr = message
+                } catch {
+                    stderr = "\(error)"
+                }
+                throw NetworkEnforcementError.tunnelFailed("ssh -R exited: \(stderr.trimmingCharacters(in: .whitespacesAndNewlines)) (guest sshd must allow TCP forwarding)")
+            }
+            if let output = try? await ssh.exec(command: probe)?.stdout, output.contains("SAND_TUNNEL_OK") {
+                logger.info("\(label) ready on guest 127.0.0.1:\(guestPort)")
+                return
+            }
+            try await Task.sleep(nanoseconds: 500_000_000)
+        }
+        throw NetworkEnforcementError.tunnelFailed("guest 127.0.0.1:\(guestPort) not reachable after \(Int(timeout))s")
     }
 }

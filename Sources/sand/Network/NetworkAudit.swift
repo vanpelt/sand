@@ -58,6 +58,13 @@ final class AuditFileSink: @unchecked Sendable {
         return url.deletingLastPathComponent().appendingPathComponent("\(base).network.jsonl").path
     }
 
+    /// Appends one already-encoded JSON object (used for `sand.audit.v1` admission events).
+    func writeLine(_ json: String) {
+        lock.withLock {
+            handle.write(Data((json + "\n").utf8))
+        }
+    }
+
     func write(_ event: NetworkAuditEvent) {
         var object = event.fields
         object["event"] = event.name

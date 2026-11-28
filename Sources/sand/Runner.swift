@@ -11,6 +11,9 @@ struct Runner: Sendable {
     let control: RunnerControl
     let vmName: String
     let network: RunnerNetworkDependencies
+    /// Set in broker mode (`provisioner.config.broker`).
+    let broker: BrokerRuntime?
+    private let iterationFlags = IterationFlags()
     private let logger: Logger
     private let vmLogger: Logger
     private let restartBackoff = RestartBackoff()
@@ -25,6 +28,7 @@ struct Runner: Sendable {
         case vmExitedBeforeIP
         case unsupportedRunnerPlatform(String)
         case sshNotReady
+        case missingBroker
     }
 
     init(
@@ -43,7 +47,8 @@ struct Runner: Sendable {
         network: RunnerNetworkDependencies? = nil,
         audit: NetworkAudit? = nil,
         inspectionCAs: [InspectionCA] = [],
-        pinnedBackend: EnforcementBackend? = nil
+        pinnedBackend: EnforcementBackend? = nil,
+        broker: BrokerRuntime? = nil
     ) {
         self.tart = tart
         self.github = github
@@ -54,6 +59,7 @@ struct Runner: Sendable {
         self.shutdownCoordinator = shutdownCoordinator
         self.control = control
         self.vmName = vmName
+        self.broker = broker
         self.logger = Logger(label: "host.\(logLabel)", minimumLevel: logLevel, sink: logSink)
         self.vmLogger = Logger(label: "vm.\(logLabel)", minimumLevel: logLevel, sink: logSink)
         let networkAudit = audit ?? NetworkAudit(logger: Logger(label: "network.\(logLabel)", minimumLevel: logLevel, sink: logSink))
@@ -120,6 +126,9 @@ struct Runner: Sendable {
         case completed
         /// A counted network enforcement failure; the VM was destroyed and will be recreated.
         case enforcementRetry
+        /// Broker mode: the acquired job was not admitted and the VM was destroyed.
+        /// Not a finished iteration, so it never counts toward `stopAfter`.
+        case admissionDenied
     }
 
     /// Thrown by `recordEnforcementFailure` below the limit: unwinds to `runOnce`,
@@ -136,7 +145,7 @@ struct Runner: Sendable {
         let networkPolicy = try await network.preflight.compile(config.vm.run.network, sshPort: config.vm.ssh.port, pinnedBackend: network.pinnedBackend)
         do {
             try await runIteration(networkPolicy: networkPolicy)
-            return .completed
+            return iterationFlags.takeDenied() ? .admissionDenied : .completed
         } catch is EnforcementRetry {
             return .enforcementRetry
         } catch let error as NetworkEnforcementError where !error.isFatal && networkPolicy.isIsolated {
@@ -490,6 +499,17 @@ struct Runner: Sendable {
                 throw error
             }
         }
+        // Broker mode: wait for an allocation before the health check starts, so a
+        // long wait for eligible demand never trips a `pgrep run.sh` health check.
+        var brokerContext: BrokerAllocationContext?
+        if provisionerConfig.type == .github, let githubConfig = provisionerConfig.github, githubConfig.broker != nil {
+            do {
+                brokerContext = try await prepareBrokerAllocation(githubConfig: githubConfig, healthCheckState: healthCheckState)
+            } catch {
+                await shutdownCoordinator.cleanup(reason: "broker allocation failed")
+                throw error
+            }
+        }
         logger.debug("healthCheck task preparing (vm=\(name))")
         let healthCheckTask = startHealthCheck(
             healthCheck: config.healthCheck ?? .standard,
@@ -531,6 +551,13 @@ struct Runner: Sendable {
                     return
                 }
             case .github:
+                if let brokerContext {
+                    try await runBrokerProvisioner(
+                        brokerContext, ssh: ssh, healthCheckState: healthCheckState, egress: egress,
+                        stopHealthCheck: { await stopHealthCheck(healthCheckTask) }
+                    )
+                    return
+                }
                 guard let github, let githubConfig = provisionerConfig.github else {
                     throw RunnerError.missingGitHub
                 }
@@ -622,6 +649,176 @@ struct Runner: Sendable {
         logger.debug("runOnce complete (vm=\(vmName))")
     }
 
+    /// Broker mode (ADR 0001), step 1: allocate a JIT runner from the broker
+    /// (waiting out missing demand with the VM booted) and register its release
+    /// with the shutdown coordinator before anything else can fail.
+    private func prepareBrokerAllocation(githubConfig: GitHubProvisionerConfig, healthCheckState: HealthCheckState) async throws -> BrokerAllocationContext {
+        guard let broker, let repository = githubConfig.repository else {
+            throw RunnerError.missingBroker
+        }
+        logger.info("run github provisioner (broker mode, device \(broker.deviceId))")
+        let request = AllocationRequest(
+            repository: RepositoryName(owner: githubConfig.organization, name: repository),
+            runnerNamePrefix: githubConfig.runnerName,
+            sand: .init(version: SandVersion.current, networkPolicyHash: nil, vmName: vmName)
+        )
+        let issued = try await Runner.allocateWithRetry(broker: broker.client, request: request, sleep: broker.sleep) { [logger] message in
+            logger.info(message)
+        }
+        guard let jitConfig = issued.jitConfig, !jitConfig.isEmpty else {
+            // Lost on an idempotent replay: release and ask again on the next iteration.
+            _ = try? await broker.client.release(allocationId: issued.allocationId, ReleaseRequest(reason: .unused, detail: "jit_config missing"))
+            throw BrokerClientError.invalidResponse
+        }
+        // The JIT config is kept out of the controller, the relay and every log line.
+        let allocation: Allocation = {
+            var copy = issued
+            copy.jitConfig = nil
+            return copy
+        }()
+        logger.info("broker allocation \(allocation.allocationId): runner \(allocation.runner.name) (id \(allocation.runner.id)) labels \((allocation.runner.labels ?? []).joined(separator: ",")), expires \(allocation.expiresAt)")
+        let controller = AdmissionController(
+            allocation: allocation, deviceId: broker.deviceId, audit: broker.audit,
+            kill: Runner.admissionKillAction(control: control, shutdownCoordinator: shutdownCoordinator, logger: logger) { message in
+                await healthCheckState.markFailed(message: message)
+            }
+        )
+        await shutdownCoordinator.setDeregistration(withReason: { [logger, client = broker.client] reason in
+            guard let release = await controller.takeRelease(cleanupReason: reason) else { return }
+            do {
+                let result = try await client.release(allocationId: allocation.allocationId, release)
+                logger.info("released broker allocation \(allocation.allocationId) (\(release.reason.rawValue)): \(result.state.rawValue), runner deleted \(result.runnerDeleted)")
+            } catch {
+                logger.warning("failed to release broker allocation \(allocation.allocationId): \(error)")
+            }
+        })
+        return BrokerAllocationContext(allocation: allocation, jitConfig: jitConfig, controller: controller)
+    }
+
+    /// Broker mode, step 2: start the per-VM admission relay and its reverse
+    /// tunnel, install the job-started hook, and run the runner with the
+    /// assignment verifier watching. A deny from either side kills the VM.
+    private func runBrokerProvisioner(
+        _ context: BrokerAllocationContext,
+        ssh: SSHClient,
+        healthCheckState: HealthCheckState,
+        egress: GuestEgressEnv?,
+        stopHealthCheck: () async -> Void
+    ) async throws {
+        guard let broker else { throw RunnerError.missingBroker }
+        let allocation = context.allocation
+        let jitConfig = context.jitConfig
+        let controller = context.controller
+        let secrets = [jitConfig, allocation.nonce]
+        let relay = AdmissionRelay(controller: controller, broker: broker.client, vmName: vmName)
+        var tunnel: ProcessHandle?
+        func teardown() async {
+            relay.stop()
+            await tunnel?.terminate()
+        }
+        do {
+            let relayPort = try await relay.start()
+            let handle = try ssh.startReverseTunnel(remotePort: NetworkPolicy.guestAdmissionPort, localPort: relayPort)
+            tunnel = handle
+            try await ReverseTunnel.waitUntilReady(
+                ssh: ssh, tunnel: handle, guestPort: NetworkPolicy.guestAdmissionPort,
+                timeout: network.tunnelReadyTimeout, logger: logger, label: "admission relay tunnel"
+            )
+            try await installRunnerTarball(ssh: ssh, authToken: nil)
+        } catch {
+            await teardown()
+            await stopHealthCheck()
+            await shutdownCoordinator.cleanup(reason: "admission relay setup failed")
+            throw error
+        }
+        let commands: [GuestCommand]
+        do {
+            commands = try provisioner.brokerScript(allocation: allocation, jitConfig: jitConfig, egress: egress)
+        } catch {
+            await teardown()
+            await stopHealthCheck()
+            await shutdownCoordinator.cleanup(reason: "admission hook generation failed")
+            throw error
+        }
+        let verifier = AssignmentVerifier(
+            controller: controller, broker: broker.client,
+            deadlineSeconds: TimeInterval(allocation.admission.deadlineSeconds),
+            workerProbe: { [ssh] in
+                // GitHub-independent: a Worker with no admission means the hook did not gate the job.
+                let output = try await ssh.exec(command: AssignmentVerifier.workerProbeCommand)?.stdout ?? ""
+                return try AssignmentVerifier.parseWorkerProbe(output)
+            },
+            sleep: broker.sleep,
+            warn: { [logger] in logger.warning($0) }
+        )
+        let verifierTask = Task { await verifier.run() }
+        let outcome = await runProvisionerCommands(commands, ssh: ssh, healthCheckState: healthCheckState, secrets: secrets)
+        verifierTask.cancel()
+        await teardown()
+        await controller.waitForTeardown()
+        if await controller.wasKilled {
+            iterationFlags.markDenied()
+            await scheduleRestart(reason: .admissionDenied)
+            await stopHealthCheck()
+            await shutdownCoordinator.cleanup(reason: "admission denied")
+            return
+        }
+        switch outcome {
+        case .completed:
+            await controller.markCompleted()
+            logger.warning("github provisioner completed; runner exited, restarting VM")
+            await scheduleRestart(reason: .provisionerExited)
+            await stopHealthCheck()
+            await shutdownCoordinator.cleanup(reason: "provisioner exited")
+        case let .failed(error):
+            let handled = await handleStageFailure(error, stage: "provisioner", healthCheckState: healthCheckState)
+            await stopHealthCheck()
+            await shutdownCoordinator.cleanup(reason: "provisioner failed")
+            if !handled { throw error }
+        case let .healthCheckFailed(message):
+            await scheduleRestart(reason: .healthCheckFailed(message))
+            await stopHealthCheck()
+            await shutdownCoordinator.cleanup(reason: "health check failed: \(message)")
+        }
+    }
+
+    /// Asks the broker for an allocation, waiting out `409 no_eligible_demand`
+    /// and `429` (the VM stays booted meanwhile). Other errors are thrown.
+    static func allocateWithRetry(
+        broker: BrokerClienting,
+        request: AllocationRequest,
+        sleep: @Sendable (TimeInterval) async throws -> Void,
+        log: (String) -> Void
+    ) async throws -> Allocation {
+        while true {
+            try Task.checkCancellation()
+            do {
+                return try await broker.allocate(request)
+            } catch let error as BrokerClientError where error.isRetryLater {
+                let wait = min(max(TimeInterval(error.retryAfterSeconds ?? 30), 5), 300)
+                log("broker: \(error.code ?? "retry later"); asking again in \(Int(wait))s (VM kept warm)")
+                try await sleep(wait)
+            }
+        }
+    }
+
+    /// The shared kill path for a relay deny and a verifier kill (the
+    /// watchdog pattern): fail the health check, stop the runner command, then
+    /// destroy the VM, which also releases the allocation.
+    static func admissionKillAction(
+        control: RunnerControl,
+        shutdownCoordinator: VMShutdownCoordinator,
+        logger: Logger,
+        markFailed: @escaping @Sendable (String) async -> Void
+    ) -> AdmissionController.KillAction {
+        { reason in
+            logger.error("\(reason); stopping VM")
+            await markFailed(reason)
+            await control.terminateProvisioning()
+            await shutdownCoordinator.cleanup(reason: reason)
+        }
+    }
+
     private func applyVMConfigIfNeeded(name: String, vm: Config.VM) async throws {
         let hardware = vm.hardware
         let display: Tart.Display? = hardware?.display.map {
@@ -644,7 +841,7 @@ struct Runner: Sendable {
         )
     }
 
-    private func installRunnerTarball(ssh: SSHClient, authToken: String) async throws {
+    private func installRunnerTarball(ssh: SSHClient, authToken: String?) async throws {
         let platform = try await resolveRunnerPlatform(ssh: ssh)
         let directory = config.vm.cache?.hostPath ?? Config.expandPath(Config.Cache.defaultHostPath)
         try ensureDirectoryExists(directory)
@@ -931,8 +1128,17 @@ struct Runner: Sendable {
         healthCheckState: HealthCheckState,
         secrets: [String] = []
     ) async -> ProvisionerSequenceOutcome {
+        await runProvisionerCommands(commands.map { GuestCommand($0) }, ssh: ssh, healthCheckState: healthCheckState, secrets: secrets)
+    }
+
+    private func runProvisionerCommands(
+        _ commands: [GuestCommand],
+        ssh: SSHClient,
+        healthCheckState: HealthCheckState,
+        secrets: [String] = []
+    ) async -> ProvisionerSequenceOutcome {
         for command in commands {
-            let outcome = await runProvisionerCommand(command, ssh: ssh, healthCheckState: healthCheckState, secrets: secrets)
+            let outcome = await runProvisionerCommand(command.command, stdin: command.stdin, ssh: ssh, healthCheckState: healthCheckState, secrets: secrets)
             switch outcome {
             case .completed:
                 continue
@@ -947,6 +1153,7 @@ struct Runner: Sendable {
 
     private func runProvisionerCommand(
         _ command: String,
+        stdin: String? = nil,
         ssh: SSHClient,
         healthCheckState: HealthCheckState,
         secrets: [String]
@@ -959,7 +1166,7 @@ struct Runner: Sendable {
                 let commandLabel = commandSummary(displayCommand)
                 let labeledCommand = commandLabel.isEmpty ? "provisioner command" : "provisioner command (\(commandLabel))"
                 logger.debug("\(labeledCommand) starting (attempt \(attempt + 1))")
-                let handle = try ssh.start(command: command)
+                let handle = try ssh.start(command: command, stdin: stdin)
                 await control.setProvisioningHandle(handle)
                 logger.debug("\(labeledCommand) started; awaiting completion or healthCheck failure")
                 let outcome = await awaitProvisionerCommand(handle: handle, healthCheckState: healthCheckState)
@@ -1192,7 +1399,8 @@ struct Runner: Sendable {
         guard !firstToken.isEmpty else {
             return false
         }
-        return firstToken.hasSuffix("actions-runner/run.sh")
+        // Plain, or the last word of a broker-mode `... ~/actions-runner/run.sh`.
+        return firstToken.hasSuffix("actions-runner/run.sh") || trimmed.hasSuffix("~/actions-runner/run.sh")
     }
 
     private func logRunOptions(name: String, options: Tart.RunOptions) {
@@ -1375,5 +1583,36 @@ private actor EnforcementFailureCounter {
 
     func reset() {
         count = 0
+    }
+}
+
+/// An issued allocation for one VM; `jitConfig` is secret and is only ever
+/// passed to the guest through `ACTIONS_RUNNER_INPUT_JITCONFIG`.
+private struct BrokerAllocationContext: Sendable {
+    let allocation: Allocation
+    let jitConfig: String
+    let controller: AdmissionController
+}
+
+/// Device-side broker dependencies for one runner slot.
+struct BrokerRuntime: Sendable {
+    let client: BrokerClienting
+    let deviceId: String
+    var audit: AdmissionAudit = .silent
+    var sleep: @Sendable (TimeInterval) async throws -> Void = { try await Task.sleep(nanoseconds: UInt64(max(0, $0) * 1_000_000_000)) }
+}
+
+/// Per-iteration flags set deep in the stages and read by `runOnce`.
+private final class IterationFlags: @unchecked Sendable {
+    private let lock = NSLock()
+    private var denied = false
+
+    func markDenied() { lock.withLock { denied = true } }
+
+    func takeDenied() -> Bool {
+        lock.withLock {
+            defer { denied = false }
+            return denied
+        }
     }
 }

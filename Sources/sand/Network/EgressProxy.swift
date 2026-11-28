@@ -747,7 +747,7 @@ private final class ProxySession: @unchecked Sendable {
 
 /// Guards a continuation that several state callbacks may try to resume.
 /// Only touched from the proxy's serial queue.
-private final class ResumeOnce: @unchecked Sendable {
+final class ResumeOnce: @unchecked Sendable {
     private var done = false
 
     func claim() -> Bool {

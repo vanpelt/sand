@@ -3,7 +3,7 @@ import Foundation
 actor VMShutdownCoordinator {
     private var activeName: String?
     private var cleanupTask: Task<Void, Never>?
-    private var deregistration: (@Sendable () async -> Void)?
+    private var deregistration: (@Sendable (_ reason: String) async -> Void)?
     private let destroyer: VMDestroyer
     private let logger: Logger
 
@@ -25,7 +25,20 @@ actor VMShutdownCoordinator {
     }
 
     func setDeregistration(_ action: @escaping @Sendable () async -> Void) {
+        deregistration = { _ in await action() }
+    }
+
+    /// Like `setDeregistration`, but the action learns the cleanup reason
+    /// (for example "signal shutdown"), which broker mode reports on release.
+    func setDeregistration(withReason action: @escaping @Sendable (_ reason: String) async -> Void) {
         deregistration = action
+    }
+
+    /// VMs whose delete failed after every retry (for callers and tests).
+    private(set) var destroyFailures: [String] = []
+
+    private func recordDestroyFailure(_ name: String) {
+        destroyFailures.append(name)
     }
 
     func cleanup(reason: String? = nil) async {
@@ -40,9 +53,15 @@ actor VMShutdownCoordinator {
             return
         }
         logger.info("cleanup start for VM \(name) (reason: \(reasonLabel))")
-        let task = Task { [destroyer, deregistration] in
-            _ = try? await destroyer.destroy(name: name)
-            await deregistration?()
+        let task = Task { [destroyer, deregistration, logger] in
+            do {
+                try await destroyer.destroy(name: name)
+            } catch {
+                // Never silent: the VM may still hold a job's credentials.
+                logger.error("VM DESTROY FAILED for \(name) after retries: \(error); delete it by hand (tart delete \(name))")
+                self.recordDestroyFailure(name)
+            }
+            await deregistration?(reasonLabel)
         }
         cleanupTask = task
         await task.value

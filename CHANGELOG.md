@@ -20,6 +20,12 @@
 
 ### Added
 
+- Broker mode (`provisioner.config.broker`) with job admission: JIT runners
+  from the Sand broker, a guest job-started hook behind a per-VM host relay,
+  a host assignment verifier and `sand.audit.v1` admission events
+  (ADR 0001, `docs/broker-api.md`).
+- `sand broker keygen` and the development-only `sand broker mock`.
+
 - `profile: offline`, built-in `presets`, `allowedDomains`, `allowedCIDRs`
   (reviewed direct allows) and `verify: basic|strict`.
 - Guest egress verification before registration, an enforcement watchdog,

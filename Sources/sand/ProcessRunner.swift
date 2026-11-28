@@ -234,6 +234,8 @@ protocol ProcessRunning: Sendable {
     /// `environment` replaces the child's environment when non-nil.
     func run(executable: String, arguments: [String], wait: Bool, environment: [String: String]?) async throws -> ProcessResult?
     func start(executable: String, arguments: [String], environment: [String: String]?) throws -> ProcessHandle
+    /// Like `start`, writing `stdin` to the child's standard input and closing it.
+    func start(executable: String, arguments: [String], environment: [String: String]?, stdin: Data?) throws -> ProcessHandle
 }
 
 extension ProcessRunning {
@@ -244,6 +246,11 @@ extension ProcessRunning {
 
     func start(executable: String, arguments: [String], environment: [String: String]?) throws -> ProcessHandle {
         try start(executable: executable, arguments: arguments)
+    }
+
+    // Fakes that do not care about stdin drop it.
+    func start(executable: String, arguments: [String], environment: [String: String]?, stdin: Data?) throws -> ProcessHandle {
+        try start(executable: executable, arguments: arguments, environment: environment)
     }
 }
 
@@ -265,6 +272,10 @@ struct SystemProcessRunner: ProcessRunning, Sendable {
     }
 
     func start(executable: String, arguments: [String], environment: [String: String]?) throws -> ProcessHandle {
+        try start(executable: executable, arguments: arguments, environment: environment, stdin: nil)
+    }
+
+    func start(executable: String, arguments: [String], environment: [String: String]?, stdin: Data?) throws -> ProcessHandle {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         if let environment {
@@ -276,7 +287,19 @@ struct SystemProcessRunner: ProcessRunning, Sendable {
         let stderrPipe = Pipe()
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
+        let stdinPipe = stdin.map { _ in Pipe() }
+        if let stdinPipe {
+            process.standardInput = stdinPipe
+        }
         try process.run()
+        if let stdin, let stdinPipe {
+            // Written off the caller's thread: a pipe holds only ~64 KiB.
+            let writer = stdinPipe.fileHandleForWriting
+            DispatchQueue.global(qos: .userInitiated).async {
+                try? writer.write(contentsOf: stdin)
+                try? writer.close()
+            }
+        }
         return ProcessHandle(process: process, stdoutPipe: stdoutPipe, stderrPipe: stderrPipe, command: command)
     }
 }
