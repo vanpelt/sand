@@ -294,13 +294,14 @@ struct DirectCIDRAllow: Decodable, Sendable, Hashable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        try StrictKeys.reject(in: decoder, known: CodingKeys.allCases.map(\.rawValue), path: "vm.run.network.allowedCIDRs[]")
         cidr = try container.decode(String.self, forKey: .cidr)
         port = try container.decode(Int.self, forKey: .port)
         proto = try container.decodeIfPresent(SoftnetProto.self, forKey: .proto) ?? .tcp
         allowPrivate = try container.decodeIfPresent(Bool.self, forKey: .allowPrivate) ?? false
     }
 
-    private enum CodingKeys: String, CodingKey {
+    private enum CodingKeys: String, CodingKey, CaseIterable {
         case cidr, port, proto, allowPrivate
     }
 }

@@ -7,8 +7,9 @@ import Foundation
 /// safely installed privileged softnet exists, otherwise hostOnly), `hostOnly`
 /// (tart `--net-host`, no root) or `softnet` (needs a privileged softnet binary).
 ///
-/// An omitted `network` key means `profile: github`. Unrestricted shared NAT is
-/// only available by writing `mode: shared` explicitly.
+/// An omitted `network` key, or a block that sets only options (for example
+/// just `tlsInspection`), means `profile: github`. Unknown keys are rejected.
+/// Unrestricted shared NAT is only available by writing `mode: shared` explicitly.
 struct NetworkConfig: Decodable, Sendable, Equatable {
     enum Profile: String, Sendable, CaseIterable {
         /// No direct guest egress plus the host-side allowlisting CONNECT proxy.
@@ -147,6 +148,7 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        try StrictKeys.reject(in: decoder, known: Self.knownKeys, path: "vm.run.network")
         let profileName = try container.decodeIfPresent(String.self, forKey: .profile)
         let modeName = try container.decodeIfPresent(String.self, forKey: .mode)
         switch (profileName, modeName) {
@@ -156,12 +158,10 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
                 debugDescription: "vm.run.network: set either profile or mode, not both"
             )
         case (nil, nil):
-            // An explicit network block must say what it wants; never silently
-            // fall back to anything because a key was misspelled or omitted.
-            throw DecodingError.dataCorruptedError(
-                forKey: .profile, in: container,
-                debugDescription: "vm.run.network: an explicit network block must specify profile (\(Profile.allCases.map(\.rawValue).joined(separator: "|"))) or mode (\(Mode.allCases.map(\.rawValue).joined(separator: "|")))"
-            )
+            // A block that only sets options (tlsInspection, backend, ...) means
+            // the default secure profile. Misspelled keys are refused above, so
+            // a typo such as `profle: offline` can never land here silently.
+            selection = .profile(.github)
         case let (profile?, nil):
             guard let value = Profile(rawValue: profile) else {
                 throw DecodingError.dataCorruptedError(
@@ -223,7 +223,11 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
         return value
     }
 
-    private enum CodingKeys: String, CodingKey {
+    /// Every key `vm.run.network` accepts. Anything else is a decoding error,
+    /// so a misspelled option never silently falls back to a default.
+    static var knownKeys: [String] { CodingKeys.allCases.map(\.rawValue) }
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
         case profile, mode, presets, allowedDomains, allowedCIDRs, allowCIDRs, verify, allowGitHubSSH, transport
         case backend, softnetPath, softnetSHA256, hostListeners, acceptedHostListeners, tlsInspection, ipForwarding, maxEnforcementFailures
     }
@@ -400,5 +404,27 @@ enum DirectCIDRError: Error, Equatable, CustomStringConvertible {
         case let .privateRange(cidr):
             return "allowedCIDRs entry \(cidr) overlaps a private, loopback, link-local, CGNAT or multicast range; set allowPrivate: true only after review"
         }
+    }
+}
+
+/// Refuses keys a config block does not define, so a misspelled option is an
+/// error instead of a silently ignored line.
+enum StrictKeys {
+    static func reject(in decoder: Decoder, known: [String], path: String) throws {
+        let raw = try decoder.container(keyedBy: AnyKey.self)
+        let knownSet = Set(known)
+        let unknown = raw.allKeys.map(\.stringValue).filter { !knownSet.contains($0) }.sorted()
+        guard let first = unknown.first, let key = AnyKey(stringValue: first) else { return }
+        throw DecodingError.dataCorruptedError(
+            forKey: key, in: raw,
+            debugDescription: "\(path): unknown key\(unknown.count == 1 ? "" : "s") \(unknown.map { "'\($0)'" }.joined(separator: ", ")) (expected one of \(known.joined(separator: ", ")))"
+        )
+    }
+
+    private struct AnyKey: CodingKey {
+        let stringValue: String
+        var intValue: Int? { nil }
+        init?(stringValue: String) { self.stringValue = stringValue }
+        init?(intValue: Int) { nil }
     }
 }

@@ -72,12 +72,54 @@ private func vm(network: NetworkConfig, noClipboard: Bool = true, nested: Bool =
         }
     }
 
-    @Test func emptyNetworkBlockIsAnError() {
+    @Test(arguments: ["{}", "{ tlsInspection: trustHostCA }", "{ backend: hostOnly, hostListeners: deny }"])
+    func optionsOnlyNetworkBlockMeansTheGitHubProfile(block: String) throws {
+        let vm = try loadRun("""
+              run:
+                network: \(block)
+        """)
+        #expect(vm.run.network.profile == .github)
+        #expect(vm.run.network.mode == nil)
+        let policy = try vm.run.network.compile()
+        #expect(policy.egress != nil)
+        #expect(!validationMessages(vm).contains { $0.severity == .error })
+    }
+
+    @Test func optionsOnlyBlockKeepsItsOptions() throws {
+        let vm = try loadRun("""
+              run:
+                network:
+                  tlsInspection: trustHostCA
+                  backend: softnet
+        """)
+        #expect(vm.run.network.profile == .github)
+        #expect(vm.run.network.tlsInspection == .trustHostCA)
+        #expect(vm.run.network.backend == .softnet)
+        #expect(try vm.run.network.compile().options.tlsInspection == .trustHostCA)
+    }
+
+    @Test(arguments: [
+        "profle: offline", "tlsInspecton: trustHostCA", "Profile: github", "profile: github, allowedDomain: [example.com]",
+        "allowedCIDRs: [{ cidr: 203.0.113.10/32, port: 443, allowPrivat: true }]"
+    ])
+    func unknownNetworkKeyIsAnError(body: String) {
         #expect(throws: (any Error).self) {
             try loadRun("""
                   run:
-                    network: {}
+                    network: { \(body) }
             """)
+        }
+    }
+
+    @Test func unknownKeyErrorNamesTheKey() {
+        do {
+            _ = try loadRun("""
+                  run:
+                    network: { profle: offline }
+            """)
+            Issue.record("expected a decoding error")
+        } catch {
+            #expect("\(error)".contains("profle"))
         }
     }
 

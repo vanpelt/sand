@@ -163,6 +163,9 @@ vm:
 ```
 
 - **No `network` key** is the same as `profile: github` with `backend: auto`.
+  So is a block that sets only options and neither `profile` nor `mode`, for
+  example `network: { tlsInspection: trustHostCA }`: it is the github profile
+  with that option.
 - **`backend`** applies to profiles:
   - `auto` (default) uses softnet when it is installed where only root can
     replace it (P12), new enough (P2) and privileged (P3), and hostOnly
@@ -228,9 +231,12 @@ vm:
 
 Validation rules:
 
-- Setting both `profile` and `mode` is an error, and so is an empty
-  `network: {}`. An unknown profile, mode, preset, backend, `hostListeners`,
-  `tlsInspection` or `ipForwarding` value is also an error.
+- Setting both `profile` and `mode` is an error. An unknown key (for
+  example `profle: offline` or `tlsInspecton: trustHostCA`, also inside an
+  `allowedCIDRs` entry) is an error that names the key, so a typo never falls
+  back to the default profile silently. An unknown profile, mode, preset,
+  backend, `hostListeners`, `tlsInspection` or `ipForwarding` value is also an
+  error. `network: {}` is the default github profile.
 - `backend`, `hostListeners`, `acceptedHostListeners`, `tlsInspection` and
   `ipForwarding` require a profile; `tlsInspection` requires `profile: github`.
   `maxEnforcementFailures` must be 1-100 and is rejected with `mode: shared`.
