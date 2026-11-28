@@ -23,6 +23,10 @@ runners:
         noClipboard: false
         nested: false
         rootDiskOpts: null
+        # Host mounts and the clipboard need unrestricted shared NAT; this is an
+        # explicit opt-out of the secure default and logs a warning on every boot.
+        network:
+          mode: shared
       diskSizeGb: null
       ssh:
         user: admin
@@ -50,6 +54,34 @@ runners:
         image: "ghcr.io/cirruslabs/ubuntu:latest"
       cache:
         host: ~/.cache/sand/actions-runner
+      run:
+        noGraphics: true
+        # Omitting network is the same as profile: github. Written out in full here.
+        network:
+          profile: github          # github (default) | offline
+          presets: [npm, pypi]     # extra built-in domain bundles
+          allowedDomains:          # user additions; port defaults to 443
+            - registry.example-artifacts.com
+            - "*.cdn.example.com"
+            - "git.example.org:8443"
+          allowGitHubSSH: false    # reserved; HTTPS checkout only
+          verify: basic            # basic (default) | strict
+          transport: tunnel        # tunnel (default); gateway is reserved
+          backend: softnet         # auto (default: managed softnet if safely installed, else hostOnly) | hostOnly (no root) | softnet (privileged softnet)
+          softnetPath: /usr/local/libexec/sand/softnet  # optional; default: this managed path, then PATH. Must be root-owned all the way up (P12)
+          softnetSHA256: 2ea5572268f814317bc3944d1352032f1f4dafe00bfe453eefc64e9dc32627a3  # optional pin (softnet 0.26.0), checked before every VM (P13)
+          hostListeners: warn      # hostOnly only: warn (default) | deny host services reachable on the bridge
+          acceptedHostListeners: []  # with deny: accepted exposures, e.g. [tcp/7000, udp/5353, udp/*]
+          tlsInspection: fail      # fail (default) | trustHostCA: trust the host's TLS-inspection CA in the guest
+          maxEnforcementFailures: 3  # consecutive enforcement failures before sand run exits 78
+          quietOSBackground: true  # default: deny macOS background endpoints quietly (debug log, counted); false logs them as warnings
+          quietDenies:             # extra names whose denies are logged at debug and counted (still denied)
+            - "*.telemetry.example.com"
+          requireSteering: false   # default; true refuses steered GitHub names that resolve only to public addresses
+          allowedCIDRs:            # expert escape hatch (softnet backend only): direct allows that bypass the proxy
+            - cidr: 203.0.113.10/32
+              port: 443
+              proto: tcp
       ssh:
         user: admin
         password: admin

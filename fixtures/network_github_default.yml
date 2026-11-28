@@ -1,0 +1,22 @@
+# Zero-config secure networking: no vm.run.network key is the same as
+# `network: { profile: github, backend: auto }`. The guest reaches only GitHub
+# (plus the github preset's CDN/blob hosts) through Sand's host-side
+# allowlisting HTTPS proxy over an SSH reverse tunnel.
+# backend auto: on a managed Mac with a root-owned privileged softnet at
+# /usr/local/libexec/sand/softnet (deploy/jamf/install-managed-softnet.sh) the
+# VM gets softnet deny-all (host-service and peer-VM isolation too). Anywhere
+# else it gets Tart's host-only network (`--net-host`, no root), which needs
+# host IP forwarding off (preflight P11). No per-user setup either way.
+runners:
+  - name: secure-default
+    vm:
+      source:
+        type: oci
+        image: ghcr.io/cirruslabs/macos-runner:golden-gate
+    provisioner:
+      type: github
+      config:
+        appId: 123456
+        organization: my-org
+        privateKeyKeychainLabel: sand-github-app
+        runnerName: secure-default

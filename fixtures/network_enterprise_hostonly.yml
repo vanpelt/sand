@@ -1,0 +1,32 @@
+# Enterprise laptop/Mac mini without root: the hostOnly backend pinned explicitly
+# (tart --net-host) plus the opt-ins an endpoint-managed host typically needs.
+# `sand network preflight --config <this file>` shows what this host detects.
+runners:
+  - name: enterprise-hostonly
+    vm:
+      source:
+        type: oci
+        image: ghcr.io/cirruslabs/macos-runner:golden-gate
+      run:
+        network:
+          profile: github
+          backend: hostOnly          # pinned (the default auto would use a managed softnet); needs no root
+          verify: strict
+          # Refuse the VM while host services listen on the VM bridge, except these.
+          hostListeners: deny
+          acceptedHostListeners: [udp/5353, udp/*]
+          # An endpoint agent (Netskope, Zscaler...) re-signs upstream TLS: trust only
+          # its detected CA certificate(s) in the guest. Default is fail (preflight exits 78).
+          tlsInspection: trustHostCA
+          # A guest with root can route via the host's bridge address; with host IP
+          # forwarding on (VPN clients, Internet Sharing) that bypasses the proxy.
+          # deny (default) fails preflight P11; accept runs anyway and audits it per VM.
+          ipForwarding: deny
+          maxEnforcementFailures: 3
+    provisioner:
+      type: github
+      config:
+        appId: 123456
+        organization: my-org
+        privateKeyKeychainLabel: sand-github-app
+        runnerName: enterprise-hostonly

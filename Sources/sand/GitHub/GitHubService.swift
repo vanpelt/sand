@@ -24,6 +24,11 @@ struct GitHubService: Sendable {
         let token: String
     }
 
+    struct RunnerRegistrationCredentials: Sendable {
+        let runnerToken: String
+        let installationToken: String
+    }
+
     struct RunnersResponse: Decodable {
         struct Runner: Decodable {
             let id: Int
@@ -41,10 +46,14 @@ struct GitHubService: Sendable {
     let baseURL = URL(string: "https://api.github.com")!
 
     func runnerRegistrationToken() async throws -> String {
+        try await runnerRegistrationCredentials().runnerToken
+    }
+
+    func runnerRegistrationCredentials() async throws -> RunnerRegistrationCredentials {
         let installationId = try await installationID()
         let accessToken = try await installationAccessToken(installationId: installationId)
         let tokenResponse: RunnerTokenResponse = try await request(path: registrationTokenPath(), method: "POST", token: accessToken)
-        return tokenResponse.token
+        return RunnerRegistrationCredentials(runnerToken: tokenResponse.token, installationToken: accessToken)
     }
 
     func deleteRunner(named name: String) async throws -> Bool {

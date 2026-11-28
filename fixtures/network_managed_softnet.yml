@@ -1,0 +1,25 @@
+# A Jamf-managed Mac (see deploy/jamf/README.md): IT installed softnet setuid
+# root at /usr/local/libexec/sand/softnet with a SHA-256 manifest, so the
+# default `backend: auto` picks softnet with no per-user steps. Pinning the
+# backend makes a lost or tampered managed install fail closed (exit 78)
+# instead of falling back to hostOnly; the optional SHA-256 pin is checked in
+# addition to the installer's manifest before every VM.
+runners:
+  - name: managed-softnet
+    vm:
+      source:
+        type: oci
+        image: ghcr.io/cirruslabs/macos-runner:golden-gate
+      run:
+        network:
+          profile: github
+          backend: softnet
+          softnetSHA256: 2ea5572268f814317bc3944d1352032f1f4dafe00bfe453eefc64e9dc32627a3
+          verify: strict
+    provisioner:
+      type: github
+      config:
+        appId: 123456
+        organization: my-org
+        privateKeyKeychainLabel: sand-github-app
+        runnerName: managed-softnet

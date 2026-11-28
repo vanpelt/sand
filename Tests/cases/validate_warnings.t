@@ -23,6 +23,8 @@ runners:
         user: ${SAND_E2E_SSH_USER}
         password: ${SAND_E2E_SSH_PASSWORD}
         port: ${SAND_E2E_SSH_PORT}
+      run:
+        network: { mode: shared }
       mounts:
         - host: /path/does/not/exist
           name: e2e
@@ -39,3 +41,4 @@ output=$("$SAND_BIN" validate --config "$config")
 assert_match "warning" "$output"
 assert_match "stopAfter" "$output"
 assert_match "vm.cache is set but provisioner is not github" "$output"
+assert_match "unrestricted host/LAN/VPN/corporate network reach" "$output"

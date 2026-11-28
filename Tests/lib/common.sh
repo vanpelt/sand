@@ -107,6 +107,12 @@ init_defaults() {
   export SAND_E2E_SSH_PASSWORD="${SAND_E2E_SSH_PASSWORD:-admin}"
   export SAND_E2E_SSH_PORT="${SAND_E2E_SSH_PORT:-22}"
   export SAND_E2E_RUNNER_PREFIX="${SAND_E2E_RUNNER_PREFIX:-sand-e2e}"
+  # VM-booting cases default to explicit shared NAT so they run on a host
+  # without the one-time softnet setup. Set SAND_E2E_NETWORK='{ profile: github }'
+  # to run them under the secure default instead.
+  if [ -z "${SAND_E2E_NETWORK:-}" ]; then
+    export SAND_E2E_NETWORK='{ mode: shared }'
+  fi
 }
 
 ensure_e2e_deps() {
@@ -141,6 +147,7 @@ runners:
         port: ${SAND_E2E_SSH_PORT}
       run:
         noGraphics: true
+        network: ${SAND_E2E_NETWORK}
     provisioner:
       type: script
       config:

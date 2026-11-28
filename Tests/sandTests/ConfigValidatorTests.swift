@@ -208,7 +208,7 @@ final class ConfigValidatorTests: XCTestCase {
     }
 
     func testRestrictedNetworkRequiresFailClosedSettings() {
-        let network = NetworkPolicy(mode: .restricted, allowCIDRs: ["0.0.0.0/0", "10.1.2.3/32"])
+        let network = NetworkConfig(mode: .restricted, allowCIDRs: ["0.0.0.0/0", "10.1.2.3/32"])
         let vm = Config.VM(
             source: Config.VMSource(type: .local, image: nil, name: "golden"),
             hardware: nil,

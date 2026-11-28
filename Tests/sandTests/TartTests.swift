@@ -34,7 +34,14 @@ final class MockProcessRunner: ProcessRunning, @unchecked Sendable {
 }
 
 func makeTart(_ runner: ProcessRunning) -> Tart {
-    Tart(processRunner: runner, logger: Logger(label: "tart.test", minimumLevel: .info))
+    Tart(processRunner: runner, logger: Logger(label: "tart.test", minimumLevel: .info), isExecutable: { $0.hasSuffix("/tart") })
+}
+
+/// A softnet policy as `NetworkPreflight.compile` binds it on a managed Mac.
+func boundToManagedSoftnet(_ policy: NetworkPolicy) -> NetworkPolicy {
+    var policy = policy
+    policy.host.softnet = SoftnetLocation(path: SoftnetDiscovery.managedPath, resolved: SoftnetDiscovery.managedPath, source: .managed)
+    return policy
 }
 
 final class TartTests: XCTestCase {
@@ -80,7 +87,7 @@ final class TartTests: XCTestCase {
         let options = Tart.RunOptions(
             directoryMounts: [], noAudio: true, noGraphics: true,
             noClipboard: true, nested: false,
-            network: NetworkPolicy(mode: .softnet)
+            network: boundToManagedSoftnet(try NetworkConfig(mode: .softnet).compile())
         )
         _ = try tart.run(name: "ephemeral", options: options)
         XCTAssertEqual(runner.startCalls.last?.arguments, [
@@ -94,12 +101,12 @@ final class TartTests: XCTestCase {
         let options = Tart.RunOptions(
             directoryMounts: [], noAudio: true, noGraphics: true,
             noClipboard: true, nested: false,
-            network: NetworkPolicy(mode: .restricted, allowCIDRs: ["10.42.10.25/32", "10.42.11.0/24"])
+            network: boundToManagedSoftnet(try NetworkConfig(mode: .restricted, allowCIDRs: ["10.42.10.25/32", "10.42.11.0/24"]).compile())
         )
         _ = try tart.run(name: "ephemeral", options: options)
         XCTAssertEqual(runner.startCalls.last?.arguments, [
             "run", "ephemeral", "--net-softnet", "--net-softnet-block=0.0.0.0/0",
-            "--net-softnet-allow=10.42.10.25/32,10.42.11.0/24",
+            "--net-softnet-allow=in proto tcp @host port 22,out 10.42.10.25/32,out 10.42.11.0/24",
             "--no-graphics", "--no-audio", "--no-clipboard"
         ])
     }

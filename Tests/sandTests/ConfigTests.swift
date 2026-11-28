@@ -115,7 +115,9 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(config.runners.first?.vm.source.type, .oci)
         XCTAssertEqual(config.runners.first?.vm.source.resolvedSource, "ghcr.io/acme/vm:latest")
         XCTAssertEqual(config.runners.first?.vm.run.noGraphics, true)
-        XCTAssertEqual(config.runners.first?.vm.run.noClipboard, false)
+        // No network key: the secure default profile, which also disables the clipboard.
+        XCTAssertEqual(config.runners.first?.vm.run.noClipboard, true)
+        XCTAssertEqual(config.runners.first?.vm.run.network, .secureDefault)
         XCTAssertEqual(config.runners.first?.vm.run.nested, false)
         XCTAssertNil(config.runners.first?.vm.run.rootDiskOpts)
         XCTAssertEqual(config.runners.first?.vm.ssh.user, "runner")
@@ -221,7 +223,7 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(policy.allowCIDRs, ["10.42.10.25/32"])
     }
 
-    func testNetworkBlockRequiresExplicitMode() throws {
+    func testNetworkOptionsOnlyBlockMeansGitHubProfile() throws {
         let yaml = """
         runners:
           - name: secure-vm
@@ -232,6 +234,27 @@ final class ConfigTests: XCTestCase {
               run:
                 network:
                   allowCIDRs: [10.42.10.25/32]
+            provisioner:
+              type: script
+              config:
+                run: echo ok
+        """
+        // An options-only block selects the default secure profile (d80d276).
+        let config = try Config.load(path: writeTempFile(contents: yaml).path)
+        XCTAssertEqual(config.runners.first?.vm.run.network.profile, .github)
+    }
+
+    func testNetworkBlockRejectsMisspelledMode() throws {
+        let yaml = """
+        runners:
+          - name: secure-vm
+            vm:
+              source:
+                type: local
+                name: golden
+              run:
+                network:
+                  profle: offline
             provisioner:
               type: script
               config:

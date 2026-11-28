@@ -66,24 +66,33 @@ actor ProcessHandle {
     private let command: [String]?
     private let waitAsyncBlock: (() async throws -> ProcessResult)?
     private let terminateBlock: (() -> Void)?
+    private let hasExitedBlock: (@Sendable () -> Bool)?
     private var cachedResult: Result<ProcessResult, Error>?
     private var waiters: [UUID: CheckedContinuation<ProcessResult, Error>] = [:]
     private var terminationHandlerInstalled = false
+    /// The child's pid (nil for injected fakes).
+    nonisolated let processIdentifier: Int32?
 
     init(process: Process, stdoutPipe: Pipe, stderrPipe: Pipe, command: [String]) {
         self.process = process
+        self.processIdentifier = process.processIdentifier
         self.stdoutDrain = PipeDrain(pipe: stdoutPipe)
         self.stderrDrain = PipeDrain(pipe: stderrPipe)
         self.command = command
         self.waitAsyncBlock = nil
         self.terminateBlock = nil
+        self.hasExitedBlock = nil
     }
 
     init(
         waitAsync: @escaping () async throws -> ProcessResult,
-        terminate: @escaping () -> Void
+        terminate: @escaping () -> Void,
+        hasExited: (@Sendable () -> Bool)? = nil,
+        processIdentifier: Int32? = nil
     ) {
         self.process = nil
+        self.processIdentifier = processIdentifier
+        self.hasExitedBlock = hasExited
         self.stdoutDrain = nil
         self.stderrDrain = nil
         self.command = nil
@@ -125,6 +134,7 @@ actor ProcessHandle {
 
     func hasExited() -> Bool {
         if let process { return !process.isRunning }
+        if let hasExitedBlock { return hasExitedBlock() }
         return cachedResult != nil
     }
 
@@ -221,20 +231,45 @@ enum ProcessRunnerError: Error, CustomStringConvertible {
 protocol ProcessRunning: Sendable {
     func run(executable: String, arguments: [String], wait: Bool) async throws -> ProcessResult?
     func start(executable: String, arguments: [String]) throws -> ProcessHandle
+    /// `environment` replaces the child's environment when non-nil.
+    func run(executable: String, arguments: [String], wait: Bool, environment: [String: String]?) async throws -> ProcessResult?
+    func start(executable: String, arguments: [String], environment: [String: String]?) throws -> ProcessHandle
+}
+
+extension ProcessRunning {
+    // Fakes that do not care about the environment only implement the two-argument forms.
+    func run(executable: String, arguments: [String], wait: Bool, environment: [String: String]?) async throws -> ProcessResult? {
+        try await run(executable: executable, arguments: arguments, wait: wait)
+    }
+
+    func start(executable: String, arguments: [String], environment: [String: String]?) throws -> ProcessHandle {
+        try start(executable: executable, arguments: arguments)
+    }
 }
 
 struct SystemProcessRunner: ProcessRunning, Sendable {
     func run(executable: String, arguments: [String], wait: Bool) async throws -> ProcessResult? {
-        let handle = try start(executable: executable, arguments: arguments)
+        try await run(executable: executable, arguments: arguments, wait: wait, environment: nil)
+    }
+
+    func start(executable: String, arguments: [String]) throws -> ProcessHandle {
+        try start(executable: executable, arguments: arguments, environment: nil)
+    }
+
+    func run(executable: String, arguments: [String], wait: Bool, environment: [String: String]?) async throws -> ProcessResult? {
+        let handle = try start(executable: executable, arguments: arguments, environment: environment)
         guard wait else {
             return nil
         }
         return try await handle.waitAsync()
     }
 
-    func start(executable: String, arguments: [String]) throws -> ProcessHandle {
+    func start(executable: String, arguments: [String], environment: [String: String]?) throws -> ProcessHandle {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        if let environment {
+            process.environment = environment
+        }
         let command = [executable] + arguments
         process.arguments = command
         let stdoutPipe = Pipe()

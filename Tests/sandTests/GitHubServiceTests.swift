@@ -40,6 +40,18 @@ final class GitHubServiceTests: XCTestCase {
         ])
     }
 
+
+    func testRegistrationCredentialsIncludeInstallationToken() async throws {
+        let session = MockSession()
+        session.responses["/repos/org/repo/installation"] = (Data("{\"id\":1}".utf8), 200)
+        session.responses["/app/installations/1/access_tokens"] = (Data("{\"token\":\"access\"}".utf8), 200)
+        session.responses["/repos/org/repo/actions/runners/registration-token"] = (Data("{\"token\":\"runner\"}".utf8), 200)
+        let service = GitHubService(auth: MockAuth(), session: session, organization: "org", repository: "repo")
+        let credentials = try await service.runnerRegistrationCredentials()
+        XCTAssertEqual(credentials.runnerToken, "runner")
+        XCTAssertEqual(credentials.installationToken, "access")
+    }
+
     func testDeleteRunnerLooksUpByNameThenDeletes() async throws {
         let session = MockSession()
         session.responses["/orgs/org/installation"] = (Data("{\"id\":1}".utf8), 200)
