@@ -6,6 +6,7 @@ on:
   push:
     branches:
       - feature/keychain-github-app-signing
+      - feature/enterprise-network-egress
 
 permissions:
   contents: read
