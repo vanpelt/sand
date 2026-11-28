@@ -34,6 +34,13 @@ actor VMShutdownCoordinator {
         deregistration = action
     }
 
+    /// VMs whose delete failed after every retry (for callers and tests).
+    private(set) var destroyFailures: [String] = []
+
+    private func recordDestroyFailure(_ name: String) {
+        destroyFailures.append(name)
+    }
+
     func cleanup(reason: String? = nil) async {
         let reasonLabel = reason ?? "unspecified"
         if let cleanupTask {
@@ -46,8 +53,14 @@ actor VMShutdownCoordinator {
             return
         }
         logger.info("cleanup start for VM \(name) (reason: \(reasonLabel))")
-        let task = Task { [destroyer, deregistration] in
-            _ = try? await destroyer.destroy(name: name)
+        let task = Task { [destroyer, deregistration, logger] in
+            do {
+                try await destroyer.destroy(name: name)
+            } catch {
+                // Never silent: the VM may still hold a job's credentials.
+                logger.error("VM DESTROY FAILED for \(name) after retries: \(error); delete it by hand (tart delete \(name))")
+                self.recordDestroyFailure(name)
+            }
             await deregistration?(reasonLabel)
         }
         cleanupTask = task

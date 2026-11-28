@@ -57,7 +57,7 @@ enum AdmissionHook {
     sand_body=$(printf '{"allocation_id":"%s","nonce":"%s","hints":{"repository_id":%s,"run_id":%s,"run_attempt":%s,"runner_name":"%s","job_key":"%s"}}' \
       "$SAND_ALLOCATION_ID" "$SAND_NONCE" "$GITHUB_REPOSITORY_ID" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$RUNNER_NAME" "$sand_job")
 
-    sand_verdict=$(/usr/bin/curl --silent --noproxy '*' --max-time 60 --connect-timeout 5 \
+    sand_verdict=$(/usr/bin/curl -q --silent --proto '=http' --noproxy '*' --max-time @@CURL_MAX_TIME@@ --connect-timeout 5 \
       -H 'Content-Type: application/json' --data-binary "$sand_body" "$SAND_RELAY" 2>/dev/null)
 
     if [ "$sand_verdict" = "allow" ]; then
@@ -86,15 +86,33 @@ enum AdmissionHook {
             .replacingOccurrences(of: "@@ALLOCATION_ID@@", with: allocationId)
             .replacingOccurrences(of: "@@NONCE@@", with: nonce)
             .replacingOccurrences(of: "@@RELAY_PORT@@", with: String(relayPort))
+            .replacingOccurrences(of: "@@CURL_MAX_TIME@@", with: String(AdmissionTimeouts.hookCurlSeconds))
             .replacingOccurrences(of: "@@KILL_COMMAND@@", with: killCommand)
             .replacingOccurrences(of: "@@BLOCK_COMMAND@@", with: blockCommand)
     }
 
     /// Guest commands that install the hook read-only, outside `actions-runner`.
-    static func installCommands(script: String) -> [String] {
+    /// The script (it holds the nonce) travels on the SSH session's stdin, never
+    /// in a process argument on the host or in the guest.
+    static func installCommands(script: String) -> [GuestCommand] {
         [
-            "mkdir -p \"$HOME/.sand/hooks\" && chmod 0755 \"$HOME/.sand/hooks\" && rm -f \"$HOME/.sand/hooks/job-started.sh\"",
-            "printf '%s' \(GitHubProvisioner.shellQuote(script)) > \"$HOME/.sand/hooks/job-started.sh\" && chmod 0555 \"$HOME/.sand/hooks/job-started.sh\" && chmod 0555 \"$HOME/.sand/hooks\""
+            GuestCommand("mkdir -p \"$HOME/.sand/hooks\" && chmod 0755 \"$HOME/.sand/hooks\" && rm -f \"$HOME/.sand/hooks/job-started.sh\""),
+            GuestCommand(
+                "umask 077 && /bin/cat > \"$HOME/.sand/hooks/job-started.sh\" && chmod 0555 \"$HOME/.sand/hooks/job-started.sh\" && chmod 0555 \"$HOME/.sand/hooks\"",
+                stdin: script
+            )
         ]
+    }
+}
+
+/// One guest command, optionally with data for its stdin (secrets travel
+/// there rather than in `ssh` arguments, which `ps` shows to every local user).
+struct GuestCommand: Sendable, Equatable {
+    let command: String
+    var stdin: String?
+
+    init(_ command: String, stdin: String? = nil) {
+        self.command = command
+        self.stdin = stdin
     }
 }

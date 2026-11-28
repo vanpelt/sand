@@ -17,14 +17,14 @@ struct BrokerKeygenCommand: AsyncParsableCommand {
         abstract: "Create a P-256 device key (<out>/<device-id>.key.pem, mode 0600) and its public key."
     )
 
-    @Option(name: .long, help: "Device id (^[a-z0-9][a-z0-9-]{0,62}$).")
+    @Option(name: .long, help: "Device id (^[a-z0-9][a-z0-9-]{0,49}$).")
     var deviceId: String
     @Option(name: .long, help: "Output directory.")
     var out: String = "~/.sand/broker"
 
     mutating func run() async throws {
         guard BrokerConfig.isValidDeviceId(deviceId) else {
-            throw ValidationError("--device-id must match ^[a-z0-9][a-z0-9-]{0,62}$")
+            throw ValidationError("--device-id must match ^[a-z0-9][a-z0-9-]{0,49}$")
         }
         let key = DeviceKey.generate()
         let paths = try key.save(directory: out, deviceId: deviceId)
@@ -51,7 +51,12 @@ struct MockBrokerCommand: AsyncParsableCommand {
     @OptionGroup
     var logLevel: LogLevelOptions
 
+    static let enableVariable = "SAND_DEVELOPMENT_BROKER"
+
     mutating func run() async throws {
+        guard ProcessInfo.processInfo.environment[Self.enableVariable] == "1" else {
+            throw ValidationError("sand broker mock is development only; set \(Self.enableVariable)=1 to run it.")
+        }
         let level = logLevel.resolvedLevel()
         let logger = Logger(label: "broker.mock", minimumLevel: level, sink: try logLevel.makeLogFileSink())
         let config = try MockBrokerConfig.load(path: config)
@@ -79,6 +84,20 @@ struct MockBrokerCommand: AsyncParsableCommand {
             logger.info("audit \(line)")
             auditFile?.writeLine(line)
         })
+        // Sign the first App JWT now: an unanswered Keychain prompt or a bad
+        // key fails here, not inside the first allocation request.
+        FileHandle.standardError.write(Data("sand broker mock: signing a GitHub App JWT (approve the Keychain prompt if one appears)...\n".utf8))
+        do {
+            _ = try await store.warmUp()
+        } catch let error as BrokerAPIError {
+            throw ValidationError("mock broker could not reach GitHub as the App (\(error.code): \(error.message)). If a Keychain prompt is pending, approve it and start again.")
+        }
+        let failures = await store.checkPreconditions(force: true)
+        if !failures.isEmpty {
+            let mode = config.policy.enforcesTierAPreconditions ? "enforce: allocations will be refused" : "warn: allocating anyway"
+            FileHandle.standardError.write(Data("sand broker mock: Tier A preconditions not met (\(mode)): \(failures.joined(separator: ", "))\n".utf8))
+            logger.warning("tier A preconditions not met (\(mode)): \(failures.joined(separator: ","))")
+        }
         let routes = MockBrokerRoutes(store: store)
         let server = LoopbackHTTPServer(maxBodyBytes: 16_384) { request in
             await routes.handle(request)

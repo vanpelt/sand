@@ -28,13 +28,13 @@ import Testing
         ConfigValidator().validate(try config(github)).filter { $0.severity == .error }.map(\.message)
     }
 
-    private func broker(url: String = "http://127.0.0.1:8787", deviceId: String = "dev-laptop", key: String = keyPath) -> String {
+    private func broker(url: String = "http://127.0.0.1:8787", deviceId: String = "dev-laptop", key: String = keyPath, allowDevelopment: Bool? = true) -> String {
         """
         broker:
           url: \(url)
           deviceId: \(deviceId)
           deviceKeyPath: \(key)
-        """
+        """ + (allowDevelopment.map { "\n  allowDevelopmentBroker: \($0)" } ?? "")
     }
 
     private let base = """
@@ -79,6 +79,26 @@ import Testing
         #expect(try errors(base + "\n" + broker(url: "https://broker.example.com")).isEmpty)
         #expect(try errors(base + "\n" + broker(url: "http://localhost:8787")).isEmpty)
         #expect(try errors(base + "\n" + broker(url: "ftp://x")).contains { $0.contains("https") })
+    }
+
+    /// Finding: an unauthenticated http broker needs an explicit development opt-in.
+    @Test func plainHTTPNeedsTheDevelopmentOptIn() throws {
+        #expect(try errors(base + "\n" + broker(allowDevelopment: nil)).contains { $0.contains("allowDevelopmentBroker: true") })
+        #expect(try errors(base + "\n" + broker(allowDevelopment: false)).contains { $0.contains("allowDevelopmentBroker: true") })
+        #expect(try errors(base + "\n" + broker(url: "https://broker.example.com", allowDevelopment: nil)).isEmpty)
+        let warnings = ConfigValidator().validate(try config(base + "\n" + broker())).filter { $0.severity == .warning }.map(\.message)
+        #expect(warnings.contains { $0.contains("development broker") })
+    }
+
+    /// Finding: runner names are sand-<device>-<8 hex>; the hook accepts at most 64.
+    @Test func deviceIdLengthKeepsRunnerNamesWithinTheHookPattern() {
+        let longest = String(repeating: "a", count: 50)
+        #expect(BrokerConfig.isValidDeviceId(longest))
+        #expect(!BrokerConfig.isValidDeviceId(longest + "a"))
+        let name = "sand-\(longest)-0123abcd"
+        #expect(name.count == 64)
+        #expect(AdmissionHints(repositoryId: 1, runId: 1, runAttempt: 1, runnerName: name, jobKey: "").isWellFormed)
+        #expect(!BrokerConfig.isValidDeviceId("dev-laptop\n"), "no trailing newline")
     }
 
     @Test func badDeviceIdAndMissingKeyFile() throws {
@@ -166,6 +186,38 @@ import Testing
         let jobs = try await service(session).attemptJobs(runId: 9, attempt: 2)
         #expect(jobs.map(\.id) == [1, 2])
         #expect(session.requests.contains { $0.url!.path == "/repos/vanpelt/sand/actions/runs/9/attempts/2/jobs" })
+    }
+
+    /// Finding 1: a run past the first page of 100 must still be observed.
+    @Test func runsFollowsPagination() async throws {
+        let runJSON: @Sendable (Int) -> String = { id in #"{"id":\#(id),"run_attempt":1,"event":"push","status":"in_progress","path":"p","head_branch":"main","head_sha":"a","repository":{"id":1}}"# }
+        let session = ScriptedSession { request in
+            if let reply = Self.base(request) { return reply }
+            let page = request.url!.query!.contains("page=2") ? 2 : 1
+            let ids = page == 1 ? Array(1...100) : [101]
+            return .init(200, #"{"total_count":101,"workflow_runs":[\#(ids.map(runJSON).joined(separator: ","))]}"#)
+        }
+        let runs = try await service(session).runs(status: "in_progress")
+        #expect(runs.count == 101)
+        #expect(runs.last?.id == 101)
+    }
+
+    @Test func tierAFactsReadTheRepositorySettings() async throws {
+        let session = ScriptedSession { request in
+            if let reply = Self.base(request) { return reply }
+            switch request.url!.path {
+            case "/repos/vanpelt/sand/actions/secrets": return .init(200, #"{"total_count":0,"secrets":[]}"#)
+            case "/repos/vanpelt/sand/actions/organization-secrets": return .init(422, #"{"message":"Validation Failed"}"#)
+            case "/repos/vanpelt/sand/environments": return .init(200, #"{"total_count":0}"#)
+            case "/repos/vanpelt/sand/actions/permissions/workflow": return .init(200, #"{"default_workflow_permissions":"read","can_approve_pull_request_reviews":false}"#)
+            case "/repos/vanpelt/sand/actions/permissions/fork-pr-contributor-approval": return .init(200, #"{"approval_policy":"first_time_contributors"}"#)
+            default: return .init(404)
+            }
+        }
+        let facts = try await service(session).tierAFacts(ownerIsUser: true)
+        #expect(facts.failures == ["fork_pr_approval=first_time_contributors"])
+        // On an organization repository a 422 is not "no secrets".
+        await #expect(throws: GitHubServiceError.self) { _ = try await service(session).tierAFacts(ownerIsUser: false) }
     }
 
     @Test func runAttemptDecodesActors() async throws {

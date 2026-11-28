@@ -12,9 +12,46 @@ protocol BrokerGitHubAPI: Sendable {
     func deleteRunner(id: Int) async throws -> DeleteRunnerResult
     func listRunners() async throws -> [GitHubService.RunnersResponse.Runner]
     func cancelRun(id: Int) async throws
+    /// The repository settings that make Tier A's residual R1 acceptable.
+    func tierAFacts(ownerIsUser: Bool) async throws -> TierAFacts
 }
 
-extension GitHubService: BrokerGitHubAPI {}
+extension GitHubService: BrokerGitHubAPI {
+    func tierAFacts(ownerIsUser: Bool) async throws -> TierAFacts {
+        TierAFacts(
+            repositorySecrets: try await repositorySecretCount(),
+            organizationSecrets: try await organizationSecretCount(ownerIsUser: ownerIsUser),
+            environments: try await environmentCount(),
+            defaultWorkflowPermissions: try await defaultWorkflowPermissions(),
+            forkPullRequestApproval: try await forkPullRequestApprovalPolicy()
+        )
+    }
+}
+
+/// Tier A preconditions (ADR 0001 §5.1, residuals R1 and R9). The job message
+/// (secrets, `GITHUB_TOKEN`) reaches the guest before the gate runs, so a
+/// denied job is harmless only while the repository has no secrets, the
+/// default token is read-only, and fork pull requests need approval.
+struct TierAFacts: Sendable, Equatable {
+    var repositorySecrets: Int
+    var organizationSecrets: Int
+    var environments: Int
+    var defaultWorkflowPermissions: String
+    var forkPullRequestApproval: String
+
+    static let requiredForkApproval = "all_external_contributors"
+
+    /// Failed preconditions, as stable strings for audit and errors.
+    var failures: [String] {
+        var failures: [String] = []
+        if repositorySecrets != 0 { failures.append("repository_secrets=\(repositorySecrets)") }
+        if organizationSecrets != 0 { failures.append("organization_secrets=\(organizationSecrets)") }
+        if environments != 0 { failures.append("environments=\(environments)") }
+        if defaultWorkflowPermissions != "read" { failures.append("default_workflow_permissions=\(defaultWorkflowPermissions)") }
+        if forkPullRequestApproval != Self.requiredForkApproval { failures.append("fork_pr_approval=\(forkPullRequestApproval)") }
+        return failures
+    }
+}
 
 struct BrokerAPIError: Error, Equatable {
     let status: Int
@@ -46,6 +83,8 @@ actor MockBrokerStore {
         var state: AllocationState
         var observedJob: JobRef?
         var observedAt: Date?
+        /// Last observation in which every GitHub call succeeded.
+        var observedOkAt: Date?
         var firstObservedAt: Date?
         var admittedJob: JobRef?
         var decision: AdmissionDecision?
@@ -76,6 +115,8 @@ actor MockBrokerStore {
     static let cleanupMaxDelay: TimeInterval = 300
     static let cleanupDeadline: TimeInterval = 6 * 3600
     static let observedCacheSeconds: TimeInterval = 5
+    static let preconditionCacheSeconds: TimeInterval = 300
+    static let githubCallTimeout: TimeInterval = 20
 
     let config: MockBrokerConfig
     private let github: BrokerGitHubAPI
@@ -93,6 +134,7 @@ actor MockBrokerStore {
     private var circuitOpenUntil: [String: Date] = [:]
     private(set) var cleanupQueue: [CleanupEntry] = []
     private var repository: GitHubRepositoryInfo?
+    private var preconditions: (failures: [String], checkedAt: Date)?
 
     init(
         config: MockBrokerConfig,
@@ -208,10 +250,11 @@ actor MockBrokerStore {
             throw BrokerAPIError(status: 429, code: "circuit_open", message: "too many denials", retryAfterSeconds: max(1, Int(until.timeIntervalSince(now()).rounded(.up))))
         }
         let repository = try await resolveRepository()
+        try await enforcePreconditions(deviceId: deviceId, repository: repository)
         if policy.requiresQueuedJob {
             let queued: [GitHubRun]
             do {
-                queued = try await github.runs(status: "queued")
+                queued = try await withGitHubTimeout { [github] in try await github.runs(status: "queued") }
             } catch {
                 throw BrokerAPIError(status: 502, code: "github_error", message: "GitHub unavailable")
             }
@@ -229,7 +272,9 @@ actor MockBrokerStore {
         let name = "sand-\(deviceId)-\(suffix)"
         let jit: GitHubJITConfig
         do {
-            jit = try await github.generateJITConfig(name: name, labels: policy.labels, runnerGroupId: 1, workFolder: "_work")
+            jit = try await withGitHubTimeout { [github, policy] in
+                try await github.generateJITConfig(name: name, labels: policy.labels, runnerGroupId: 1, workFolder: "_work")
+            }
         } catch {
             throw BrokerAPIError(status: 502, code: "github_error", message: "JIT config request failed")
         }
@@ -273,7 +318,8 @@ actor MockBrokerStore {
         return AllocationStatus(
             allocationId: allocationId, state: current.state, expiresAt: current.allocation.expiresAt,
             runner: BrokerRunner(id: current.allocation.runner.id, name: current.allocation.runner.name),
-            observedJob: current.observedJob, admittedJob: current.admittedJob, decision: current.decision?.decision
+            observedJob: current.observedJob, admittedJob: current.admittedJob, decision: current.decision?.decision,
+            observedOkAt: current.observedOkAt
         )
     }
 
@@ -446,6 +492,11 @@ actor MockBrokerStore {
 
     /// Idle expiry, admission deadlines and due cleanups. Called every few seconds.
     func tick() async {
+        // Observe undecided allocations here too, so assignment and the
+        // admission deadline do not depend on the device polling status.
+        for (id, record) in allocations where record.decision == nil && (record.state == .registered || record.state == .assigned) {
+            await refreshObserved(id)
+        }
         for (id, record) in allocations {
             switch record.state {
             case .registered where now() > record.allocation.expiresAt:
@@ -454,7 +505,7 @@ actor MockBrokerStore {
                 enqueueCleanup(id, cancelRunId: nil)
             case .assigned:
                 if record.decision == nil, !record.admissionInFlight, let first = record.firstObservedAt,
-                   now().timeIntervalSince(first) > TimeInterval(policy.deadlineSeconds) {
+                   now().timeIntervalSince(first) > AdmissionTimeouts.verifierDeadline(TimeInterval(policy.deadlineSeconds)) {
                     let job = record.observedJob
                     _ = finalize(id, key: [job?.runId ?? 0, job?.runAttempt ?? 0], .deny, [.admissionTimeout],
                                  job: job.map { AdmissionJob(id: $0.id, runId: $0.runId, runAttempt: $0.runAttempt) })
@@ -479,6 +530,8 @@ actor MockBrokerStore {
     }
 
     /// The broker's own REST view of the job our runner holds (cached for 5 s).
+    /// `observedOkAt` advances only when every call succeeded, so a rate
+    /// limited or failing GitHub reads as stale, never as "nothing running".
     private func refreshObserved(_ allocationId: String) async {
         guard let record = allocations[allocationId] else { return }
         if let at = record.observedAt, now().timeIntervalSince(at) < Self.observedCacheSeconds { return }
@@ -486,13 +539,18 @@ actor MockBrokerStore {
         guard let runs = try? await github.runs(status: "in_progress") else { return }
         var found: JobRef?
         for run in runs {
-            guard let jobs = try? await github.attemptJobs(runId: run.id, attempt: run.runAttempt ?? 1) else { continue }
+            guard let jobs = try? await github.attemptJobs(runId: run.id, attempt: run.runAttempt ?? 1) else { return }
             if let job = jobs.first(where: { $0.runnerId == record.allocation.runner.id }) {
                 found = JobRef(id: job.id, runId: job.runId, runAttempt: job.runAttempt ?? run.runAttempt ?? 1, status: job.status, observedAt: now())
                 break
             }
         }
-        guard let found, var current = allocations[allocationId] else { return }
+        guard var current = allocations[allocationId] else { return }
+        current.observedOkAt = now()
+        guard let found else {
+            allocations[allocationId] = current
+            return
+        }
         if current.observedJob?.id != found.id {
             current.firstObservedAt = now()
         }
@@ -522,11 +580,70 @@ actor MockBrokerStore {
     private func resolveRepository() async throws -> GitHubRepositoryInfo {
         if let repository { return repository }
         do {
-            let info = try await github.repositoryInfo()
+            let info = try await withGitHubTimeout { [github] in try await github.repositoryInfo() }
             repository = info
             return info
+        } catch is RelayTimeout {
+            throw BrokerAPIError(status: 503, code: "github_timeout", message: "GitHub App signing or the repository lookup timed out", retryAfterSeconds: 30)
         } catch {
             throw BrokerAPIError(status: 502, code: "github_error", message: "repository lookup failed")
+        }
+    }
+
+    /// Signs the first App JWT and resolves the repository now, so a pending
+    /// Keychain approval or a bad key fails at startup instead of hanging the
+    /// first allocation request.
+    func warmUp(timeout: TimeInterval = 120) async throws -> GitHubRepositoryInfo {
+        if let repository { return repository }
+        let result = await withTimeout(timeout) { [github] in try await github.repositoryInfo() }
+        switch result {
+        case let .success(info):
+            repository = info
+            return info
+        case .failure(is RelayTimeout):
+            throw BrokerAPIError(status: 503, code: "github_timeout", message: "no GitHub App JWT within \(Int(timeout)) s (Keychain approval pending?)")
+        case let .failure(error):
+            throw BrokerAPIError(status: 502, code: "github_error", message: "repository lookup failed: \(type(of: error))")
+        }
+    }
+
+    /// Bounds a GitHub call (including Keychain signing, which can block on
+    /// an unanswered approval prompt) so a request fails instead of hanging.
+    private func withGitHubTimeout<T: Sendable>(_ operation: @escaping @Sendable () async throws -> T) async throws -> T {
+        try await withTimeout(Self.githubCallTimeout, operation).get()
+    }
+
+    /// Checks (and caches for 5 min) the Tier A preconditions. Fails closed:
+    /// a check that cannot run (missing App permission, GitHub down) is a failure.
+    func checkPreconditions(force: Bool = false) async -> [String] {
+        if !force, let cached = preconditions, now().timeIntervalSince(cached.checkedAt) < Self.preconditionCacheSeconds {
+            return cached.failures
+        }
+        let failures: [String]
+        do {
+            let repository = try await resolveRepository()
+            let ownerIsUser = repository.owner.type == "User"
+            let facts = try await withGitHubTimeout { [github] in try await github.tierAFacts(ownerIsUser: ownerIsUser) }
+            failures = facts.failures
+        } catch {
+            failures = ["check_failed"]
+        }
+        preconditions = (failures, now())
+        return failures
+    }
+
+    private func enforcePreconditions(deviceId: String, repository: GitHubRepositoryInfo) async throws {
+        let failures = await checkPreconditions()
+        guard !failures.isEmpty else { return }
+        let enforced = policy.enforcesTierAPreconditions
+        audit("allocation.precondition", level: enforced ? .error : .warning, deviceId: deviceId, fields: [
+            "reason": DenyReason.tierPreconditionFailed.rawValue, "failures": failures.joined(separator: ","),
+            "mode": enforced ? "enforce" : "warn"
+        ])
+        if enforced {
+            refuse(deviceId, DenyReason.tierPreconditionFailed.rawValue)
+            throw BrokerAPIError(status: 403, code: DenyReason.tierPreconditionFailed.rawValue,
+                                 message: "Tier A preconditions not met: \(failures.joined(separator: ", "))")
         }
     }
 

@@ -270,22 +270,30 @@ How a job is gated:
   reverse tunnel), which asks the broker. Only an explicit allow lets the job
   continue; anything else kills the runner, blocks the hook, and the host
   destroys the VM. The hook never exits non-zero (that would fail open).
-- A host-side assignment verifier also polls the broker and destroys the VM if
-  a job runs without an admission or a different job runs.
+- A host-side assignment verifier also polls the broker (and checks the guest
+  for a `Runner.Worker`) and destroys the VM if a job runs without an
+  admission, a different job runs, or the broker's view of GitHub goes stale.
+- The JIT config and the hook (which holds the nonce) reach the guest on SSH
+  stdin, never as process arguments.
 - A denied job is consumed and fails (or times out); it is not requeued.
-  Pilot scope is Tier A only: repositories without secrets.
+  Pilot scope is Tier A only: the broker refuses allocations unless the repo
+  has no secrets or environments, a read-only default token, and fork-PR
+  approval for all outside contributors.
 
 Development tools:
 
 ```bash
 sand broker keygen --device-id dev-laptop --out ~/.sand/broker
-sand broker mock --config my-broker-mock.yml --audit-log ~/sand-broker.audit.jsonl
+SAND_DEVELOPMENT_BROKER=1 sand broker mock --config my-broker-mock.yml --audit-log ~/sand-broker.audit.jsonl
 ```
 
 `sand broker mock` implements the API on 127.0.0.1 only (see
-`fixtures/broker_mock.yml`). It signs with a GitHub App key on your own Mac
-(Keychain label or PEM) and is for development only; never point enterprise
-devices or production credentials at it.
+`fixtures/broker_mock.yml`) and refuses to start without
+`SAND_DEVELOPMENT_BROKER=1`. It signs with a GitHub App key on your own Mac
+(Keychain label or PEM) at startup, so approve the Keychain prompt then; it
+exits after 120 s without an approval. It is for development only; never point
+enterprise devices or production credentials at it. A Sand config that uses the
+plain-http mock must set `allowDevelopmentBroker: true` under `broker:`.
 
 ### Custom provisioner script
 

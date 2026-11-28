@@ -75,29 +75,39 @@ struct GitHubProvisioner: Sendable {
     /// with Sand's job-started admission hook installed read-only outside
     /// `actions-runner` and wired through `.env`, which the workflow cannot
     /// override. The `.env` is written whether or not egress isolation is on.
-    /// The JIT config reaches the runner only via `ACTIONS_RUNNER_INPUT_JITCONFIG`.
-    func brokerScript(allocation: Allocation, jitConfig: String, egress: GuestEgressEnv?, relayPort: Int = NetworkPolicy.guestAdmissionPort) throws -> [String] {
+    ///
+    /// The JIT config reaches the runner only via `ACTIONS_RUNNER_INPUT_JITCONFIG`,
+    /// read from the SSH session's stdin: it is never in a host process
+    /// argument (`ps` on the host) nor in a guest command line. It remains in
+    /// the initial environment of `run.sh` and the Listener in the guest
+    /// (`docs/broker-api.md` §6.5).
+    func brokerScript(allocation: Allocation, jitConfig: String, egress: GuestEgressEnv?, relayPort: Int = NetworkPolicy.guestAdmissionPort) throws -> [GuestCommand] {
         let hook = try AdmissionHook.script(allocationId: allocation.allocationId, nonce: allocation.nonce, relayPort: relayPort)
         var commands = [
-            "rm -rf ~/actions-runner && mkdir ~/actions-runner",
-            "tar xzf ~/\(Self.tarballRemotePath) -C ~/actions-runner",
-            "echo \"Runner extracted\""
+            GuestCommand("rm -rf ~/actions-runner && mkdir ~/actions-runner"),
+            GuestCommand("tar xzf ~/\(Self.tarballRemotePath) -C ~/actions-runner"),
+            GuestCommand("echo \"Runner extracted\"")
         ]
         commands += AdmissionHook.installCommands(script: hook)
         let hookVariable = [("ACTIONS_RUNNER_HOOK_JOB_STARTED", AdmissionHook.guestPath)]
         if let egress {
-            commands.append(egress.runnerDotEnvCommand(extra: hookVariable))
+            commands.append(GuestCommand(egress.runnerDotEnvCommand(extra: hookVariable)))
         } else {
-            commands.append(GuestEgressEnv.dotEnvCommand(variables: hookVariable))
+            commands.append(GuestCommand(GuestEgressEnv.dotEnvCommand(variables: hookVariable)))
         }
-        commands.append("echo \"Runner configured (JIT, admission hook installed), starting ~/actions-runner/run.sh\"")
-        let jit = "env \(Self.shellQuote("ACTIONS_RUNNER_INPUT_JITCONFIG=\(jitConfig)"))"
-        if let egress {
-            commands.append("\(egress.envPrefix) \(jit) ~/actions-runner/run.sh")
-        } else {
-            commands.append("\(jit) ~/actions-runner/run.sh")
-        }
+        commands.append(GuestCommand("echo \"Runner configured (JIT, admission hook installed), starting ~/actions-runner/run.sh\""))
+        let prefix = egress.map { "\($0.envPrefix) " } ?? ""
+        commands.append(GuestCommand(Self.jitRunCommand(prefix: prefix), stdin: jitConfig + "\n"))
         return commands
+    }
+
+    /// Reads the JIT config from stdin into the runner's variable, detaches
+    /// stdin, then runs `run.sh`. Exits 97 without starting the runner when
+    /// stdin carried nothing.
+    static func jitRunCommand(prefix: String) -> String {
+        "IFS= read -r SAND_JIT; [ -n \"$SAND_JIT\" ] || { echo 'sand: JIT config missing on stdin' >&2; exit 97; }; "
+            + "export ACTIONS_RUNNER_INPUT_JITCONFIG=\"$SAND_JIT\"; unset SAND_JIT; exec </dev/null; "
+            + "\(prefix)~/actions-runner/run.sh"
     }
 
     static func shellQuote(_ value: String) -> String {

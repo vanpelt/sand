@@ -247,6 +247,12 @@ struct Run: AsyncParsableCommand {
         guard let url = URL(string: broker.url) else {
             throw ValidationError("provisioner.config.broker.url is not a valid URL")
         }
+        if let problem = BrokerConfig.urlProblem(broker.url, allowDevelopmentBroker: broker.allowDevelopmentBroker ?? false) {
+            throw ValidationError(problem)
+        }
+        if broker.isDevelopmentBroker {
+            FileHandle.standardError.write(Data("WARNING: broker \(broker.url) is a plain-http DEVELOPMENT broker; admission decisions are unauthenticated.\n".utf8))
+        }
         let key = try DeviceKey.load(path: broker.deviceKeyPath)
         return BrokerRuntime(client: BrokerClient(baseURL: url, deviceId: broker.deviceId, key: key), deviceId: broker.deviceId, audit: audit)
     }

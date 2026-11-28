@@ -20,8 +20,10 @@ runners:
         repository: example-repo
         runnerName: laptop-runner
         broker:
-          # https is required; plain http only for a loopback mock broker.
+          # https is required; plain http only for a loopback mock broker,
+          # and only with allowDevelopmentBroker: true (its answers are unauthenticated).
           url: http://127.0.0.1:8787
+          allowDevelopmentBroker: true
           deviceId: dev-laptop
           deviceKeyPath: ~/.sand/broker/dev-laptop.key.pem
     healthCheck:

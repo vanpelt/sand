@@ -90,7 +90,16 @@ struct MockBrokerConfig: Decodable, Sendable {
             errors.append("devices must list at least one device")
         }
         for device in devices where !BrokerConfig.isValidDeviceId(device.id) {
-            errors.append("device id \(device.id) must match ^[a-z0-9][a-z0-9-]{0,62}$")
+            errors.append("device id \(device.id) must match ^[a-z0-9][a-z0-9-]{0,49}$")
+        }
+        if !(1...AdmissionTimeouts.maxBrokerWaitSeconds).contains(policy.waitSeconds) {
+            errors.append("policy.admissionWaitSeconds must be 1-\(AdmissionTimeouts.maxBrokerWaitSeconds) (below the relay's \(Int(AdmissionTimeouts.relaySeconds)) s timeout)")
+        }
+        if TimeInterval(policy.deadlineSeconds) < AdmissionTimeouts.minimumVerifierDeadline {
+            errors.append("policy.admissionDeadlineSeconds must be at least \(Int(AdmissionTimeouts.minimumVerifierDeadline)) (above the hook and relay timeouts)")
+        }
+        if let mode = policy.tierAPreconditions, !["enforce", "warn"].contains(mode) {
+            errors.append("policy.tierAPreconditions must be enforce or warn")
         }
         if policy.labels.isEmpty || policy.workflows.isEmpty || policy.branches.isEmpty {
             errors.append("policy.labels, policy.workflows and policy.branches must not be empty")

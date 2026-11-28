@@ -49,7 +49,10 @@ actor AdmissionController {
     /// Runs the kill path once: audit, then the injected action (mark the health
     /// check failed, terminate provisioning, destroy the VM; destroying it runs
     /// the release through the shutdown coordinator).
-    func kill(_ kill: Kill) async {
+    ///
+    /// `waitForAction: false` records the kill (so `wasKilled` and the release
+    /// reason are set before returning) and runs the teardown in its own task.
+    func kill(_ kill: Kill, waitForAction: Bool = true) async {
         guard self.kill == nil else { return }
         self.kill = kill
         let denyReasons = kill.reasons.compactMap(DenyReason.init(rawValue:))
@@ -59,7 +62,28 @@ actor AdmissionController {
         audit.emit(event("vm.killed", level: .warning, jobId: kill.jobId, runId: kill.runId, runAttempt: kill.runAttempt,
                          decision: nil, reasons: nil, fields: ["cause": kill.type]))
         let job = kill.jobId.map { "job \($0)" } ?? "unidentified job"
-        await killAction("admission denied \(job): \(kill.reasons.joined(separator: ","))")
+        let reason = "admission denied \(job): \(kill.reasons.joined(separator: ","))"
+        if waitForAction {
+            await killAction(reason)
+        } else {
+            let action = killAction
+            teardown = Task { await action(reason) }
+        }
+    }
+
+    /// The detached teardown started by `kill(_:waitForAction: false)`, if any.
+    private(set) var teardown: Task<Void, Never>?
+
+    /// Waits for a detached teardown to finish (no-op otherwise).
+    func waitForTeardown() async {
+        await teardown?.value
+    }
+
+    /// An unauthenticated relay request (wrong nonce, malformed body, wrong
+    /// content type). Audited; it neither kills the VM nor spends the admission.
+    func noteRejected(_ reason: String) {
+        audit.emit(event("admission.relay_rejected", level: .warning, jobId: nil, runId: nil, runAttempt: nil,
+                         decision: nil, reasons: nil, fields: ["reason": reason]))
     }
 
     func markCompleted() {

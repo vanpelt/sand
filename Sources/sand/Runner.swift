@@ -731,7 +731,7 @@ struct Runner: Sendable {
             await shutdownCoordinator.cleanup(reason: "admission relay setup failed")
             throw error
         }
-        let commands: [String]
+        let commands: [GuestCommand]
         do {
             commands = try provisioner.brokerScript(allocation: allocation, jitConfig: jitConfig, egress: egress)
         } catch {
@@ -743,6 +743,11 @@ struct Runner: Sendable {
         let verifier = AssignmentVerifier(
             controller: controller, broker: broker.client,
             deadlineSeconds: TimeInterval(allocation.admission.deadlineSeconds),
+            workerProbe: { [ssh] in
+                // GitHub-independent: a Worker with no admission means the hook did not gate the job.
+                let output = try await ssh.exec(command: AssignmentVerifier.workerProbeCommand)?.stdout ?? ""
+                return try AssignmentVerifier.parseWorkerProbe(output)
+            },
             sleep: broker.sleep,
             warn: { [logger] in logger.warning($0) }
         )
@@ -750,6 +755,7 @@ struct Runner: Sendable {
         let outcome = await runProvisionerCommands(commands, ssh: ssh, healthCheckState: healthCheckState, secrets: secrets)
         verifierTask.cancel()
         await teardown()
+        await controller.waitForTeardown()
         if await controller.wasKilled {
             iterationFlags.markDenied()
             await scheduleRestart(reason: .admissionDenied)
@@ -1122,8 +1128,17 @@ struct Runner: Sendable {
         healthCheckState: HealthCheckState,
         secrets: [String] = []
     ) async -> ProvisionerSequenceOutcome {
+        await runProvisionerCommands(commands.map { GuestCommand($0) }, ssh: ssh, healthCheckState: healthCheckState, secrets: secrets)
+    }
+
+    private func runProvisionerCommands(
+        _ commands: [GuestCommand],
+        ssh: SSHClient,
+        healthCheckState: HealthCheckState,
+        secrets: [String] = []
+    ) async -> ProvisionerSequenceOutcome {
         for command in commands {
-            let outcome = await runProvisionerCommand(command, ssh: ssh, healthCheckState: healthCheckState, secrets: secrets)
+            let outcome = await runProvisionerCommand(command.command, stdin: command.stdin, ssh: ssh, healthCheckState: healthCheckState, secrets: secrets)
             switch outcome {
             case .completed:
                 continue
@@ -1138,6 +1153,7 @@ struct Runner: Sendable {
 
     private func runProvisionerCommand(
         _ command: String,
+        stdin: String? = nil,
         ssh: SSHClient,
         healthCheckState: HealthCheckState,
         secrets: [String]
@@ -1150,7 +1166,7 @@ struct Runner: Sendable {
                 let commandLabel = commandSummary(displayCommand)
                 let labeledCommand = commandLabel.isEmpty ? "provisioner command" : "provisioner command (\(commandLabel))"
                 logger.debug("\(labeledCommand) starting (attempt \(attempt + 1))")
-                let handle = try ssh.start(command: command)
+                let handle = try ssh.start(command: command, stdin: stdin)
                 await control.setProvisioningHandle(handle)
                 logger.debug("\(labeledCommand) started; awaiting completion or healthCheck failure")
                 let outcome = await awaitProvisionerCommand(handle: handle, healthCheckState: healthCheckState)
@@ -1383,7 +1399,8 @@ struct Runner: Sendable {
         guard !firstToken.isEmpty else {
             return false
         }
-        return firstToken.hasSuffix("actions-runner/run.sh")
+        // Plain, or the last word of a broker-mode `... ~/actions-runner/run.sh`.
+        return firstToken.hasSuffix("actions-runner/run.sh") || trimmed.hasSuffix("~/actions-runner/run.sh")
     }
 
     private func logRunOptions(name: String, options: Tart.RunOptions) {

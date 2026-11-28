@@ -21,6 +21,21 @@ import Testing
         #expect(result.job?.runAttempt == 2)
     }
 
+    /// Finding 8: a missing referenced_workflows field fails closed.
+    @Test func missingReferencedWorkflowsDenies() {
+        var run = Spike.run()
+        run.referencedWorkflows = nil
+        #expect(evaluate(run: run).reasons == [.reusableWorkflowNotAllowed])
+    }
+
+    /// A newline-terminated hint must not pass the `$`-anchored pattern (`\z`).
+    @Test func trailingNewlineHintsAreMalformed() {
+        #expect(!Spike.hints(runnerName: Spike.runnerName + "\n").isWellFormed)
+        #expect(!Spike.hints(jobKey: "smoke\n").isWellFormed)
+        #expect(!BrokerID.matches("alc_01JDQ7Z6S8V4N3K2M1P0R9T8W7\n", prefix: "alc"))
+        #expect(!Base64URL.isToken32(String(repeating: "n", count: 43) + "\n"))
+    }
+
     @Test func allowsWorkflowDispatch() {
         #expect(evaluate(run: Spike.run(event: "workflow_dispatch", branch: "main")).decision == .allow)
     }

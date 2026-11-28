@@ -177,10 +177,60 @@ struct GitHubService: Sendable {
         return try await request(path: "\(try repositoryPath())/actions/runners/generate-jitconfig", method: "POST", token: try await accessToken(), body: body)
     }
 
+    /// Every run with `status`, following pagination (up to 1000 runs). A
+    /// partial answer would let a running job hide past the first page, so
+    /// running out of pages throws instead of truncating.
     func runs(status: String) async throws -> [GitHubRun] {
-        let response: GitHubRunsResponse = try await request(path: "\(try repositoryPath())/actions/runs?status=\(status)&per_page=100", method: "GET", token: try await accessToken())
-        return response.workflowRuns
+        let token = try await accessToken()
+        var runs: [GitHubRun] = []
+        for page in 1...10 {
+            let response: GitHubRunsResponse = try await request(
+                path: "\(try repositoryPath())/actions/runs?status=\(status)&per_page=100&page=\(page)",
+                method: "GET", token: token
+            )
+            runs += response.workflowRuns
+            if response.workflowRuns.count < 100 || runs.count >= response.totalCount {
+                return runs
+            }
+        }
+        throw GitHubServiceError.invalidResponse
     }
+
+    /// Counts for the Tier A preconditions (ADR 0001 §5.1). Organization
+    /// secrets answer 404/422 on a user-owned repository; that counts as 0
+    /// only when the owner really is a user.
+    func repositorySecretCount() async throws -> Int {
+        let response: CountResponse = try await request(path: "\(try repositoryPath())/actions/secrets?per_page=1", method: "GET", token: try await accessToken())
+        return response.totalCount
+    }
+
+    func organizationSecretCount(ownerIsUser: Bool) async throws -> Int {
+        do {
+            let response: CountResponse = try await request(path: "\(try repositoryPath())/actions/organization-secrets?per_page=1", method: "GET", token: try await accessToken())
+            return response.totalCount
+        } catch GitHubServiceError.httpError(let status, _) where ownerIsUser && (status == 404 || status == 422) {
+            return 0
+        }
+    }
+
+    func environmentCount() async throws -> Int {
+        let response: CountResponse = try await request(path: "\(try repositoryPath())/environments?per_page=1", method: "GET", token: try await accessToken())
+        return response.totalCount
+    }
+
+    func defaultWorkflowPermissions() async throws -> String {
+        struct Response: Decodable { let defaultWorkflowPermissions: String }
+        let response: Response = try await request(path: "\(try repositoryPath())/actions/permissions/workflow", method: "GET", token: try await accessToken())
+        return response.defaultWorkflowPermissions
+    }
+
+    func forkPullRequestApprovalPolicy() async throws -> String {
+        struct Response: Decodable { let approvalPolicy: String }
+        let response: Response = try await request(path: "\(try repositoryPath())/actions/permissions/fork-pr-contributor-approval", method: "GET", token: try await accessToken())
+        return response.approvalPolicy
+    }
+
+    private struct CountResponse: Decodable { let totalCount: Int }
 
     /// The run as it was for `attempt` (actor and triggering actor of that attempt).
     func runAttempt(runId: Int, attempt: Int) async throws -> GitHubRun {
@@ -261,7 +311,11 @@ final class InstallationTokenCache: @unchecked Sendable {
 // MARK: - REST shapes used by the broker (decoded with convertFromSnakeCase)
 
 struct GitHubRepositoryInfo: Codable, Sendable, Equatable {
-    struct Owner: Codable, Sendable, Equatable { let login: String; let id: Int }
+    struct Owner: Codable, Sendable, Equatable {
+        let login: String
+        let id: Int
+        var type: String?
+    }
     let id: Int
     let name: String
     let owner: Owner

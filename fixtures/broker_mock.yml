@@ -21,13 +21,20 @@ policy:
   labels: [self-hosted, macOS, ARM64, sand]
   events: [push, workflow_dispatch]
   workflows: [.github/workflows/self-hosted-smoke.yml]
-  branches: [main, "feature/*"]
+  # Prefer exact, protected, review-required branches: the policy checks who
+  # triggered a run, not who wrote it (ADR 0001 R10). Avoid prefix/* patterns.
+  branches: [main]
   allowReusableWorkflows: false
   requireQueuedJob: true
   requireOIDC: false
   cancelDeniedRuns: false
   admissionWaitSeconds: 15
-  admissionDeadlineSeconds: 30
+  # At least 60: above the relay (45 s) and hook (50 s) timeouts.
+  admissionDeadlineSeconds: 60
+  # enforce: refuse allocations unless the repo has no secrets or environments,
+  # a read-only default GITHUB_TOKEN and fork-PR approval for all outside
+  # contributors (ADR 0001 §5.1). warn: allocate and audit (development only).
+  tierAPreconditions: enforce
   idleTTLSeconds: 900
 limits:
   allocationsPerHour: 30

@@ -433,7 +433,7 @@ extension Config.Provisioner {
                 extraLabels: github.extraLabels,
                 runnerGroup: github.runnerGroup,
                 broker: github.broker.map {
-                    BrokerConfig(url: $0.url, deviceId: $0.deviceId, deviceKeyPath: Config.expandPath($0.deviceKeyPath))
+                    BrokerConfig(url: $0.url, deviceId: $0.deviceId, deviceKeyPath: Config.expandPath($0.deviceKeyPath), allowDevelopmentBroker: $0.allowDevelopmentBroker)
                 }
             )
             return Config.Provisioner(type: type, script: nil, github: expanded)

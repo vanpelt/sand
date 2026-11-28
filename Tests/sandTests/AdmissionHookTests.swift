@@ -12,6 +12,9 @@ import Testing
         #expect(script.contains("\nset +e\n"))
         #expect(!script.contains("@@"))
         #expect(script.contains("--noproxy '*'"))
+        #expect(script.contains("/usr/bin/curl -q "), "-q must be the first argument to skip ~/.curlrc")
+        #expect(script.contains("--proto '=http'"))
+        #expect(script.contains("--max-time \(AdmissionTimeouts.hookCurlSeconds) "))
         #expect(script.contains("http://127.0.0.1:3129/v1/admission"))
         // The only exit is the allow path's `exit 0`.
         let exits = script.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { $0.hasPrefix("exit") }
@@ -27,7 +30,9 @@ import Testing
 
     @Test func installIsReadOnlyOutsideTheRunnerDirectory() throws {
         let commands = AdmissionHook.installCommands(script: try AdmissionHook.script(allocationId: Self.allocationId, nonce: Self.nonce))
-        let joined = commands.joined(separator: "\n")
+        let joined = commands.map(\.command).joined(separator: "\n")
+        #expect(!joined.contains(Self.nonce), "the script travels on stdin")
+        #expect(commands.last?.stdin?.contains(Self.nonce) == true)
         #expect(joined.contains("chmod 0555 \"$HOME/.sand/hooks/job-started.sh\""))
         #expect(joined.contains("chmod 0555 \"$HOME/.sand/hooks\""))
         #expect(!joined.contains("actions-runner"))
@@ -54,7 +59,7 @@ import Testing
         func add(_ request: HTTPRequest) { lock.withLock { storage.append(request) } }
     }
 
-    private func execute(verdict: String?, env overrides: [String: String] = [:]) async throws -> Execution {
+    private func execute(verdict: String?, env overrides: [String: String] = [:], home: String = NSTemporaryDirectory()) async throws -> Execution {
         let requests = Requests()
         var port = 1
         var server: LoopbackHTTPServer?
@@ -74,7 +79,7 @@ import Testing
         )
         let path = try writeTempFile(contents: script, suffix: ".sh").path
         var environment = [
-            "PATH": "/usr/bin:/bin", "HOME": NSTemporaryDirectory(),
+            "PATH": "/usr/bin:/bin", "HOME": home,
             "GITHUB_RUN_ID": "46107413025", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_REPOSITORY_ID": "1473742157",
             "RUNNER_NAME": "sand-dev-laptop-3f9a1c2e", "GITHUB_JOB": "smoke",
             // A proxy in the environment must never be used for the relay call.
@@ -136,6 +141,16 @@ import Testing
         let badRunner = try await execute(verdict: "allow", env: ["RUNNER_NAME": "a\"b"])
         #expect(badRunner.exitCode == 77)
         #expect(badRunner.requests.isEmpty)
+    }
+
+    /// Finding: without -q curl reads ~/.curlrc, which could redirect or add options.
+    @Test func plantedCurlrcIsIgnored() async throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
+        try FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
+        try "header = \"X-Planted: 1\"\n".write(toFile: home + "/.curlrc", atomically: true, encoding: .utf8)
+        let run = try await execute(verdict: "allow", home: home)
+        #expect(run.exitCode == 0)
+        #expect(run.requests.first?.header("x-planted") == nil)
     }
 
     @Test func quotedJobKeyIsSentEmpty() async throws {

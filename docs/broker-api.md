@@ -118,7 +118,7 @@ Requests a JIT runner for a repository.
   "repository": {"id": 1473742157, "owner": "vanpelt", "name": "sand"},
   "runner": {"id": 34, "name": "sand-dev-laptop-3f9a1c2e", "labels": ["self-hosted","macOS","ARM64","sand"], "runner_group_id": 1, "ephemeral": true},
   "jit_config": "<base64; SECRET>",
-  "admission": {"deadline_seconds": 30, "require_oidc": false, "oidc_audience": "sand-broker"},
+  "admission": {"deadline_seconds": 60, "require_oidc": false, "oidc_audience": "sand-broker"},
   "policy_version": "pilot-1"
 }
 ```
@@ -161,8 +161,24 @@ Requests a JIT runner for a repository.
 | `422 idempotency_mismatch` | |
 | `429 rate_limited` | |
 | `429 circuit_open` | |
+| `403 tier_precondition_failed` | The repository does not meet the Tier A preconditions (§4.2.1). |
 | `502 github_error` | |
+| `503 github_timeout` | GitHub (or App JWT signing) did not answer within 20 s. |
 | `503 unavailable` | |
+
+#### 4.2.1 Tier A preconditions
+
+The job message (secrets and `GITHUB_TOKEN`) reaches the guest before the gate runs (ADR 0001, R1). A denied job is harmless only while the repository gives jobs nothing worth stealing. So before issuing an allocation the broker checks, cached for 5 minutes:
+
+| Check | Required |
+| --- | --- |
+| `GET /repos/{o}/{r}/actions/secrets` `total_count` | 0 |
+| `GET /repos/{o}/{r}/actions/organization-secrets` `total_count` | 0 (a 404 or 422 counts as 0 only on a user-owned repository) |
+| `GET /repos/{o}/{r}/environments` `total_count` | 0 (environment secrets reach jobs that name the environment) |
+| `GET /repos/{o}/{r}/actions/permissions/workflow` `default_workflow_permissions` | `read` |
+| `GET /repos/{o}/{r}/actions/permissions/fork-pr-contributor-approval` `approval_policy` | `all_external_contributors` (R9) |
+
+A check that cannot run (missing App permission, GitHub down) counts as failed. Policy `tierAPreconditions: enforce` (the default) refuses the allocation with `403 tier_precondition_failed`; `warn` (development only) allocates and audits `allocation.precondition`.
 
 ### 4.3 `GET /v1/allocations/{allocation_id}`
 
@@ -178,12 +194,14 @@ The host-side `AssignmentVerifier` polls this endpoint.
   "runner": {"id": 34, "name": "sand-dev-laptop-3f9a1c2e"},
   "observed_job": {"id": 140863154515, "run_id": 46107413025, "run_attempt": 1, "status": "in_progress", "observed_at": "…"},
   "admitted_job": null,
-  "decision": null
+  "decision": null,
+  "observed_ok_at": "…"
 }
 ```
 
-- **`observed_job`** is the broker's *own* REST view of the job that holds `runner.id`. The broker finds it from `workflow_job` webhooks in production. The mock instead scans `actions/runs?status=in_progress` and then each attempt's jobs, cached for 5 s.
+- **`observed_job`** is the broker's *own* REST view of the job that holds `runner.id`. The broker finds it from `workflow_job` webhooks in production. The mock instead scans every page of `actions/runs?status=in_progress` and then each attempt's jobs, cached for 5 s. The mock also observes undecided allocations on its own 2 s tick, so assignment and `admission_timeout` do not depend on the device polling.
 - It is `null` until the runner has taken a job.
+- **`observed_ok_at`** is when the broker last completed an observation in which every GitHub call succeeded. A `null` `observed_job` means "nothing running" only while `observed_ok_at` keeps advancing. Before admission, the device's verifier destroys the VM when `observed_ok_at` has not advanced for its deadline (`assignment.unadmitted`, reason `observation_stale`). A rate-limited or failing GitHub therefore cannot hide a job that skipped the hook.
 - **Owner check:** an allocation that belongs to another device returns `404`, not `403`.
 
 ### 4.4 `POST /v1/allocations/{allocation_id}/admissions`
@@ -351,8 +369,8 @@ The device sends its own events in batches of up to 100.
 | Area | Types |
 | --- | --- |
 | Device sessions | `device.session.created`, `device.session.denied` |
-| Allocations | `allocation.created`, `allocation.refused` (with a reason code), `allocation.expired`, `allocation.assigned` |
-| Admissions | `admission.allowed`, `admission.denied`, `admission.relay_error`, `assignment.unadmitted` (verifier: job seen without admission), `assignment.mismatch` (verifier: observed job differs from admitted) |
+| Allocations | `allocation.created`, `allocation.refused` (with a reason code), `allocation.expired`, `allocation.assigned`, `allocation.precondition` (Tier A precondition failures, §4.2.1) |
+| Admissions | `admission.allowed`, `admission.denied`, `admission.relay_error`, `admission.relay_rejected` (unauthenticated relay request; no kill), `assignment.unadmitted` (verifier: job seen without admission `admission_timeout`, broker observation stale `observation_stale`, guest `Runner.Worker` without admission `worker_unadmitted`, broker unreachable `broker_unreachable`), `assignment.mismatch` (verifier: observed job differs from admitted) |
 | VM | `vm.killed` (with a `cause`) |
 | Runners and runs | `runner.deregistered`, `runner.deregister_retry`, `runner.deregister_failed`, `run.cancelled`, `gc.runner_deleted` |
 
@@ -405,7 +423,8 @@ A `429` response carries a `Retry-After` header and `error.retry_after_seconds`.
 
 - **Sand side:**
   - `jit_config`, `nonce`, `session_token` and `oidc_token` are passed to the logger's `secrets:` list. They are never printed, even at debug level.
-  - Sand passes `jit_config` to the guest only through `ACTIONS_RUNNER_INPUT_JITCONFIG`. The runner masks it and removes it from its environment (`CommandSettings.cs:110-139`).
+  - Secrets never travel as process arguments. `ps` shows every local user the arguments of the host's `sshpass`/`ssh` for as long as they run, and the runner's SSH session lasts the whole job. Sand writes `jit_config` to that SSH session's **stdin**; the guest command (`IFS= read -r`) moves it into `ACTIONS_RUNNER_INPUT_JITCONFIG`, detaches stdin and starts `run.sh`. The hook script, which embeds the nonce, is installed the same way (`cat >` from stdin).
+  - **Remaining guest-side exposure:** the variable is in the *initial* environment of `run.sh`, `run-helper.sh` and `Runner.Listener` for the life of the job. The runner masks the value and removes it from its own environment (`CommandSettings.cs:110-139`), but that does not change the initial environment the kernel holds, so a same-user process in the guest can read it (`ps -wwE`). Before admission no workflow code runs; after admission, an admitted job's steps run as the same user and can read it. The JIT config is single-use and the runner is ephemeral, but a step that sends it out could register an impersonating runner elsewhere until the job ends. Closing this needs the patched-runner gate or a runner that reads the config from a file it deletes (ADR 0001 §8).
 - **The guest hook** prints only fixed strings.
 - **Broker side:** structured logs whitelist their fields. Request bodies are never logged.
 
@@ -415,9 +434,10 @@ The relay runs per VM on host `127.0.0.1:<ephemeral>`, reached from the guest as
 
 - **Request:** `POST /v1/admission` with body `{allocation_id, nonce, hints}`. The body is at most 4 KiB and arrives on a single connection.
 - **Response:** `200` with the plain-text body `allow` or `deny`. There is nothing else.
-- **Before forwarding,** the relay checks that `allocation_id` and `nonce` match the allocation it holds. It accepts at most one admission per VM; a second request gets `deny`.
-- **Timeout:** 45 s overall.
-- **On anything but an allow,** the relay answers `deny` and calls the host kill path.
+- **Authentication first.** The relay requires `Content-Type: application/json`, a parsable body of at most 4 KiB, and an `allocation_id` and `nonce` that match the allocation it holds (constant time). A request that fails any of these gets `deny` (415, 400 or 403) and an `admission.relay_rejected` audit event, but **does not kill the VM and does not use up the admission**: any local process (or a browser page sending a no-cors POST) can reach the loopback port, and it must not be able to destroy the VM.
+- **One admission per VM.** After the nonce matched, the first request is forwarded; any later request gets `deny`.
+- **Timeouts nest:** broker REST wait (policy, at most 30 s) < relay → broker call (45 s) < hook `curl --max-time` (50 s) < verifier deadline (at least 60 s). A slow but legitimate admission is never cut off by an outer layer first.
+- **On anything but an allow** (after the nonce matched), the relay records the kill, answers `deny` at once, and runs the host kill path (cancel provisioning, destroy the VM, release) in its own task. The hook gets its answer and kills the runner without waiting for the VM teardown.
 
 ## 8. GitHub App permissions used by the broker
 
@@ -427,3 +447,6 @@ The relay runs per VM on host `127.0.0.1:<ephemeral>`, reached from the guest as
 | Actions: read | runs, attempts, jobs | Yes |
 | Metadata: read | | Yes |
 | Actions: write | `cancelDeniedRuns` | Optional |
+| Secrets: read | Tier A precondition: repository and organization secret counts | Yes under `tierAPreconditions: enforce` |
+| Administration: read | Tier A precondition: default workflow permissions and fork-PR approval (covered by Administration: write) | Yes |
+| Environments: read | Tier A precondition: environment count | Yes under `enforce` |

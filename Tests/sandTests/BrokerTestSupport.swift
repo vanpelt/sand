@@ -126,6 +126,12 @@ final class FakeBrokerGitHub: BrokerGitHubAPI, @unchecked Sendable {
     var deleteResults: [DeleteRunnerResult] = []
     var cancelFails = false
     var failRuns = false
+    /// Fail only the in-progress listing (e.g. rate limited) or only job lookups.
+    var failInProgress = false
+    var failJobs = false
+    var tierA = TierAFacts(repositorySecrets: 0, organizationSecrets: 0, environments: 0, defaultWorkflowPermissions: "read", forkPullRequestApproval: "all_external_contributors")
+    var tierAError = false
+    private(set) var tierAChecks = 0
     private(set) var deleted: [Int] = []
     private(set) var cancelled: [Int] = []
     private(set) var jitRequests: [(name: String, labels: [String], group: Int, folder: String)] = []
@@ -153,6 +159,7 @@ final class FakeBrokerGitHub: BrokerGitHubAPI, @unchecked Sendable {
     func runs(status: String) async throws -> [GitHubRun] {
         try lock.withLock {
             if failRuns { throw GitHubServiceError.httpError(status: 503, body: "") }
+            if failInProgress && status == "in_progress" { throw GitHubServiceError.httpError(status: 429, body: "") }
             return status == "queued" ? queuedRuns : inProgressRuns
         }
     }
@@ -167,6 +174,7 @@ final class FakeBrokerGitHub: BrokerGitHubAPI, @unchecked Sendable {
     func attemptJobs(runId: Int, attempt: Int) async throws -> [GitHubJob] {
         try lock.withLock {
             let key = "\(runId)/\(attempt)"
+            if failJobs { throw GitHubServiceError.httpError(status: 403, body: "") }
             guard var answers = jobs[key], !answers.isEmpty else {
                 if failRuns { throw GitHubServiceError.httpError(status: 503, body: "") }
                 return []
@@ -187,6 +195,14 @@ final class FakeBrokerGitHub: BrokerGitHubAPI, @unchecked Sendable {
 
     func listRunners() async throws -> [GitHubService.RunnersResponse.Runner] { lock.withLock { runners } }
 
+    func tierAFacts(ownerIsUser: Bool) async throws -> TierAFacts {
+        try lock.withLock {
+            tierAChecks += 1
+            if tierAError { throw GitHubServiceError.httpError(status: 403, body: "") }
+            return tierA
+        }
+    }
+
     func cancelRun(id: Int) async throws {
         try lock.withLock {
             cancelled.append(id)
@@ -201,6 +217,8 @@ final class FakeBrokerClient: BrokerClienting, @unchecked Sendable {
     var admitResult: Result<AdmissionDecision, Error> = .failure(BrokerClientError.transport("unset"))
     var admitDelay: TimeInterval = 0
     var statuses: [Result<AllocationStatus, Error>] = []
+    /// Overrides `statuses` when set (computed per poll).
+    var statusProvider: (@Sendable () -> Result<AllocationStatus, Error>)?
     var allocateResults: [Result<Allocation, Error>] = []
     private(set) var admitCalls: [AdmissionRequest] = []
     private(set) var releases: [ReleaseRequest] = []
@@ -220,6 +238,7 @@ final class FakeBrokerClient: BrokerClienting, @unchecked Sendable {
     func status(allocationId: String) async throws -> AllocationStatus {
         let next: Result<AllocationStatus, Error> = lock.withLock {
             statusCalls += 1
+            if let statusProvider { return statusProvider() }
             if statuses.count > 1 { return statuses.removeFirst() }
             return statuses.first ?? .failure(BrokerClientError.transport("none"))
         }
@@ -258,4 +277,19 @@ func decision(_ verdict: AdmissionVerdict, _ reasons: [DenyReason] = [], jobId: 
         job: AdmissionJob(id: jobId, runId: Spike.runId, runAttempt: 1, workflowPath: ".github/workflows/self-hosted-smoke.yml", headBranch: "main", event: "push"),
         policyVersion: "pilot-1", decidedAt: Date()
     )
+}
+
+/// A one-shot gate: `wait()` suspends until `open()`.
+actor AsyncGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+    func open() {
+        isOpen = true
+        waiters.forEach { $0.resume() }
+        waiters = []
+    }
 }

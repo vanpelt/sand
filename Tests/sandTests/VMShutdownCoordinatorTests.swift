@@ -106,6 +106,63 @@ final class VMShutdownCoordinatorTests: XCTestCase {
     }
 }
 
+/// `tart delete` fails a given number of times; `tart list` reports the VM present.
+private final class FlakyDeleteRunner: ProcessRunning, @unchecked Sendable {
+    private let lock = NSLock()
+    private var failuresLeft: Int
+    private(set) var deletes = 0
+    init(failures: Int) { failuresLeft = failures }
+
+    func run(executable: String, arguments: [String], wait: Bool) async throws -> ProcessResult? {
+        switch arguments.first {
+        case "delete":
+            let fail = lock.withLock { () -> Bool in
+                deletes += 1
+                if failuresLeft > 0 { failuresLeft -= 1; return true }
+                return false
+            }
+            if fail { throw ProcessRunnerError.failed(exitCode: 1, stdout: "", stderr: "busy", command: ["tart"] + arguments) }
+        case "list":
+            return ProcessResult(stdout: #"[{"Name":"vm","State":"stopped","Source":"local"}]"#, stderr: "", exitCode: 0)
+        default:
+            break
+        }
+        return ProcessResult(stdout: "", stderr: "", exitCode: 0)
+    }
+
+    func start(executable: String, arguments: [String]) throws -> ProcessHandle {
+        ProcessHandle(waitAsync: { ProcessResult(stdout: "", stderr: "", exitCode: 0) }, terminate: {})
+    }
+}
+
+final class VMDestroyerRetryTests: XCTestCase {
+    func testDeleteIsRetried() async throws {
+        let runner = FlakyDeleteRunner(failures: 2)
+        var destroyer = VMDestroyer(tart: makeTart(runner), logger: Logger(label: "t", minimumLevel: .critical))
+        destroyer.deleteRetryDelays = [0, 0]
+        try await destroyer.destroy(name: "vm")
+        XCTAssertEqual(runner.deletes, 3)
+    }
+
+    /// Finding 6: a VM that cannot be deleted is reported, not ignored.
+    func testPersistentDeleteFailureIsRecordedAndStillDeregisters() async {
+        let runner = FlakyDeleteRunner(failures: 10)
+        let logger = Logger(label: "t", minimumLevel: .critical)
+        var destroyer = VMDestroyer(tart: makeTart(runner), logger: logger)
+        destroyer.deleteRetryDelays = [0, 0]
+        let coordinator = VMShutdownCoordinator(destroyer: destroyer, logger: logger)
+        let probe = DeregistrationProbe()
+        await coordinator.activate(name: "vm")
+        await coordinator.setDeregistration { await probe.record(true) }
+        await coordinator.cleanup(reason: "admission denied")
+        let failures = await coordinator.destroyFailures
+        XCTAssertEqual(failures, ["vm"])
+        XCTAssertEqual(runner.deletes, 3)
+        let released = await probe.values
+        XCTAssertEqual(released, [true])
+    }
+}
+
 private actor DeregistrationProbe {
     private(set) var values: [Bool] = []
 

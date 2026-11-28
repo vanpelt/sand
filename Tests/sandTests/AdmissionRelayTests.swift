@@ -28,8 +28,11 @@ import Testing
             return Data(#"{"allocation_id":"\#(allocationId)","nonce":"\#(nonce)","hints":\#(hintsJSON)}"#.utf8)
         }
 
-        func post(_ body: Data, path: String = "/v1/admission", method: String = "POST") async -> String {
-            let response = await relay.handle(HTTPRequest(method: method, path: path, query: nil, headers: ["content-type": "application/json"], body: body))
+        func post(_ body: Data, path: String = "/v1/admission", method: String = "POST", contentType: String? = "application/json") async -> String {
+            let headers = contentType.map { ["content-type": $0] } ?? [:]
+            let response = await relay.handle(HTTPRequest(method: method, path: path, query: nil, headers: headers, body: body))
+            // The relay answers before the (detached) VM teardown finishes.
+            await controller.waitForTeardown()
             return String(decoding: response.body, as: UTF8.self)
         }
     }
@@ -43,20 +46,44 @@ import Testing
         #expect(await f.post(f.body()) == "allow")
     }
 
-    @Test func oversizedBodyIsDenied() async {
+    /// Finding: unauthenticated local requests must not destroy the VM nor
+    /// spend its single admission; the real hook can still be admitted after.
+    @Test func unauthenticatedRequestsNeitherKillNorSpendTheAdmission() async {
         let f = Fixture()
+        f.broker.set { $0.admitResult = .success(decision(.allow)) }
         #expect(await f.post(Data(repeating: 0x20, count: 4097)) == "deny")
+        #expect(await f.post(Data("not json".utf8)) == "deny")
+        #expect(await f.post(f.body(), contentType: nil) == "deny", "a no-cors browser POST is text/plain")
+        #expect(await f.post(f.body(), contentType: "text/plain") == "deny")
+        #expect(await f.post(f.body(allocationId: "alc_99999999999999999999999999")) == "deny")
+        #expect(await f.post(f.body(nonce: String(repeating: "x", count: 43))) == "deny")
+        #expect(f.kills.reasons.isEmpty)
+        #expect(f.broker.admitCalls.isEmpty)
+        #expect(f.audit.types == Array(repeating: "admission.relay_rejected", count: 6))
+        #expect(await f.post(f.body()) == "allow")
+    }
+
+    @Test func authenticatedMalformedHintsKill() async {
+        let f = Fixture()
+        #expect(await f.post(f.body(hints: Spike.hints(runnerName: "bad name"))) == "deny")
         #expect(f.kills.reasons.count == 1)
         #expect(f.broker.admitCalls.isEmpty)
     }
 
-    @Test func mismatchedAllocationOrNonceIsDeniedWithoutABrokerCall() async {
-        for (id, nonce) in [("alc_99999999999999999999999999", Spike.allocation().nonce), (Spike.allocation().allocationId, String(repeating: "x", count: 43))] {
-            let f = Fixture()
-            #expect(await f.post(f.body(allocationId: id, nonce: nonce)) == "deny")
-            #expect(f.broker.admitCalls.isEmpty)
-            #expect(f.kills.reasons.count == 1)
-        }
+    /// Finding: the hook must get `deny` without waiting for the VM teardown.
+    @Test func denyIsAnsweredBeforeTheTeardownFinishes() async throws {
+        let gate = AsyncGate()
+        let audit = AuditCollector()
+        let broker = FakeBrokerClient()
+        broker.set { $0.admitResult = .success(decision(.deny, [.workflowNotAllowed])) }
+        let controller = AdmissionController(allocation: Spike.allocation(), deviceId: "dev-laptop", audit: audit.audit) { _ in await gate.wait() }
+        let relay = AdmissionRelay(controller: controller, broker: broker, vmName: "laptop-runner", timeout: 5)
+        let body = Fixture().body()
+        let response = await relay.handle(HTTPRequest(method: "POST", path: "/v1/admission", query: nil, headers: ["content-type": "application/json"], body: body))
+        #expect(String(decoding: response.body, as: UTF8.self) == "deny")
+        #expect(await controller.wasKilled, "recorded before answering")
+        await gate.open()
+        await controller.waitForTeardown()
     }
 
     @Test func brokerAllowAnswersAllow() async {
@@ -126,5 +153,31 @@ import Testing
         }.value
         #expect(reply.hasPrefix("HTTP/1.1 200"))
         #expect(reply.hasSuffix("\r\n\r\nallow"))
+    }
+}
+
+@Suite struct WithTimeoutTests {
+    /// A call that ignores cancellation (a Keychain prompt nobody answers)
+    /// must not hold the caller past the deadline.
+    @Test func timeoutReturnsEvenWhenTheOperationIgnoresCancellation() async {
+        let start = Date()
+        let result = await withTimeout(0.2) { () -> Int in
+            usleep(2_000_000) // blocking, uncancellable
+            return 1
+        }
+        #expect(Date().timeIntervalSince(start) < 1.5)
+        guard case .failure(let error) = result else { Issue.record("expected a timeout"); return }
+        #expect(error is RelayTimeout)
+    }
+
+    @Test func fastOperationWins() async throws {
+        let result = await withTimeout(5) { 42 }
+        #expect(try result.get() == 42)
+    }
+
+    @Test func errorsPassThrough() async {
+        let result = await withTimeout(5) { () -> Int in throw BrokerClientError.invalidResponse }
+        guard case .failure(let error) = result else { Issue.record("expected failure"); return }
+        #expect(error is BrokerClientError)
     }
 }

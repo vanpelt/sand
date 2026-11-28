@@ -119,7 +119,7 @@ import Testing
     @Test func runnerRedactsTheJITConfigAndNonceFromCommandLogs() throws {
         let allocation = Spike.allocation(nonce: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJ0123456")
         let commands = try GitHubProvisioner().brokerScript(allocation: allocation, jitConfig: "JIT-SECRET-XYZ", egress: .standard)
-        let logged = commands.map { Runner.redact($0, secrets: ["JIT-SECRET-XYZ", allocation.nonce]) }.joined(separator: "\n")
+        let logged = commands.map { Runner.redact($0.command + ($0.stdin ?? ""), secrets: ["JIT-SECRET-XYZ", allocation.nonce]) }.joined(separator: "\n")
         #expect(!logged.contains("JIT-SECRET-XYZ"))
         #expect(!logged.contains(allocation.nonce))
         #expect(logged.contains("[REDACTED]"))

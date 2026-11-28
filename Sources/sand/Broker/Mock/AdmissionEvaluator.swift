@@ -12,11 +12,15 @@ struct AdmissionPolicy: Codable, Sendable, Equatable {
     var requireOIDC: Bool? = false
     var cancelDeniedRuns: Bool? = false
     var admissionWaitSeconds: Int? = 15
-    var admissionDeadlineSeconds: Int? = 30
+    var admissionDeadlineSeconds: Int? = 60
     var idleTTLSeconds: Int? = 900
+    /// `enforce` (default) refuses allocations while a Tier A precondition
+    /// fails; `warn` allocates and audits the failure (development only).
+    var tierAPreconditions: String? = "enforce"
 
     var waitSeconds: Int { admissionWaitSeconds ?? 15 }
-    var deadlineSeconds: Int { admissionDeadlineSeconds ?? 30 }
+    var deadlineSeconds: Int { admissionDeadlineSeconds ?? 60 }
+    var enforcesTierAPreconditions: Bool { tierAPreconditions != "warn" }
     var idleTTL: Int { idleTTLSeconds ?? 900 }
     var requiresQueuedJob: Bool { requireQueuedJob ?? true }
     var requiresOIDC: Bool { requireOIDC ?? false }
@@ -96,7 +100,8 @@ enum AdmissionEvaluator {
         if run.actor?.id != ownerId { reasons.append(.actorNotOwner) }
         if run.triggeringActor?.id != ownerId { reasons.append(.triggeringActorNotOwner) }
         if !policy.workflows.contains(run.path) { reasons.append(.workflowNotAllowed) }
-        if !(run.referencedWorkflows ?? []).isEmpty && !(policy.allowReusableWorkflows ?? false) {
+        // A missing field fails closed like every other missing fact.
+        if (run.referencedWorkflows.map { !$0.isEmpty } ?? true) && !(policy.allowReusableWorkflows ?? false) {
             reasons.append(.reusableWorkflowNotAllowed)
         }
         if !policy.branchAllowed(run.headBranch) { reasons.append(.refNotAllowed) }

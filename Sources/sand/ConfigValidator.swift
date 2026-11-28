@@ -396,11 +396,13 @@ final class ConfigValidator {
         if github.extraLabels != nil {
             issues.append(.init(severity: .error, message: "provisioner.config.extraLabels is not allowed with broker; the broker policy owns the labels."))
         }
-        if let problem = BrokerConfig.urlProblem(broker.url) {
+        if let problem = BrokerConfig.urlProblem(broker.url, allowDevelopmentBroker: broker.allowDevelopmentBroker ?? false) {
             issues.append(.init(severity: .error, message: problem))
+        } else if broker.isDevelopmentBroker {
+            issues.append(.init(severity: .warning, message: "provisioner.config.broker.url is a plain-http development broker: its decisions are unauthenticated. Development only."))
         }
         if !BrokerConfig.isValidDeviceId(broker.deviceId) {
-            issues.append(.init(severity: .error, message: "provisioner.config.broker.deviceId must match ^[a-z0-9][a-z0-9-]{0,62}$."))
+            issues.append(.init(severity: .error, message: "provisioner.config.broker.deviceId must match ^[a-z0-9][a-z0-9-]{0,49}$."))
         }
         if !FileManager.default.fileExists(atPath: broker.deviceKeyPath) {
             issues.append(.init(severity: .error, message: "Device key not found at \(broker.deviceKeyPath) (create one with sand broker keygen)."))

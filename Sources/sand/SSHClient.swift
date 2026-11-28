@@ -59,6 +59,18 @@ struct SSHClient {
         )
     }
 
+    /// Runs `command` with `stdin` on the remote side's standard input. Use it
+    /// for secrets: arguments of `sshpass`/`ssh` are visible in `ps`.
+    func start(command: String, stdin: String?) throws -> ProcessHandle {
+        guard let stdin else { return try start(command: command) }
+        return try processRunner.start(
+            executable: "sshpass",
+            arguments: sshArguments(command: command),
+            environment: Self.childEnvironment(),
+            stdin: Data(stdin.utf8)
+        )
+    }
+
     func copy(localPath: String, remotePath: String) async throws -> ProcessResult? {
         return try await processRunner.run(
             executable: "sshpass",

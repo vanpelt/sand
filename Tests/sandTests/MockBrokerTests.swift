@@ -249,6 +249,91 @@ struct BrokerHarness {
         #expect(status.observedJob?.id == Spike.jobId)
         #expect(status.admittedJob == nil)
         await #expect(throws: BrokerAPIError.self) { _ = try await h.store.status(deviceId: "other", allocationId: allocation.allocationId) }
+        #expect(status.observedOkAt == h.clock.now)
+    }
+
+    /// Finding 1: a failing or rate-limited GitHub must read as stale, not as
+    /// "nothing running": observed_ok_at does not advance.
+    @Test(arguments: ["runs", "jobs"])
+    func failedObservationDoesNotAdvanceObservedOkAt(_ failing: String) async throws {
+        let h = BrokerHarness()
+        let allocation = try await h.assigned()
+        h.github.set { if failing == "runs" { $0.failInProgress = true } else { $0.failJobs = true } }
+        let status = try await h.store.status(deviceId: "dev-laptop", allocationId: allocation.allocationId)
+        #expect(status.observedJob == nil)
+        #expect(status.observedOkAt == nil)
+        #expect(status.state == .registered)
+    }
+
+    /// Finding 1: the mock observes and times out undecided allocations on
+    /// its own tick, even when the device stops polling status.
+    @Test func tickAssignsAndTimesOutWithoutDevicePolls() async throws {
+        let h = BrokerHarness()
+        let allocation = try await h.assigned()
+        await h.store.tick()
+        #expect(await h.store.record(allocation.allocationId)?.state == .assigned)
+        h.clock.advance(61)
+        await h.store.tick()
+        let record = await h.store.record(allocation.allocationId)
+        #expect(record?.state == .denied)
+        #expect(record?.decision?.reasons == [.admissionTimeout])
+    }
+
+    // MARK: - Tier A preconditions (finding 4)
+
+    @Test func failingPreconditionRefusesAllocationWhenEnforced() async throws {
+        let h = BrokerHarness()
+        h.github.set { $0.tierA.repositorySecrets = 1; $0.tierA.forkPullRequestApproval = "first_time_contributors" }
+        do {
+            _ = try await h.allocate()
+            Issue.record("expected tier_precondition_failed")
+        } catch let error as BrokerAPIError {
+            #expect(error.status == 403)
+            #expect(error.code == "tier_precondition_failed")
+            #expect(error.message.contains("repository_secrets=1"))
+            #expect(error.message.contains("fork_pr_approval=first_time_contributors"))
+        }
+        #expect(h.github.set { $0.jitRequests.isEmpty }, "no runner is registered")
+    }
+
+    @Test(arguments: [
+        TierAFacts(repositorySecrets: 0, organizationSecrets: 2, environments: 0, defaultWorkflowPermissions: "read", forkPullRequestApproval: "all_external_contributors"),
+        TierAFacts(repositorySecrets: 0, organizationSecrets: 0, environments: 1, defaultWorkflowPermissions: "read", forkPullRequestApproval: "all_external_contributors"),
+        TierAFacts(repositorySecrets: 0, organizationSecrets: 0, environments: 0, defaultWorkflowPermissions: "write", forkPullRequestApproval: "all_external_contributors")
+    ])
+    func eachPreconditionIsChecked(_ facts: TierAFacts) {
+        #expect(facts.failures.count == 1)
+    }
+
+    @Test func uncheckablePreconditionFailsClosed() async throws {
+        let h = BrokerHarness()
+        h.github.set { $0.tierAError = true }
+        await #expect(throws: BrokerAPIError(status: 403, code: "tier_precondition_failed", message: "Tier A preconditions not met: check_failed")) {
+            _ = try await h.allocate()
+        }
+    }
+
+    @Test func warnModeAllocatesAndAudits() async throws {
+        var policy = Spike.policy
+        policy.tierAPreconditions = "warn"
+        let h = BrokerHarness(policy: policy)
+        h.github.set { $0.tierA.forkPullRequestApproval = "first_time_contributors" }
+        let (status, _) = try await h.allocate()
+        #expect(status == 201)
+        let event = h.audit.events.first { $0.type == "allocation.precondition" }
+        #expect(event?.fields["mode"] == "warn")
+        #expect(event?.fields["failures"] == "fork_pr_approval=first_time_contributors")
+    }
+
+    @Test func preconditionsAreCachedForFiveMinutes() async throws {
+        let h = BrokerHarness()
+        _ = try await h.allocate()
+        let first = h.github.set { $0.tierAChecks }
+        _ = await h.store.checkPreconditions()
+        #expect(h.github.set { $0.tierAChecks } == first)
+        h.clock.advance(301)
+        _ = await h.store.checkPreconditions()
+        #expect(h.github.set { $0.tierAChecks } == first + 1)
     }
 }
 
@@ -349,7 +434,7 @@ struct BrokerHarness {
         let h = BrokerHarness()
         let allocation = try await h.assigned()
         _ = try await h.store.status(deviceId: "dev-laptop", allocationId: allocation.allocationId)
-        h.clock.advance(31)
+        h.clock.advance(61)
         await h.store.tick()
         let record = await h.store.record(allocation.allocationId)
         #expect(record?.state == .denied)
@@ -435,13 +520,34 @@ struct BrokerHarness {
         #expect(config.validationErrors().contains { $0.contains("listen.host") })
     }
 
+    /// Finding 10: timeouts must nest (broker wait < relay < hook < verifier).
+    @Test func timeoutOrderingIsValidated() {
+        func errors(wait: Int?, deadline: Int?) -> [String] {
+            var policy = Spike.policy
+            policy.admissionWaitSeconds = wait
+            policy.admissionDeadlineSeconds = deadline
+            return MockBrokerConfig(
+                github: .init(appId: 1, privateKeyPath: nil, privateKeyKeychainLabel: "l", owner: "o", repository: "r"),
+                devices: [.init(id: "dev", publicKeyPath: "/x", owner: .init(login: "u", id: 1), revoked: nil)],
+                policy: policy
+            ).validationErrors()
+        }
+        #expect(errors(wait: nil, deadline: nil).isEmpty)
+        #expect(errors(wait: 31, deadline: 60).contains { $0.contains("admissionWaitSeconds") })
+        #expect(errors(wait: 15, deadline: 30).contains { $0.contains("admissionDeadlineSeconds") })
+        #expect(Double(AdmissionTimeouts.maxBrokerWaitSeconds) < AdmissionTimeouts.relaySeconds)
+        #expect(AdmissionTimeouts.relaySeconds < Double(AdmissionTimeouts.hookCurlSeconds))
+        #expect(Double(AdmissionTimeouts.hookCurlSeconds) < AdmissionTimeouts.minimumVerifierDeadline)
+    }
+
     @Test func fixtureLoadsAndValidates() throws {
         let path = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("fixtures/broker_mock.yml").path
         let config = try MockBrokerConfig.load(path: path)
         #expect(config.validationErrors().isEmpty)
         #expect(config.policy.labels == Spike.labels)
-        #expect(config.policy.deadlineSeconds == 30)
+        #expect(config.policy.deadlineSeconds == 60)
+        #expect(config.policy.enforcesTierAPreconditions)
     }
 
     @Test func endToEndOverHTTPWithBrokerClient() async throws {

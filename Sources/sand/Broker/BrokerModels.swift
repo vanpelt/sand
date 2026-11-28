@@ -48,6 +48,7 @@ enum DenyReason: String, Codable, Sendable, CaseIterable, Hashable {
     case circuitOpen = "circuit_open"
     case githubUnavailable = "github_unavailable"
     case admissionTimeout = "admission_timeout"
+    case tierPreconditionFailed = "tier_precondition_failed"
 }
 
 enum AllocationState: String, Codable, Sendable {
@@ -178,6 +179,11 @@ struct AllocationStatus: Codable, Sendable, Equatable {
     var observedJob: JobRef?
     var admittedJob: JobRef?
     var decision: AdmissionVerdict?
+    /// When the broker last completed a full observation of the runner's job
+    /// (every GitHub call succeeded). Null `observed_job` is "nothing running"
+    /// only while this keeps advancing; the verifier kills an unadmitted VM
+    /// when it stalls past the deadline (ADR 0001 §3.8).
+    var observedOkAt: Date?
 }
 
 // MARK: - Admissions
@@ -189,8 +195,8 @@ struct AdmissionHints: Codable, Sendable, Equatable {
     let runnerName: String
     let jobKey: String
 
-    static let runnerNamePattern = #"^[A-Za-z0-9._-]{1,64}$"#
-    static let jobKeyPattern = #"^[A-Za-z_][A-Za-z0-9_-]{0,99}$"#
+    static let runnerNamePattern = #"^[A-Za-z0-9._-]{1,64}\z"#
+    static let jobKeyPattern = #"^[A-Za-z_][A-Za-z0-9_-]{0,99}\z"#
 
     var isWellFormed: Bool {
         repositoryId > 0 && runId > 0 && runAttempt > 0
@@ -283,7 +289,7 @@ enum BrokerID {
     }
 
     static func matches(_ value: String, prefix: String) -> Bool {
-        value.range(of: "^\(prefix)_[0-9A-Z]{26}$", options: .regularExpression) != nil
+        value.range(of: "^\(prefix)_[0-9A-Z]{26}\\z", options: .regularExpression) != nil
     }
 }
 
@@ -305,7 +311,7 @@ enum Base64URL {
     }
 
     static func decode(_ string: String) -> Data? {
-        guard string.range(of: "^[A-Za-z0-9_-]*$", options: .regularExpression) != nil else { return nil }
+        guard string.range(of: #"^[A-Za-z0-9_-]*\z"#, options: .regularExpression) != nil else { return nil }
         var base64 = string.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
         while base64.count % 4 != 0 { base64 += "=" }
         return Data(base64Encoded: base64)
@@ -313,7 +319,7 @@ enum Base64URL {
 
     /// A 32-byte value in unpadded base64url is exactly 43 characters.
     static func isToken32(_ value: String) -> Bool {
-        value.range(of: "^[A-Za-z0-9_-]{43}$", options: .regularExpression) != nil
+        value.range(of: #"^[A-Za-z0-9_-]{43}\z"#, options: .regularExpression) != nil
     }
 }
 
