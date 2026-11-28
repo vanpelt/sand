@@ -1,0 +1,19 @@
+name: Spike target (unique label)
+# SPIKE (spike/job-admission): targets the per-session unique runner label.
+on:
+  push:
+    branches: [spike/job-admission]
+    paths: [spike/triggers/target]
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  target:
+    runs-on: [self-hosted, sand-spike-c14d30ddb2c0]
+    timeout-minutes: 10
+    steps:
+      - name: Normal step
+        run: echo "SPIKE-MARKER target normal step ran on $RUNNER_NAME"
+      - name: Always step
+        if: always()
+        run: echo "SPIKE-MARKER target always step ran"

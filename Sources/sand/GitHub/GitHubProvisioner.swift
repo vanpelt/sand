@@ -1,3 +1,5 @@
+import Foundation
+
 struct GitHubProvisionerConfig: Decodable, Sendable {
     let appId: Int
     let organization: String
@@ -62,9 +64,24 @@ struct GitHubProvisioner: Sendable {
         } else {
             commands.append(configure)
         }
+        commands.append(contentsOf: Self.spikeHookCommands())
         commands.append("echo \"Runner configured, starting ~/actions-runner/run.sh\"")
         commands.append("~/actions-runner/run.sh")
         return commands
+    }
+
+    /// SPIKE ONLY (spike/job-admission): when the host environment names a
+    /// script in SAND_SPIKE_HOOK_SCRIPT, install it in the guest outside
+    /// ~/actions-runner and point ACTIONS_RUNNER_HOOK_JOB_STARTED at it via
+    /// the runner's .env. Not for production use.
+    static func spikeHookCommands(environment: [String: String] = ProcessInfo.processInfo.environment) -> [String] {
+        guard let path = environment["SAND_SPIKE_HOOK_SCRIPT"],
+              let data = FileManager.default.contents(atPath: path) else { return [] }
+        let encoded = data.base64EncodedString()
+        return [
+            "mkdir -p ~/sand-hook && printf '%s' \(encoded) | base64 --decode > ~/sand-hook/job-started.sh && chmod 0555 ~/sand-hook/job-started.sh",
+            "printf 'ACTIONS_RUNNER_HOOK_JOB_STARTED=%s\\n' \"$HOME/sand-hook/job-started.sh\" >> ~/actions-runner/.env && echo \"spike hook installed\""
+        ]
     }
 
     static func shellQuote(_ value: String) -> String {

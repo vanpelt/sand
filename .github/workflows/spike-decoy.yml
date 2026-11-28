@@ -1,0 +1,23 @@
+name: Spike decoy (generic labels)
+# SPIKE (spike/job-admission): a job any [self-hosted, sand] runner matches.
+on:
+  push:
+    branches: [spike/job-admission]
+    paths: [spike/triggers/decoy]
+permissions:
+  contents: read
+jobs:
+  decoy:
+    runs-on: [self-hosted, sand]
+    timeout-minutes: 10
+    env:
+      FOO: bar
+      BASH_ENV: /tmp/sand-spike-bashenv
+      ACTIONS_RUNNER_HOOK_JOB_STARTED: /tmp/sand-spike-evil-hook
+    steps:
+      - uses: vanpelt/sand/.github/actions/pre-probe@spike/job-admission
+      - name: Normal step
+        run: echo "SPIKE-MARKER normal step ran"
+      - name: Always step
+        if: always()
+        run: echo "SPIKE-MARKER always step ran; FOO=${FOO:-unset}"
