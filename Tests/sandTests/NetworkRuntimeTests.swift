@@ -129,6 +129,18 @@ func makePreflight(runner: ScriptedProcessRunner, fileSystem: FakeFileSystem = F
         #expect(checks.contains { $0.name == "P4 GitHub egress" && $0.detail.contains("VPN-steered") })
     }
 
+    @Test func requireSteeringFailsP4WithoutAVPNFront() async {
+        let required = try! NetworkConfig(selection: .profile(.github), backend: .softnet, requireSteering: true).compile()
+        let steered = await makePreflight(runner: ScriptedProcessRunner(responder: currentToolHelp)).run(policy: required)
+        #expect(NetworkPreflight.failures(steered).isEmpty, "\(steered.map(\.line))")
+        let publicOnly = StaticHostResolver(table: ["github.com": [IPAddress("140.82.112.3")!], "api.github.com": [IPAddress("140.82.114.6")!]])
+        let failures = NetworkPreflight.failures(await makePreflight(runner: ScriptedProcessRunner(responder: currentToolHelp), resolver: publicOnly).run(policy: required))
+        #expect(failures.contains { $0.name == "P4 GitHub egress" && $0.detail.contains("requireSteering") })
+        // Without requireSteering, public GitHub is fine.
+        let plain = NetworkPreflight.failures(await makePreflight(runner: ScriptedProcessRunner(responder: currentToolHelp), resolver: publicOnly).run(policy: github))
+        #expect(!plain.contains { $0.name == "P4 GitHub egress" })
+    }
+
     @Test func missingSoftnetFails() async {
         var fileSystem = FakeFileSystem()
         fileSystem.paths["softnet"] = nil

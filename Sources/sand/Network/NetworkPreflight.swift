@@ -290,7 +290,7 @@ struct NetworkPreflight: Sendable {
         }
         if let egress = policy.egress {
             checks.append(checkDirectCIDROverlap(egress))
-            checks.append(contentsOf: await checkHostEgress())
+            checks.append(contentsOf: await checkHostEgress(requireSteering: egress.requireSteering))
             if let proxySelfTest {
                 checks.append(contentsOf: await proxySelfTest(egress))
             }
@@ -576,7 +576,7 @@ struct NetworkPreflight: Sendable {
         return PreflightCheck(Self.pinCheckName, .ok, "SHA-256 \(actual.prefix(16))... matches \(expected.map(\.source).joined(separator: " and "))")
     }
 
-    func checkHostEgress() async -> [PreflightCheck] {
+    func checkHostEgress(requireSteering: Bool = false) async -> [PreflightCheck] {
         var checks: [PreflightCheck] = []
         var steered = false
         for host in ["github.com", "api.github.com"] {
@@ -590,6 +590,11 @@ struct NetworkPreflight: Sendable {
             }
         }
         switch await hostProbe.tlsHandshake(host: "api.github.com", port: 443, timeout: 10) {
+        case .success where requireSteering && !steered:
+            checks.append(PreflightCheck(
+                "P4 GitHub egress", .failed, "requireSteering is set but github.com and api.github.com resolve to public addresses",
+                remediation: "Connect the VPN that steers GitHub (e.g. BlastShield), or remove vm.run.network.requireSteering."
+            ))
         case .success:
             checks.append(PreflightCheck("P4 GitHub egress", .ok, steered ? "via VPN-steered front (split DNS)" : "direct"))
         case let .failure(error):

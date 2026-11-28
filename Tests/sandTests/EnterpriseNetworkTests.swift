@@ -589,6 +589,7 @@ struct FakeTrustStore: HostTrustStore {
         #expect(managed.softnetSHA256.map(SoftnetDiscovery.isSHA256) == true)
         let full = try Config.load(path: fixtures.appendingPathComponent("sample_full_config.yml").path).runners.map(\.vm.run.network)
         #expect(full.contains { $0.softnetPath == SoftnetDiscovery.managedPath && $0.softnetSHA256 != nil })
+        #expect(full.contains { $0.quietDenies == ["*.telemetry.example.com"] && $0.quietOSBackground == true && $0.requireSteering == false })
         let zeroConfig = try #require(try Config.load(path: fixtures.appendingPathComponent("network_github_default.yml").path).runners.first).vm.run.network
         #expect(zeroConfig.backendChoice == .auto)
     }

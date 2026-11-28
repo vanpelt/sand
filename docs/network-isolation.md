@@ -365,13 +365,66 @@ Other interactions:
   process flows, so the endpoint agent may intercept them. See
   [TLS-inspecting endpoint agents](#tls-inspecting-endpoint-agents-netskope-zscaler).
 - **Disconnecting the VPN mid-run.** New connections resolve to public
-  addresses and go out directly. A GitHub IP allow list then answers 403
-  inside the job. That is a visible failure, not a leak.
+  addresses and, after the flip retry below, go out directly. A GitHub IP
+  allow list then answers 403 inside the job. That is a visible failure, not
+  a leak. With `requireSteering: true` they are refused instead.
 - **VM subnet collisions.** The backend picks the VM's subnet (hostOnly:
   vmnet's host-only range, typically 192.168.128.0/24). If it overlaps a
   host route, such as the VPN's 172.16/16, it would shadow the steered fronts.
   Sand recreates the VM (up to three times) and fails if it keeps colliding.
   The watchdog also ends a job if a later route change creates an overlap.
+
+### Steering flips
+
+On a BlastShield Mac a steered name can briefly resolve to its **public**
+address. Observed in a real Actions job: `network.steering.learned` saw
+`interfaces=utun8` when the VM's proxy started (after the VM had an IP), about
+20 s later the runner's first `api.github.com` connection resolved to
+140.82.114.6 and left directly (`steered=false`), and 20 s after that
+`api.github.com` resolved to its front 172.16.0.150 again. It had been seen
+right after VM boots before. The likely cause is the VM's vmnet interface
+coming up: macOS re-evaluates its resolver configuration, and for a short
+window the VPN's supplemental (split-DNS) resolver is not consulted. A job
+then talks to GitHub from the host's public IP, which an organisation IP
+allow list rejects.
+
+The proxy rides this out:
+
+- `network.steering.learned` records which steered names resolved to a
+  private front (`steered=`) and which did not (`public=`) when the VM's
+  proxy started. Every steered connection made later in the same VM adds its
+  name to that set.
+- When a name from that set (or any steered name under `requireSteering`)
+  resolves only to public addresses, or fails to resolve, the proxy
+  re-resolves it with a short backoff (0.25, 0.5, 0.75, 1, 1.25, 1.25 s:
+  about 5 s, inside the 15 s connect timeout) and uses the first steered
+  answer. A mixed answer for a steered name always prefers the front.
+- Every such event is audited as `network.steering.flip` with `outcome=`
+  `recovered` (info: a later answer was steered), `public` (warning: the
+  connection egresses directly) or `denied` (warning: `requireSteering`),
+  plus `attempts=`, `waited_ms=`, `since_proxy_start_ms=` and the `first=`
+  and `final=` answers, so the timing of a flip can be lined up with the VM
+  lifecycle.
+
+`requireSteering: true` (profile github, default false) makes the steered
+GitHub names fail closed instead of egressing publicly:
+
+- a steered name whose answer is still public after the retry is refused
+  with `steering-required` (HTTP 502, `X-Sand-Deny: steering-required`), and
+  a refused front (for example `steered-route-mismatch`) never falls back to
+  a public address;
+- preflight P4 fails when `github.com` and `api.github.com` both resolve
+  public (the VPN is down);
+- it is part of the policy hash.
+
+Use it where public egress to GitHub is never correct (an IP allow list
+that only admits the VPN egress). Leave it off on Macs that are sometimes
+used without the VPN.
+
+The proxy already starts only after the VM has an IP and answers SSH, so
+learning never runs before the VM's network exists. It can still run inside
+a flip window; the in-session memory makes a later steered answer count
+from then on.
 
 ## TLS-inspecting endpoint agents (Netskope, Zscaler)
 
@@ -639,12 +692,12 @@ it changes the image, the right set differs per macOS release, and some of
 these services (Software Update scans, MDM enrollment) are wanted on images
 that are also used interactively. Options, all applied when baking the image:
 
-- Disable the agents that generate most of it, for example with
-  `launchctl disable gui/501/com.apple.weather.menu` style overrides or by
-  turning off Location Services, Weather/Stocks widgets, App Store
-  automatic checks and iCloud sign-in (`softwareupdate --schedule off`,
-  `defaults write com.apple.commerce AutoUpdate -bool false`,
+- Turn off the features that generate most of it: Location Services,
+  Weather/Stocks widgets, iCloud sign-in, and App Store and Software Update
+  automatic checks (for example `softwareupdate --schedule off` and
   `defaults write com.apple.SoftwareUpdate AutomaticCheckEnabled -bool false`).
+  Check the result with the `top_quiet=` count of a test job; the agents
+  involved change between macOS releases.
 - Pin the names to an unroutable address in the guest's `/etc/hosts`
   (`0.0.0.0 bag.itunes.apple.com`): the client then fails locally and never
   reaches the proxy. This hides the attempt from the audit log entirely,

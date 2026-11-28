@@ -149,6 +149,9 @@ struct NetworkPolicy: Sendable, Equatable {
             canonical["steered"] = egress.steeredNames.sorted()
             canonical["verify"] = [egress.verify.rawValue]
             canonical["tlsInspection"] = [options.tlsInspection.rawValue]
+            if egress.requireSteering {
+                canonical["requireSteering"] = ["true"]
+            }
         }
         if let backend {
             canonical["backend"] = [backend.rawValue]
@@ -205,6 +208,12 @@ struct NetworkPolicy: Sendable, Equatable {
             lines.append("verify: \(egress.verify.rawValue)")
             lines.append("TLS inspection: \(options.tlsInspection.rawValue)" + (options.tlsInspection == .trustHostCA ? " (an intercepting host CA, if detected, is trusted in the guest)" : " (detected interception fails preflight)"))
             lines.append("steered names (VPN split-DNS fronts allowed): \(egress.steeredNames.sorted().joined(separator: ", "))")
+            lines.append(egress.requireSteering
+                ? "requireSteering: a steered name that resolves only to public addresses (after a ~5 s re-resolve) is refused"
+                : "steering flips: a steered name seen on its VPN front that resolves public is re-resolved for up to ~5 s, then egresses directly")
+            if !egress.osBackground.isEmpty || !egress.quietDenies.isEmpty {
+                lines.append("quiet denies (still denied, logged at debug): \(egress.osBackground.isEmpty ? "" : "built-in macOS background list (\(egress.osBackground.count) patterns)")\(egress.osBackground.isEmpty || egress.quietDenies.isEmpty ? "" : ", ")\(egress.quietDenies.map(\.description).joined(separator: ", "))")
+            }
             lines.append("allowed destinations (\(egress.rules.count)):")
             lines.append(contentsOf: egress.rules.map { "  - \($0)" })
             if !egress.extraCIDRs.isEmpty {

@@ -74,6 +74,10 @@ runners:
           acceptedHostListeners: []  # with deny: accepted exposures, e.g. [tcp/7000, udp/5353, udp/*]
           tlsInspection: fail      # fail (default) | trustHostCA: trust the host's TLS-inspection CA in the guest
           maxEnforcementFailures: 3  # consecutive enforcement failures before sand run exits 78
+          quietOSBackground: true  # default: deny macOS background endpoints quietly (debug log, counted); false logs them as warnings
+          quietDenies:             # extra names whose denies are logged at debug and counted (still denied)
+            - "*.telemetry.example.com"
+          requireSteering: false   # default; true refuses steered GitHub names that resolve only to public addresses
           allowedCIDRs:            # expert escape hatch (softnet backend only): direct allows that bypass the proxy
             - cidr: 203.0.113.10/32
               port: 443
