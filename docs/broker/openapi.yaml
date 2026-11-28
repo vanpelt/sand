@@ -1,0 +1,387 @@
+openapi: 3.1.0
+info:
+  title: Sand registration broker
+  version: 1.0.0
+  description: >
+    Device-facing broker API. See docs/broker-api.md (normative prose) and
+    docs/adr/0001-job-admission.md. Fields marked x-sand-secret must never be logged.
+servers:
+  - url: https://broker.example.invalid
+  - url: http://127.0.0.1:8787
+    description: sand broker mock (development only)
+security:
+  - session: []
+components:
+  securitySchemes:
+    session:
+      type: http
+      scheme: bearer
+  parameters:
+    RequestId:
+      name: Sand-Request-Id
+      in: header
+      required: true
+      schema: {type: string, format: uuid}
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: {type: string, format: uuid}
+    AllocationId:
+      name: allocation_id
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/AllocationId'}
+  responses:
+    Error:
+      description: Error (no decision made; callers treat as deny / no allocation)
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+  schemas:
+    AllocationId: {type: string, pattern: '^alc_[0-9A-Z]{26}$'}
+    Nonce: {type: string, pattern: '^[A-Za-z0-9_-]{43}$', x-sand-secret: true}
+    Timestamp: {type: string, format: date-time}
+    PositiveInt: {type: integer, minimum: 1, maximum: 9007199254740991}
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [invalid_request, challenge_invalid, signature_invalid, session_expired,
+                     device_revoked, device_noncompliant, repository_not_allowed,
+                     allocation_outstanding, no_eligible_demand, idempotency_mismatch,
+                     rate_limited, circuit_open, not_found, github_error, unavailable]
+            message: {type: string}
+            retry_after_seconds: {type: integer, minimum: 0}
+        request_id: {type: string}
+    ChallengeRequest:
+      type: object
+      additionalProperties: false
+      required: [device_id]
+      properties:
+        device_id: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,62}$'}
+    Challenge:
+      type: object
+      required: [challenge_id, challenge, expires_at]
+      properties:
+        challenge_id: {type: string, pattern: '^chl_[0-9A-Z]{26}$'}
+        challenge: {type: string, pattern: '^[A-Za-z0-9_-]{43}$'}
+        expires_at: {$ref: '#/components/schemas/Timestamp'}
+    SessionRequest:
+      type: object
+      additionalProperties: false
+      required: [device_id, key_id, challenge_id, signature]
+      properties:
+        device_id: {type: string}
+        key_id: {type: string, description: 'sha256 of the SPKI DER public key, hex'}
+        challenge_id: {type: string}
+        signature:
+          type: string
+          description: >
+            base64url raw r||s (64 bytes) ECDSA P-256/SHA-256 over
+            "sand-broker-v1\ndevice-session\n<device_id>\n<challenge_id>\n<challenge>"
+          x-sand-secret: true
+    Session:
+      type: object
+      required: [session_token, expires_at, device_id, owner, policy_version]
+      properties:
+        session_token: {type: string, x-sand-secret: true}
+        expires_at: {$ref: '#/components/schemas/Timestamp'}
+        device_id: {type: string}
+        owner:
+          type: object
+          required: [github_user_id, github_login]
+          properties:
+            github_user_id: {$ref: '#/components/schemas/PositiveInt'}
+            github_login: {type: string}
+        policy_version: {type: string}
+    AllocationRequest:
+      type: object
+      additionalProperties: false
+      required: [repository, sand, capabilities]
+      properties:
+        repository:
+          type: object
+          additionalProperties: false
+          required: [owner, name]
+          properties:
+            owner: {type: string, pattern: '^[A-Za-z0-9-]{1,39}$'}
+            name: {type: string, pattern: '^[A-Za-z0-9._-]{1,100}$'}
+        runner_name_prefix: {type: string, pattern: '^[a-z0-9-]{1,32}$'}
+        sand:
+          type: object
+          required: [version]
+          properties:
+            version: {type: string}
+            network_policy_hash: {type: string}
+            vm_name: {type: string}
+        capabilities:
+          type: object
+          required: [admission_hook, assignment_verifier]
+          properties:
+            admission_hook: {type: boolean, const: true}
+            assignment_verifier: {type: boolean}
+            oidc: {type: boolean}
+    Runner:
+      type: object
+      required: [id, name]
+      properties:
+        id: {$ref: '#/components/schemas/PositiveInt'}
+        name: {type: string}
+        labels: {type: array, items: {type: string}}
+        runner_group_id: {type: integer}
+        ephemeral: {type: boolean, const: true}
+    AllocationState:
+      type: string
+      enum: [registered, assigned, admitted, denied, expired, failed, released, cleaning, closed]
+    JobRef:
+      type: object
+      required: [id, run_id, run_attempt, status]
+      properties:
+        id: {$ref: '#/components/schemas/PositiveInt'}
+        run_id: {$ref: '#/components/schemas/PositiveInt'}
+        run_attempt: {$ref: '#/components/schemas/PositiveInt'}
+        status: {type: string}
+        observed_at: {$ref: '#/components/schemas/Timestamp'}
+    Allocation:
+      type: object
+      required: [allocation_id, state, expires_at, repository, runner, admission, policy_version]
+      properties:
+        allocation_id: {$ref: '#/components/schemas/AllocationId'}
+        state: {$ref: '#/components/schemas/AllocationState'}
+        nonce: {$ref: '#/components/schemas/Nonce'}
+        created_at: {$ref: '#/components/schemas/Timestamp'}
+        expires_at: {$ref: '#/components/schemas/Timestamp'}
+        repository:
+          type: object
+          required: [id, owner, name]
+          properties:
+            id: {$ref: '#/components/schemas/PositiveInt'}
+            owner: {type: string}
+            name: {type: string}
+        runner: {$ref: '#/components/schemas/Runner'}
+        jit_config:
+          type: string
+          description: Present only in the first 201 response.
+          x-sand-secret: true
+        admission:
+          type: object
+          required: [deadline_seconds, require_oidc]
+          properties:
+            deadline_seconds: {type: integer, minimum: 1}
+            require_oidc: {type: boolean}
+            oidc_audience: {type: string}
+        policy_version: {type: string}
+    AllocationStatus:
+      type: object
+      required: [allocation_id, state, expires_at, runner]
+      properties:
+        allocation_id: {$ref: '#/components/schemas/AllocationId'}
+        state: {$ref: '#/components/schemas/AllocationState'}
+        expires_at: {$ref: '#/components/schemas/Timestamp'}
+        runner: {$ref: '#/components/schemas/Runner'}
+        observed_job:
+          oneOf: [{$ref: '#/components/schemas/JobRef'}, {type: 'null'}]
+        admitted_job:
+          oneOf: [{$ref: '#/components/schemas/JobRef'}, {type: 'null'}]
+        decision:
+          oneOf: [{type: string, enum: [allow, deny]}, {type: 'null'}]
+    AdmissionRequest:
+      type: object
+      additionalProperties: false
+      required: [nonce, hints]
+      properties:
+        nonce: {$ref: '#/components/schemas/Nonce'}
+        hints:
+          type: object
+          additionalProperties: false
+          required: [repository_id, run_id, run_attempt, runner_name]
+          properties:
+            repository_id: {$ref: '#/components/schemas/PositiveInt'}
+            run_id: {$ref: '#/components/schemas/PositiveInt'}
+            run_attempt: {$ref: '#/components/schemas/PositiveInt'}
+            runner_name: {type: string, pattern: '^[A-Za-z0-9._-]{1,64}$'}
+            job_key: {type: string, pattern: '^([A-Za-z_][A-Za-z0-9_-]{0,99})?$'}
+        oidc_token:
+          oneOf: [{type: string, pattern: '^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$'}, {type: 'null'}]
+          x-sand-secret: true
+        relay:
+          type: object
+          properties:
+            received_at: {$ref: '#/components/schemas/Timestamp'}
+            vm_name: {type: string}
+    DenyReason:
+      type: string
+      enum: [allocation_state, allocation_expired, nonce_mismatch, already_admitted, hint_invalid,
+             repository_mismatch, job_not_found_for_runner, multiple_jobs_for_runner,
+             job_not_in_progress, runner_name_mismatch, fork_head, event_not_allowed,
+             actor_not_user, actor_not_owner, triggering_actor_not_owner, workflow_not_allowed,
+             reusable_workflow_not_allowed, ref_not_allowed, labels_mismatch, oidc_required,
+             oidc_invalid, oidc_claim_mismatch, oidc_unsupported, circuit_open,
+             github_unavailable, admission_timeout]
+    AdmissionJob:
+      type: object
+      required: [id, run_id, run_attempt]
+      properties:
+        id: {$ref: '#/components/schemas/PositiveInt'}
+        run_id: {$ref: '#/components/schemas/PositiveInt'}
+        run_attempt: {$ref: '#/components/schemas/PositiveInt'}
+        workflow_path: {type: string}
+        head_sha: {type: string}
+        head_branch: {type: string}
+        event: {type: string}
+        actor_id: {type: integer}
+        triggering_actor_id: {type: integer}
+        labels: {type: array, items: {type: string}}
+    AdmissionDecision:
+      type: object
+      required: [admission_id, decision, reasons, policy_version, decided_at]
+      properties:
+        admission_id: {type: string, pattern: '^adm_[0-9A-Z]{26}$'}
+        decision: {type: string, enum: [allow, deny]}
+        reasons: {type: array, items: {$ref: '#/components/schemas/DenyReason'}}
+        job:
+          oneOf: [{$ref: '#/components/schemas/AdmissionJob'}, {type: 'null'}]
+        policy_version: {type: string}
+        decided_at: {$ref: '#/components/schemas/Timestamp'}
+    ReleaseRequest:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        reason: {type: string, enum: [completed, denied, vm_failed, verifier_kill, shutdown, expired, unused]}
+        job_id: {$ref: '#/components/schemas/PositiveInt'}
+        detail: {type: string, maxLength: 256}
+    ReleaseResult:
+      type: object
+      required: [state, runner_deleted]
+      properties:
+        state: {type: string, enum: [cleaning, closed]}
+        runner_deleted: {type: boolean}
+        next_attempt_at: {$ref: '#/components/schemas/Timestamp'}
+    AuditEvent:
+      type: object
+      additionalProperties: false
+      required: [schema, event_id, time, source, type, level]
+      properties:
+        schema: {const: sand.audit.v1}
+        event_id: {type: string, format: uuid}
+        time: {$ref: '#/components/schemas/Timestamp'}
+        source: {type: string, enum: [device, broker, relay]}
+        type:
+          type: string
+          enum: [device.session.created, device.session.denied, allocation.created,
+                 allocation.refused, allocation.expired, allocation.assigned, admission.allowed,
+                 admission.denied, admission.relay_error, assignment.unadmitted,
+                 assignment.mismatch, vm.killed, runner.deregistered, runner.deregister_retry,
+                 runner.deregister_failed, run.cancelled, gc.runner_deleted]
+        level: {type: string, enum: [info, warning, error]}
+        device_id: {type: string}
+        allocation_id: {$ref: '#/components/schemas/AllocationId'}
+        repository_id: {type: integer}
+        runner_id: {type: integer}
+        run_id: {type: integer}
+        run_attempt: {type: integer}
+        job_id: {type: integer}
+        decision: {type: string, enum: [allow, deny]}
+        reasons: {type: array, items: {$ref: '#/components/schemas/DenyReason'}}
+        policy_version: {type: string}
+        sand_version: {type: string}
+        fields:
+          type: object
+          maxProperties: 32
+          additionalProperties: {type: string, maxLength: 512}
+paths:
+  /v1/health:
+    get:
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {const: ok}
+                  version: {type: string}
+                  policy_version: {type: string}
+  /v1/device/challenges:
+    post:
+      security: []
+      parameters: [{$ref: '#/components/parameters/RequestId'}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ChallengeRequest'}}}
+      responses:
+        '201': {description: Challenge, content: {application/json: {schema: {$ref: '#/components/schemas/Challenge'}}}}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/device/sessions:
+    post:
+      security: []
+      parameters: [{$ref: '#/components/parameters/RequestId'}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/SessionRequest'}}}
+      responses:
+        '201': {description: Session, content: {application/json: {schema: {$ref: '#/components/schemas/Session'}}}}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/allocations:
+    post:
+      parameters: [{$ref: '#/components/parameters/RequestId'}, {$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/AllocationRequest'}}}
+      responses:
+        '201': {description: Allocation created (includes jit_config), content: {application/json: {schema: {$ref: '#/components/schemas/Allocation'}}}}
+        '200': {description: Idempotent replay (jit_config omitted), content: {application/json: {schema: {$ref: '#/components/schemas/Allocation'}}}}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/allocations/{allocation_id}:
+    get:
+      parameters: [{$ref: '#/components/parameters/RequestId'}, {$ref: '#/components/parameters/AllocationId'}]
+      responses:
+        '200': {description: Status, content: {application/json: {schema: {$ref: '#/components/schemas/AllocationStatus'}}}}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/allocations/{allocation_id}/admissions:
+    post:
+      parameters: [{$ref: '#/components/parameters/RequestId'}, {$ref: '#/components/parameters/AllocationId'}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/AdmissionRequest'}}}
+      responses:
+        '200': {description: Decision (allow or deny), content: {application/json: {schema: {$ref: '#/components/schemas/AdmissionDecision'}}}}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/allocations/{allocation_id}/release:
+    post:
+      parameters: [{$ref: '#/components/parameters/RequestId'}, {$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/AllocationId'}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ReleaseRequest'}}}
+      responses:
+        '202': {description: Cleanup accepted, content: {application/json: {schema: {$ref: '#/components/schemas/ReleaseResult'}}}}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/audit-events:
+    post:
+      parameters: [{$ref: '#/components/parameters/RequestId'}, {$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [events]
+              properties:
+                events: {type: array, maxItems: 100, items: {$ref: '#/components/schemas/AuditEvent'}}
+      responses:
+        '202':
+          description: Accepted
+          content:
+            application/json:
+              schema: {type: object, properties: {accepted: {type: integer}}}
+        default: {$ref: '#/components/responses/Error'}
