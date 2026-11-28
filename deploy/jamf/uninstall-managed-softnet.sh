@@ -48,6 +48,8 @@ install_dir="${install_dir%/}"
 
 for file in "$install_dir/softnet" "$install_dir/softnet.sha256" "$install_dir/.softnet.new" "$install_dir/.softnet.sha256.new"; do
   if [[ -e "$file" || -L "$file" ]]; then
+    # Strip the mode first: a hard link to a setuid binary would outlive rm.
+    if [[ -f "$file" && ! -L "$file" ]]; then /bin/chmod 0000 "$file"; fi
     /bin/rm -f "$file"
     log "removed $file"
   fi

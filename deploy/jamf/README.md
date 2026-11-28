@@ -21,7 +21,7 @@ pipe a download into a shell, and are shellcheck-clean.
 | Path | Owner / mode | Purpose |
 | --- | --- | --- |
 | `/usr/local/libexec/sand/` | root:wheel 0755 | managed directory (every parent directory must be root-owned and not group/world-writable) |
-| `/usr/local/libexec/sand/softnet` | root:wheel 4555 (setuid) or 0555 with `--sudoers` | the only softnet sand will run with privilege |
+| `/usr/local/libexec/sand/softnet` | root:GROUP 4550 (setuid, only root and GROUP can run it) or root:wheel 0555 with `--sudoers` | the only softnet sand will run with privilege |
 | `/usr/local/libexec/sand/softnet.sha256` | root:wheel 0444 | `shasum -a 256` manifest; sand checks it before every VM (preflight P13) |
 | `/etc/sudoers.d/sand-softnet` | root:wheel 0440 | `--sudoers` mode only: `%GROUP ALL=(root) NOPASSWD: /usr/local/libexec/sand/softnet`, checked with `visudo -c` |
 | `/Library/LaunchDaemons/local.sand.no-ip-forwarding.plist` | root:wheel 0644 | `--enforce-no-forwarding` only |
@@ -33,7 +33,12 @@ For 0.26.0 the script pins the tarball digest
 value as the Homebrew formula) and the binary digest
 `2ea5572268f814317bc3944d1352032f1f4dafe00bfe453eefc64e9dc32627a3`. Any other
 version needs an explicit digest. The binary is installed under a temporary
-name and renamed into place, so a running sand never sees a partial file.
+name and renamed into place, so a running sand never sees a partial file, and
+the installed file is checked against the pinned digest after the rename. The
+work directory is created under `/private/var/tmp` (never `$TMPDIR`, which
+`sudo -E` would point at a user-owned directory). Before an upgrade or
+uninstall replaces the binary, its mode is cleared, so a hard link someone made
+to the old setuid file stops being setuid too.
 
 **Never** make a Homebrew softnet setuid root or allow it in sudoers.
 `/opt/homebrew` belongs to the user, so any process running as that user could
@@ -54,7 +59,7 @@ swap the binary and get root. sand refuses such a softnet (preflight P12).
 | `$5` | Source (`release` or absolute path to a softnet binary) | `release` |
 | `$6` | softnet version | `0.26.0` |
 | `$7` | Expected SHA-256 (tarball for `release`, binary for a path) | pinned for 0.26.0 |
-| `$8` | sudoers group (sudoers mode) | `admin` |
+| `$8` | Runner group: who may run the privileged softnet | `staff` |
 | `$9` | Enforce no IP forwarding (`true`/`false`) | `false` |
 | `$10` | Install directory (non-default needs `vm.run.network.softnetPath`) | `/usr/local/libexec/sand` |
 | `$11` | (unused) | |
@@ -62,10 +67,25 @@ swap the binary and get root. sand refuses such a softnet (preflight P12).
 Empty parameters keep the defaults. `$1`-`$3` are Jamf's own (mount point,
 computer name, user name) and are ignored.
 
-`suid` or `sudoers`: both let anyone in scope run softnet as root with any
-arguments. `suid` needs nothing else. `sudoers` limits that to one group
-(`admin` by default, `staff` for every local user) and works with tools that
-refuse setuid binaries. In sudoers mode softnet re-execs itself with
+`suid` or `sudoers`: both let members of the runner group (`$8`,
+`--group`) run softnet as root **with any arguments**. `suid` installs the
+binary root:GROUP 4550, so nobody outside the group can execute it; `sudoers`
+installs it 0555 and a `%GROUP` NOPASSWD rule, and works with tools that refuse
+setuid binaries. The default group is `staff`, the primary group of every local
+user account (service accounts and `nobody` are not in it). sand's preflight
+(P3) fails when the account running sand cannot execute the setuid binary.
+
+softnet 0.26 drops privileges to `--user`/`--group`, which any caller can set:
+a group member can run `softnet --user root ...` and keep it running as root,
+with a vmnet interface it feeds frames into (L2 access to the VM bridge,
+including other sand VMs and the host's bridge address) and `--expose` port
+forwards. That is the price of a privileged helper until softnet ignores
+`--user`/`--group` for non-root callers (upstream). On Macs with local
+accounts you do not trust, create a dedicated group for the runner accounts
+(for example `dseditgroup -o create -r "sand runners" sandrunners` plus
+`dseditgroup -o edit -a RUNNER -t user sandrunners`) and pass it as `$8`.
+
+In sudoers mode softnet re-execs itself with
 `sudo --non-interactive --preserve-env=SENTRY_DSN,CIRRUS_SENTRY_TAGS`, so the
 rule keeps exactly those two variables (`env_keep`). It does not grant `SETENV`,
 which would allow `DYLD_*` injection. Test the sudoers mode on one Mac before
@@ -91,17 +111,22 @@ Data type String, input type Script, contents `sand-readiness-ea.sh`. Example
 results:
 
 ```
-<result>ready; softnet=managed privilege=suid sha256=ok forwarding=1/1 no_forwarding_daemon=no tart=2.42.0</result>
+<result>ready; softnet=managed privilege=suid(group=staff) sha256=ok forwarding=1/1 no_forwarding_daemon=no tart=2.42.0</result>
 <result>ready-hostonly; softnet=missing privilege=none sha256=none forwarding=0/0 no_forwarding_daemon=yes tart=2.42.0</result>
 <result>not-ready; softnet=missing privilege=none sha256=none forwarding=1/1 no_forwarding_daemon=no tart=2.42.0</result>
 ```
 
 - `ready`: the managed softnet is root-owned all the way up, privileged (setuid
-  or sudoers) and matches its manifest. sand `auto` uses softnet.
+  or sudoers) and matches its manifest. sand `auto` uses softnet, provided
+  the account that runs sand is in the group the EA names (`group=...`); the
+  EA cannot know which account that is, so scope the Smart Group or check
+  membership separately. `group=everyone` means an older world-executable
+  install: re-run the policy.
 - `ready-hostonly`: no usable managed softnet, but IP forwarding is off. sand
   `auto` uses hostOnly.
 - `not-ready`: sand refuses to boot isolated VMs (exit 78) until the policy runs
-  or forwarding is turned off.
+  or forwarding is turned off. `error=ea-failed-at-line-N` means the EA itself
+  failed at that line; it always prints a `<result>`.
 
 The EA reads the tart version from its Homebrew keg path. It never executes
 softnet or tart, because running a user-writable binary as root would itself be
@@ -118,8 +143,12 @@ deploying (verify).
 - AirPlay Receiver listens on TCP 5000/7000 on all interfaces. Restrictions
   payload (`com.apple.applicationaccess`): `allowAirPlayIncomingRequests` =
   false (verify).
-- Internet Sharing turns IP forwarding on. `com.apple.MCX`:
-  `forceInternetSharingOff` = true (verify).
+- Internet Sharing turns IP forwarding on. `com.apple.MCX`
+  `forceInternetSharingOff` = true would stop that, but it has not been tested
+  with softnet, which uses the vmnet shared (NAT) stack and the InternetSharing
+  bootpd preferences. Only consider it for hostOnly-only Macs, and test a VM
+  boot under softnet on one Mac before scoping it anywhere softnet runs
+  (verify).
 - Remote Login (sshd) on the host is reachable from a hostOnly VM. Leave it
   off unless needed, or rely on `hostListeners: deny` in the sand config.
 - No PPPC/TCC or system extension approval is needed. tart uses
@@ -138,3 +167,8 @@ sudo deploy/jamf/install-managed-softnet.sh
 sudo deploy/jamf/sand-readiness-ea.sh
 swift run sand network preflight --config fixtures/network_github_default.yml
 ```
+
+Run the installer with plain `sudo`, not `sudo -E`. Behind a TLS-inspecting
+proxy (Netskope, Zscaler) preflight P10 also fails until the config sets
+`vm.run.network.tlsInspection: trustHostCA` or IT exempts the GitHub hosts;
+installing softnet does not change that.

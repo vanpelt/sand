@@ -6,9 +6,15 @@
 #   STATUS ready-hostonly     no usable managed softnet, but host IP forwarding is off
 #                             (sand's default backend auto falls back to hostOnly safely)
 #   STATUS not-ready          neither: sand would refuse to boot isolated VMs (exit 78)
+# privilege=suid(group=G) / sudoers(group=G) names who may run softnet; the EA
+# cannot know which account runs sand, so scope the smart group (or check that
+# the runner account is in G) rather than trusting "ready" alone.
 # Runs as root. Read-only: it never executes softnet or tart (both may live in
 # user-writable directories, and running them as root would be an escalation path).
 set -euo pipefail
+# Always print a <result>, even when a step fails unexpectedly: Jamf records an
+# empty value otherwise.
+trap 'echo "<result>not-ready; error=ea-failed-at-line-$LINENO</result>"; exit 0' ERR
 
 readonly target="/usr/local/libexec/sand/softnet"
 readonly manifest="/usr/local/libexec/sand/softnet.sha256"
@@ -41,9 +47,14 @@ if [[ -f "$target" ]]; then
     add_problem "softnet-path"
   fi
   if [[ -u "$target" && "$(/usr/bin/stat -f '%u' "$target")" == "0" ]]; then
-    privilege="suid"
+    if [[ "$(/usr/bin/stat -f '%Lp' "$target")" == *[1357] ]]; then
+      privilege="suid(group=everyone)"
+    else
+      privilege="suid(group=$(/usr/bin/stat -f '%Sg' "$target"))"
+    fi
   elif [[ -f "$sudoers_file" ]] && /usr/bin/grep -q "NOPASSWD: $target\$" "$sudoers_file"; then
-    privilege="sudoers"
+    sudoers_group="$(/usr/bin/awk -v t="$target" '$1 ~ /^%/ && $NF == t {print substr($1, 2); exit}' "$sudoers_file")"
+    privilege="sudoers(group=${sudoers_group:-unknown})"
   else
     add_problem "softnet-unprivileged"
   fi
