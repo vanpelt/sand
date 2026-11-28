@@ -99,7 +99,8 @@ final class FakeVMHost: ProcessRunning, @unchecked Sendable {
     }
 
     func start(executable: String, arguments: [String]) throws -> ProcessHandle {
-        if executable == "tart" {
+        // Under softnet, tart run is started by absolute path.
+        if executable == "tart" || executable.hasSuffix("/tart") {
             lock.withLock { tartRunArguments.append(arguments) }
             if let stderr = lock.withLock({ tartExitStderr }) {
                 lock.withLock { booted = true }
@@ -191,7 +192,7 @@ func dependencies(
 
 func makeRunner(host: ProcessRunning, network: RunnerNetworkDependencies, run: String = "echo provisioned-marker", policy: NetworkConfig = NetworkConfig(selection: .profile(.github), backend: .hostOnly), stopAfter: Int? = 1) -> Runner {
     let logger = Logger(label: "test", minimumLevel: .critical)
-    let tart = Tart(processRunner: host, logger: logger)
+    let tart = Tart(processRunner: host, logger: logger, isExecutable: { $0.hasSuffix("/tart") })
     let vm = Config.VM(source: .init(type: .local, image: nil, name: "golden"), hardware: nil, mounts: [], cache: nil, run: .init(noGraphics: true, noClipboard: true, nested: false, network: policy), diskSizeGb: nil, ssh: .standard)
     let config = Config.RunnerConfig(name: "slot", vm: vm, provisioner: .init(type: .script, script: .init(run: run), github: nil), preRun: nil, postRun: nil, stopAfter: stopAfter, healthCheck: Config.HealthCheck(command: "true", interval: 30, delay: 600))
     return Runner(

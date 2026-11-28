@@ -45,6 +45,8 @@ protocol PreflightFileSystem: Sendable {
     func readFile(_ path: String) -> String?
     /// Lowercase hex SHA-256 of a file's contents.
     func sha256(ofFile path: String) -> String?
+    /// access(2) X_OK for this process's real user and groups.
+    func isExecutable(_ path: String) -> Bool
 }
 
 /// The host's IPv4/IPv6 forwarding switches (nil: unreadable).
@@ -111,6 +113,10 @@ struct SystemPreflightFileSystem: PreflightFileSystem {
 
     func fileExists(_ path: String) -> Bool {
         FileManager.default.fileExists(atPath: path)
+    }
+
+    func isExecutable(_ path: String) -> Bool {
+        access(path, X_OK) == 0
     }
 
     func readFile(_ path: String) -> String? {
@@ -203,7 +209,8 @@ struct NetworkPreflight: Sendable {
     \(SoftnetDiscovery.managedPath) (deploy/jamf/install-managed-softnet.sh). To do it yourself, once, in your own
     terminal from a sand checkout (sand never runs sudo):
       sudo deploy/jamf/install-managed-softnet.sh
-    (downloads the pinned softnet release, verifies its SHA-256, installs it setuid root and writes a SHA-256 manifest).
+    (downloads the pinned softnet release, verifies its SHA-256, installs it setuid root, executable only by the runner
+    group (--group, default staff; this user must be in it), and writes a SHA-256 manifest).
     Never make the Homebrew softnet setuid root or sudoers-allowed: /opt/homebrew is writable by your user, so anything
     running as you could replace the binary and get root. Softnet runs its setup as root and rewrites the system bootpd
     prefs (DHCPLeaseTimeSecs=600). Without it, backend: auto (the default) uses hostOnly, which needs no root.
@@ -339,8 +346,13 @@ struct NetworkPreflight: Sendable {
     /// What `backend: auto` means on this host: softnet when a safely installed
     /// (root-owned path), new enough, privileged softnet exists; otherwise hostOnly
     /// (which needs no root). A privileged softnet in a user-writable location
-    /// is never used: auto falls back loudly. A SHA-256 pin mismatch is not a
-    /// reason to fall back: auto keeps softnet so the preflight fails closed.
+    /// is never used: auto falls back loudly.
+    ///
+    /// A managed install (or `softnetPath`) is a statement that this Mac uses
+    /// softnet: when it is present, auto keeps softnet whatever is wrong with it
+    /// (unsafe path, unprivileged, too old, pin mismatch, old tart), so preflight
+    /// fails closed instead of quietly downgrading a fleet to hostOnly. Only a
+    /// PATH softnet (or none at all) is a reason to fall back.
     func resolveBackend(_ config: NetworkConfig) async -> EnforcementBackend {
         await resolveBackendWithReason(config).backend
     }
@@ -353,9 +365,16 @@ struct NetworkPreflight: Sendable {
             let location: SoftnetLocation
             switch SoftnetDiscovery.locate(configuredPath: config.softnetPath, fileSystem: fileSystem) {
             case let .missing(reason):
-                return (.hostOnly, .init(reason: reason, loud: config.softnetPath != nil))
+                if config.softnetPath != nil {
+                    // An explicit path that is gone: fail closed (P2), never fall back.
+                    return (.softnet, nil)
+                }
+                return (.hostOnly, .init(reason: reason, loud: false))
             case let .found(found):
                 location = found
+            }
+            if location.source != .path {
+                return (.softnet, nil)
             }
             let tart = await checkTart(backend: .softnet)
             let softnet = await checkSoftnet(.found(location), pin: config.softnetSHA256)
@@ -365,7 +384,7 @@ struct NetworkPreflight: Sendable {
             }
             let rejectedPrivileged = failures.contains { $0.name == Self.pathCheckName } && SoftnetDiscovery.isSetuidRoot(location.resolved, fileSystem: fileSystem)
             let reason = "softnet not usable: " + failures.map { "\($0.name): \($0.detail)" }.joined(separator: "; ")
-            return (.hostOnly, .init(reason: reason, loud: rejectedPrivileged || location.source != .path))
+            return (.hostOnly, .init(reason: reason, loud: rejectedPrivileged))
         }
     }
 
@@ -497,11 +516,22 @@ struct NetworkPreflight: Sendable {
     /// Only ever called for a path that passed P12.
     func checkSoftnetPrivilege(_ location: SoftnetLocation) async -> PreflightCheck {
         if SoftnetDiscovery.isSetuidRoot(location.resolved, fileSystem: fileSystem) {
+            // The managed installer restricts the setuid binary to a runner group (mode 4550).
+            guard fileSystem.isExecutable(location.resolved) else {
+                return PreflightCheck(
+                    "P3 softnet privilege", .failed,
+                    "softnet (\(location.resolved)) is setuid root but not executable by this user; tart would fail to boot isolated VMs",
+                    remediation: "Add this user to the group the managed softnet was installed for (install-managed-softnet.sh --group, Jamf parameter 8; default staff), or reinstall it for this user's group."
+                )
+            }
             return PreflightCheck("P3 softnet privilege", .ok, "softnet is setuid root")
         }
-        // Non-interactive only: -n never prompts. softnet re-execs itself via
-        // `sudo -n <its own path>`, which is `resolved` because tart execs it from there.
-        if (try? await processRunner.run(executable: "sudo", arguments: ["-n", location.resolved, "--help"], wait: true)) != nil {
+        // Non-interactive only: -n never prompts, and -k ignores a cached sudo
+        // ticket (from running the installer in this terminal), so this passes
+        // only for a NOPASSWD rule, as softnet's own `sudo -n` will need.
+        // softnet re-execs itself via `sudo -n <its own path>`, which is
+        // `resolved` because tart execs it from there.
+        if (try? await processRunner.run(executable: "sudo", arguments: ["-n", "-k", location.resolved, "--help"], wait: true)) != nil {
             return PreflightCheck("P3 softnet privilege", .ok, "passwordless sudo is configured for \(location.resolved)")
         }
         return PreflightCheck("P3 softnet privilege", .failed, "softnet (\(location.resolved)) is neither setuid root nor allowed by passwordless sudo; tart would fail to boot isolated VMs", remediation: Self.softnetRemediation)

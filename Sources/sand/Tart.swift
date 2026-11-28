@@ -62,10 +62,13 @@ struct Tart: Sendable {
 
     let processRunner: ProcessRunning
     let logger: Logger
+    /// Used to find tart's absolute path under the softnet backend; injectable for tests.
+    let isExecutable: @Sendable (String) -> Bool
 
-    init(processRunner: ProcessRunning, logger: Logger) {
+    init(processRunner: ProcessRunning, logger: Logger, isExecutable: @escaping @Sendable (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) }) {
         self.processRunner = processRunner
         self.logger = logger
+        self.isExecutable = isExecutable
     }
 
     func prepare(source: String) async throws {
@@ -137,20 +140,52 @@ struct Tart: Sendable {
             arguments.append(mount.runArgument)
         }
         logger.debug("tart \(arguments.joined(separator: " "))")
-        return try processRunner.start(executable: "tart", arguments: arguments, environment: Self.runEnvironment(network: options.network))
+        let launch = try Self.runLaunch(network: options.network, isExecutable: isExecutable)
+        return try processRunner.start(executable: launch.executable, arguments: arguments, environment: launch.environment)
     }
 
-    /// tart 2.42 execs the first `softnet` on its PATH. Under the softnet
-    /// backend the directory of the softnet sand checked goes first, so tart
-    /// execs exactly that binary; nothing else in the environment changes.
-    static func runEnvironment(network: NetworkPolicy, base: [String: String] = ProcessInfo.processInfo.environment) -> [String: String] {
-        var environment = scrubbedEnvironment(base)
-        if network.usesSoftnet, let softnet = network.host.softnet {
-            // env(1) falls back to the default search path when PATH is unset; keep it.
-            let rest = environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
-            environment["PATH"] = softnet.directory + ":" + rest
+    enum LaunchError: Error, CustomStringConvertible {
+        case softnetNotBound
+        case tartNotFound
+
+        var description: String {
+            switch self {
+            case .softnetNotBound:
+                return "refusing to start tart under the softnet backend without a checked softnet binary"
+            case .tartNotFound:
+                return "tart not found in PATH"
+            }
         }
-        return environment
+    }
+
+    /// The system directories tart run needs (sudo, diskutil, tar), never a
+    /// user-writable one that could hold a different `softnet`.
+    static let softnetSystemPath = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+    /// How to launch `tart run`. tart 2.42 execs the first `softnet` on its
+    /// PATH, so under the softnet backend tart is started by absolute path with
+    /// PATH set to the checked softnet's directory followed only by root-owned
+    /// system directories: tart execs exactly that binary, and if it vanishes
+    /// tart fails instead of finding the Homebrew one. Everything else in the
+    /// environment (minus Sentry variables) is inherited.
+    static func runLaunch(
+        network: NetworkPolicy,
+        base: [String: String] = ProcessInfo.processInfo.environment,
+        isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) }
+    ) throws -> (executable: String, environment: [String: String]) {
+        var environment = scrubbedEnvironment(base)
+        guard network.usesSoftnet else {
+            return ("tart", environment)
+        }
+        guard let softnet = network.host.softnet else {
+            throw LaunchError.softnetNotBound
+        }
+        let searchPath = base["PATH"] ?? softnetSystemPath
+        guard let tart = searchPath.split(separator: ":").map({ ($0 as Substring).appending("/tart") }).first(where: isExecutable) else {
+            throw LaunchError.tartNotFound
+        }
+        environment["PATH"] = softnet.directory + ":" + softnetSystemPath
+        return (tart, environment)
     }
 
     /// Variables Tart forwards to Sentry crash reporting; never hand them VM context.

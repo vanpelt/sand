@@ -92,6 +92,40 @@ private func networkIssues(_ network: NetworkConfig) -> [ConfigValidationIssue] 
         #expect(SoftnetDiscovery.pathProblems(location, fileSystem: fileSystem).count == 2)
     }
 
+    @Test func colonInThePathIsRejected() {
+        var fileSystem = FakeFileSystem()
+        fileSystem.owner = (0, 0o755)
+        let location = SoftnetLocation(path: "/opt/a:b/softnet", resolved: "/opt/a:b/softnet", source: .config)
+        #expect(SoftnetDiscovery.pathProblems(location, fileSystem: fileSystem).contains { $0.contains("contains ':'") })
+    }
+
+    @Test func realSymlinkIsJudgedByItsTarget() throws {
+        // Real file system: a symlink named softnet pointing into another
+        // directory is resolved, and the target's directories are what P12 inspects.
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("sand-symlink-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let real = base.appendingPathComponent("user-dir")
+        let linkDirectory = base.appendingPathComponent("link-dir")
+        try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: linkDirectory, withIntermediateDirectories: true)
+        try Data("#!/bin/sh\n".utf8).write(to: real.appendingPathComponent("softnet"))
+        try FileManager.default.createSymbolicLink(atPath: linkDirectory.appendingPathComponent("softnet").path, withDestinationPath: real.appendingPathComponent("softnet").path)
+        let fileSystem = SystemPreflightFileSystem()
+        let outcome = SoftnetDiscovery.locate(configuredPath: linkDirectory.appendingPathComponent("softnet").path, fileSystem: fileSystem)
+        guard case let .found(location) = outcome else {
+            Issue.record("expected found, got \(outcome)")
+            return
+        }
+        let realDirectory = fileSystem.realpath(real.path)
+        #expect(location.resolved == realDirectory + "/softnet")
+        #expect(location.directory == realDirectory)
+        let problems = SoftnetDiscovery.pathProblems(location, fileSystem: fileSystem)
+        // Owned by the test user, so it fails, and it is the target that is named.
+        #expect(problems.contains { $0.hasPrefix(realDirectory + "/softnet is owned by uid") })
+        #expect(problems.contains { $0.hasPrefix(realDirectory + " is owned by uid") })
+        #expect(!problems.contains { $0.contains("link-dir") })
+    }
+
     @Test func binaryMustBeNamedSoftnetAndNotWritable() {
         var fileSystem = FakeFileSystem()
         fileSystem.owner = (0, 0o755)
@@ -157,6 +191,41 @@ private func networkIssues(_ network: NetworkConfig) -> [ConfigValidationIssue] 
         #expect(failures.first?.detail.contains("expected abab") == true)
     }
 
+    @Test func brokenManagedSoftnetFailsClosedUnderAuto() async throws {
+        // A managed install that is unprivileged, on a loosened path, or gone
+        // from softnetPath never downgrades a fleet Mac to hostOnly.
+        var loosened = FakeFileSystem.managed()
+        loosened.owners[SoftnetDiscovery.managedDirectory] = (0, 0o775)
+        var notRunnable = FakeFileSystem.managed()
+        notRunnable.notExecutable.insert(SoftnetDiscovery.managedPath)
+        let cases: [(FakeFileSystem, NetworkConfig, String)] = [
+            (FakeFileSystem.managed(mode: 0o555), .secureDefault, "P3 softnet privilege"),
+            (loosened, .secureDefault, NetworkPreflight.pathCheckName),
+            (notRunnable, .secureDefault, "P3 softnet privilege"),
+            (FakeFileSystem.managed(), NetworkConfig(selection: .profile(.github), softnetPath: "/opt/sand-tools/softnet"), "P2 softnet"),
+        ]
+        for (fileSystem, config, failing) in cases {
+            let preflight = preflight(fileSystem)
+            let policy = try await preflight.compile(config, sshPort: 22)
+            #expect(policy.backend == .softnet, "\(failing)")
+            #expect(policy.host.autoFallback == nil)
+            let failures = NetworkPreflight.failures(await preflight.run(policy: policy, includeSSHTools: false))
+            #expect(failures.map(\.name).contains(failing), "\(failures.map(\.line))")
+            #expect(!NetworkPreflight.failures(await preflight.perVM(policy: policy)).isEmpty)
+        }
+    }
+
+    @Test func setuidSoftnetTheUserCannotExecuteFailsP3() async {
+        var fileSystem = FakeFileSystem.managed(mode: UInt16(S_ISUID) | 0o550)
+        fileSystem.notExecutable.insert(SoftnetDiscovery.managedPath)
+        let location = SoftnetLocation(path: SoftnetDiscovery.managedPath, resolved: SoftnetDiscovery.managedPath, source: .managed)
+        let check = await preflight(fileSystem).checkSoftnetPrivilege(location)
+        #expect(check.status == .failed)
+        #expect(check.remediation?.contains("--group") == true)
+        fileSystem.notExecutable = []
+        #expect(await preflight(fileSystem).checkSoftnetPrivilege(location).status == .ok)
+    }
+
     @Test func configuredPinIsCheckedToo() async throws {
         let fileSystem = FakeFileSystem.managed()
         let pinned = NetworkConfig(selection: .profile(.github), backend: .softnet, softnetSHA256: String(repeating: "ef", count: 32))
@@ -185,21 +254,35 @@ private func networkIssues(_ network: NetworkConfig) -> [ConfigValidationIssue] 
 
     @Test func tartExecsExactlyTheCheckedSoftnet() async throws {
         let policy = try await preflight(FakeFileSystem.managed()).compile(.secureDefault, sshPort: 22)
-        let environment = Tart.runEnvironment(network: policy, base: ["PATH": "/opt/homebrew/bin:/usr/bin", "HOME": "/Users/x", "SENTRY_DSN": "x"])
-        #expect(environment["PATH"] == "/usr/local/libexec/sand:/opt/homebrew/bin:/usr/bin")
-        #expect(environment["HOME"] == "/Users/x")
-        #expect(environment["SENTRY_DSN"] == nil)
-        #expect(Tart.runEnvironment(network: policy, base: [:])["PATH"] == "/usr/local/libexec/sand:/usr/bin:/bin:/usr/sbin:/sbin")
+        let launch = try Tart.runLaunch(network: policy, base: ["PATH": "/opt/homebrew/bin:/usr/bin", "HOME": "/Users/x", "SENTRY_DSN": "x"], isExecutable: { $0 == "/opt/homebrew/bin/tart" })
+        // tart by absolute path; its PATH holds no user-writable directory that could hold another softnet.
+        #expect(launch.executable == "/opt/homebrew/bin/tart")
+        #expect(launch.environment["PATH"] == "/usr/local/libexec/sand:/usr/bin:/bin:/usr/sbin:/sbin")
+        #expect(launch.environment["HOME"] == "/Users/x")
+        #expect(launch.environment["SENTRY_DSN"] == nil)
         let hostOnly = try NetworkConfig.secureDefault.compile()
-        #expect(Tart.runEnvironment(network: hostOnly, base: ["PATH": "/opt/homebrew/bin"])["PATH"] == "/opt/homebrew/bin")
+        let hostOnlyLaunch = try Tart.runLaunch(network: hostOnly, base: ["PATH": "/opt/homebrew/bin"])
+        #expect(hostOnlyLaunch.executable == "tart")
+        #expect(hostOnlyLaunch.environment["PATH"] == "/opt/homebrew/bin")
+    }
+
+    @Test func tartRefusesToStartUnderSoftnetWithoutACheckedBinary() async throws {
+        // A softnet policy that was never bound to a checked binary must not
+        // let tart pick whatever softnet the user's PATH has.
+        var unbound = try await preflight(FakeFileSystem.managed()).compile(.secureDefault, sshPort: 22)
+        unbound.host.softnet = nil
+        #expect(throws: Tart.LaunchError.self) { try Tart.runLaunch(network: unbound, base: ["PATH": "/opt/homebrew/bin"], isExecutable: { _ in true }) }
+        let bound = try await preflight(FakeFileSystem.managed()).compile(.secureDefault, sshPort: 22)
+        #expect(throws: Tart.LaunchError.self) { try Tart.runLaunch(network: bound, base: ["PATH": "/opt/homebrew/bin"], isExecutable: { _ in false }) }
     }
 
     @Test func tartRunIsLaunchedWithThatEnvironment() async throws {
         let policy = try await preflight(FakeFileSystem.managed()).compile(.secureDefault, sshPort: 22)
         let runner = ScriptedProcessRunner(responder: currentToolHelp)
-        _ = try Tart(processRunner: runner, logger: Logger(label: "test", minimumLevel: .critical)).run(name: "vm", options: .init(directoryMounts: [], noAudio: true, noGraphics: true, noClipboard: true, nested: false, network: policy))
+        _ = try makeTart(runner).run(name: "vm", options: .init(directoryMounts: [], noAudio: true, noGraphics: true, noClipboard: true, nested: false, network: policy))
         let call = try #require(runner.calls.first { $0.arguments.first == "run" })
-        #expect(call.environment?["PATH"]?.hasPrefix(SoftnetDiscovery.managedDirectory + ":") == true)
+        #expect(call.executable.hasPrefix("/") && call.executable.hasSuffix("/tart"))
+        #expect(call.environment?["PATH"] == SoftnetDiscovery.managedDirectory + ":" + Tart.softnetSystemPath)
     }
 }
 
@@ -234,6 +317,7 @@ private func networkIssues(_ network: NetworkConfig) -> [ConfigValidationIssue] 
         #expect(errors(NetworkConfig(selection: .profile(.github), softnetPath: "softnet")).contains { $0.contains("softnetPath must be an absolute path") })
         #expect(errors(NetworkConfig(selection: .profile(.github), softnetPath: "/usr/local/bin/softnet-dev")).contains { $0.contains("named softnet") })
         #expect(errors(NetworkConfig(selection: .profile(.github), softnetSHA256: "abc")).contains { $0.contains("64 hex digits") })
+        #expect(errors(NetworkConfig(selection: .profile(.github), softnetPath: "/opt/a:b/softnet")).contains { $0.contains("must not contain ':'") })
         #expect(errors(NetworkConfig(selection: .mode(.shared), softnetPath: "/usr/local/libexec/sand/softnet")).contains { $0.contains("mode: shared") })
         let homebrew = networkIssues(NetworkConfig(selection: .profile(.github), softnetPath: "/opt/homebrew/bin/softnet"))
         #expect(homebrew.contains { $0.severity == .warning && $0.message.contains("Homebrew") })
@@ -241,7 +325,10 @@ private func networkIssues(_ network: NetworkConfig) -> [ConfigValidationIssue] 
         #expect(hostOnly.contains { $0.severity == .warning && $0.message.contains("no effect") })
     }
 
-    @Test func managedLocationIsRootOwnedOnThisMac() {
+    /// Diagnostic for a real Mac (SAND_HOST_TESTS=1): older Intel Homebrew made
+    /// /usr/local user-owned, where the managed installer correctly refuses.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["SAND_HOST_TESTS"] == "1"))
+    func managedLocationIsRootOwnedOnThisMac() {
         // The chosen location's existing ancestors ship root:wheel 0755 on macOS.
         let fileSystem = SystemPreflightFileSystem()
         for directory in SoftnetDiscovery.ancestors(of: SoftnetDiscovery.managedPath) where fileSystem.fileExists(directory) && directory != SoftnetDiscovery.managedDirectory {

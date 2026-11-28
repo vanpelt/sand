@@ -101,6 +101,10 @@ enum SoftnetDiscovery {
         guard resolved.hasPrefix("/") else {
             return ["\(resolved) is not an absolute path"]
         }
+        if resolved.contains(":") {
+            // tart splits PATH on ':', so it would look in a different directory.
+            problems.append("\(resolved) contains ':', which tart's PATH lookup cannot express")
+        }
         if (resolved as NSString).lastPathComponent != "softnet" {
             // tart looks the binary up by the name `softnet`.
             problems.append("\(resolved) is not named softnet (tart execs `softnet` from PATH)")

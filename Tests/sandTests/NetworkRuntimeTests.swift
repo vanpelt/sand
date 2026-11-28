@@ -54,6 +54,8 @@ struct FakeFileSystem: PreflightFileSystem {
     var existing: Set<String> = []
     var files: [String: String] = [:]
     var digests: [String: String] = [:]
+    /// Paths this user cannot execute (access X_OK fails).
+    var notExecutable: Set<String> = []
 
     func which(_ command: String) -> String? { paths[command] }
     func realpath(_ path: String) -> String { path.replacingOccurrences(of: "/opt/homebrew/bin", with: "/opt/homebrew/Cellar/softnet/0.26.0/bin") }
@@ -63,6 +65,7 @@ struct FakeFileSystem: PreflightFileSystem {
     func fileExists(_ path: String) -> Bool { existing.contains(path) || files[path] != nil || paths.values.contains(path) }
     func readFile(_ path: String) -> String? { files[path] }
     func sha256(ofFile path: String) -> String? { digests[path] }
+    func isExecutable(_ path: String) -> Bool { !notExecutable.contains(path) }
 
     /// The real layout of this Mac's Homebrew: everything under /opt/homebrew belongs to the user.
     static func homebrewOwnedByUser(binary: (uid: UInt32, mode: UInt16)) -> FakeFileSystem {
@@ -157,7 +160,7 @@ func makePreflight(runner: ScriptedProcessRunner, fileSystem: FakeFileSystem = F
         let location = SoftnetLocation(path: SoftnetDiscovery.managedPath, resolved: SoftnetDiscovery.managedPath, source: .managed)
         let check = await makePreflight(runner: runner, fileSystem: fileSystem).checkSoftnetPrivilege(location)
         #expect(check.status == .ok)
-        #expect(runner.calls.contains { $0.executable == "sudo" && $0.arguments == ["-n", SoftnetDiscovery.managedPath, "--help"] })
+        #expect(runner.calls.contains { $0.executable == "sudo" && $0.arguments == ["-n", "-k", SoftnetDiscovery.managedPath, "--help"] })
     }
 
     @Test func oldTartOrSoftnetFails() async {
@@ -326,8 +329,8 @@ func makePreflight(runner: ScriptedProcessRunner, fileSystem: FakeFileSystem = F
 @Suite struct TartEnvironmentTests {
     @Test func tartNeverReceivesSentryVariables() async throws {
         let runner = ScriptedProcessRunner()
-        let tart = Tart(processRunner: runner, logger: Logger(label: "test", minimumLevel: .critical))
-        _ = try tart.run(name: "vm", options: .init(directoryMounts: [], noAudio: true, noGraphics: true, noClipboard: true, nested: false, network: try NetworkConfig(selection: .profile(.github), backend: .softnet).compile()))
+        let tart = makeTart(runner)
+        _ = try tart.run(name: "vm", options: .init(directoryMounts: [], noAudio: true, noGraphics: true, noClipboard: true, nested: false, network: boundToManagedSoftnet(try NetworkConfig(selection: .profile(.github), backend: .softnet).compile())))
         try await tart.clone(source: "a", name: "b")
         let scrubbed = Tart.scrubbedEnvironment(["SENTRY_DSN": "x", "CIRRUS_SENTRY_TAGS": "y", "PATH": "/bin"])
         #expect(scrubbed == ["PATH": "/bin"])

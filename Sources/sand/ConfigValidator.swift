@@ -196,6 +196,9 @@ final class ConfigValidator {
             }
         }
         if let path = network.softnetPath {
+            if path.contains(":") {
+                error("vm.run.network.softnetPath must not contain ':' (tart finds softnet through PATH, which ':' splits).")
+            }
             if !path.hasPrefix("/") || (path as NSString).lastPathComponent != "softnet" {
                 error("vm.run.network.softnetPath must be an absolute path to a binary named softnet (tart execs `softnet` from PATH), e.g. \(SoftnetDiscovery.managedPath).")
             }
