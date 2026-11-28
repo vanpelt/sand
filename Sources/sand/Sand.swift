@@ -47,15 +47,30 @@ struct Run: AsyncParsableCommand {
         let preflight = NetworkPreflight.live(processRunner: processRunner)
         let policies = try await NetworkStartup.compiledPolicies(config, preflight: preflight)
         for (runnerName, policy) in policies {
-            audit.emit("network.policy.compiled", [
+            var compiled = [
                 "runner": runnerName,
                 "hash": policy.policyHash,
                 "profile": policy.name.replacingOccurrences(of: "=", with: ":"),
                 "backend": policy.backend?.rawValue ?? "none",
                 "domains": String(policy.egress?.rules.count ?? 0),
                 "tart_args": policy.tartArguments.joined(separator: " ")
-            ])
+            ]
+            if let softnet = policy.host.softnet {
+                compiled["softnet"] = softnet.resolved
+                compiled["softnet_source"] = softnet.source.rawValue
+            }
+            audit.emit("network.policy.compiled", compiled)
             logger.info("runner \(runnerName): effective network policy \(policy.label) (hash \(policy.policyHash.prefix(12)))")
+            if let fallback = policy.host.autoFallback {
+                audit.emit("network.backend.fallback", level: fallback.loud ? .warning : .info, [
+                    "runner": runnerName, "chosen": "hostOnly", "requested": "auto", "reason": fallback.reason
+                ])
+                if fallback.loud {
+                    logger.warning("runner \(runnerName): WARNING backend auto rejected softnet and uses hostOnly (no host-service or peer-VM isolation): \(fallback.reason)")
+                } else {
+                    logger.info("runner \(runnerName): backend auto uses hostOnly: \(fallback.reason)")
+                }
+            }
             if !policy.isIsolated {
                 logger.warning("runner \(runnerName): network mode shared: VM has unrestricted host/LAN/VPN/corporate network reach")
             }

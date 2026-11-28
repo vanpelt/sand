@@ -189,7 +189,7 @@ func dependencies(
     return deps
 }
 
-func makeRunner(host: ProcessRunning, network: RunnerNetworkDependencies, run: String = "echo provisioned-marker", policy: NetworkConfig = .secureDefault, stopAfter: Int? = 1) -> Runner {
+func makeRunner(host: ProcessRunning, network: RunnerNetworkDependencies, run: String = "echo provisioned-marker", policy: NetworkConfig = NetworkConfig(selection: .profile(.github), backend: .hostOnly), stopAfter: Int? = 1) -> Runner {
     let logger = Logger(label: "test", minimumLevel: .critical)
     let tart = Tart(processRunner: host, logger: logger)
     let vm = Config.VM(source: .init(type: .local, image: nil, name: "golden"), hardware: nil, mounts: [], cache: nil, run: .init(noGraphics: true, noClipboard: true, nested: false, network: policy), diskSizeGb: nil, ssh: .standard)

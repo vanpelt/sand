@@ -137,7 +137,20 @@ struct Tart: Sendable {
             arguments.append(mount.runArgument)
         }
         logger.debug("tart \(arguments.joined(separator: " "))")
-        return try processRunner.start(executable: "tart", arguments: arguments, environment: Self.scrubbedEnvironment())
+        return try processRunner.start(executable: "tart", arguments: arguments, environment: Self.runEnvironment(network: options.network))
+    }
+
+    /// tart 2.42 execs the first `softnet` on its PATH. Under the softnet
+    /// backend the directory of the softnet sand checked goes first, so tart
+    /// execs exactly that binary; nothing else in the environment changes.
+    static func runEnvironment(network: NetworkPolicy, base: [String: String] = ProcessInfo.processInfo.environment) -> [String: String] {
+        var environment = scrubbedEnvironment(base)
+        if network.usesSoftnet, let softnet = network.host.softnet {
+            // env(1) falls back to the default search path when PATH is unset; keep it.
+            let rest = environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+            environment["PATH"] = softnet.directory + ":" + rest
+        }
+        return environment
     }
 
     /// Variables Tart forwards to Sentry crash reporting; never hand them VM context.

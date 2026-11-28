@@ -37,7 +37,8 @@ private func issues(_ network: NetworkConfig) -> [ConfigValidationIssue] {
 }
 
 @Suite struct EnforcementBackendConfigTests {
-    @Test func defaultIsHostOnlyWithoutSoftnet() throws {
+    @Test func defaultIsAutoAndHostIndependentCompileIsHostOnly() throws {
+        #expect(NetworkConfig.secureDefault.backendChoice == .auto)
         let policy = try NetworkConfig.secureDefault.compile()
         #expect(policy.backend == .hostOnly)
         #expect(policy.tartArguments == ["--net-host"])
@@ -527,7 +528,7 @@ struct FakeTrustStore: HostTrustStore {
         let recorder = AuditRecorder()
         var deps = dependencies(host: host, proxy: FakeProxy(), recorder: recorder)
         deps.hostListeners = { _ in .init(listeners: [HostListener(proto: .tcp, port: 5000, boundTo: "*")], method: "lsof+sweep") }
-        let runner = makeRunner(host: host, network: deps, policy: NetworkConfig(selection: .profile(.github), hostListeners: .deny))
+        let runner = makeRunner(host: host, network: deps, policy: NetworkConfig(selection: .profile(.github), backend: .hostOnly, hostListeners: .deny))
         await #expect(throws: NetworkEnforcementError.self) { try await runner.run() }
         #expect(!host.lock.withLock { host.started }.contains { $0.contains("provisioned-marker") })
         #expect(recorder.events.contains { $0.name == "network.host.listeners" && $0.fields["result"] == "denied" })

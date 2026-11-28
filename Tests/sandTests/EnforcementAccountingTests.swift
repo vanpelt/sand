@@ -68,7 +68,7 @@ private func waitUntil(_ condition: () -> Bool) async throws {
         deps.inspectionCAs = [InspectionCA(sha256: "AA77", subject: "Inspection Root", pem: "x", isRoot: true)]
         let runner = makeRunner(
             host: host, network: deps,
-            policy: NetworkConfig(selection: .profile(.github), tlsInspection: .trustHostCA, maxEnforcementFailures: 2), stopAfter: nil
+            policy: NetworkConfig(selection: .profile(.github), backend: .hostOnly, tlsInspection: .trustHostCA, maxEnforcementFailures: 2), stopAfter: nil
         )
         await #expect(throws: NetworkEnforcementError.self) { try await runner.run() }
         let failed = recorder.events.filter { $0.name == "network.enforcement.failed" }
@@ -89,7 +89,7 @@ private func waitUntil(_ condition: () -> Bool) async throws {
             processRunner: ScriptedProcessRunner(responder: currentToolHelp), fileSystem: fileSystem,
             resolver: StaticHostResolver(table: ["github.com": [IPAddress("140.82.112.3")!]]), hostProbe: FakeHostProbe(), proxySelfTest: nil
         )
-        let runner = makeRunner(host: host, network: deps, policy: NetworkConfig(selection: .profile(.github), maxEnforcementFailures: 2), stopAfter: nil)
+        let runner = makeRunner(host: host, network: deps, policy: NetworkConfig(selection: .profile(.github), backend: .hostOnly, maxEnforcementFailures: 2), stopAfter: nil)
         await #expect(throws: NetworkEnforcementError.self) { try await runner.run() }
         let failed = recorder.events.filter { $0.name == "network.enforcement.failed" }
         #expect(failed.map { $0.fields["stage"] } == ["per-vm-preflight", "per-vm-preflight"])
@@ -123,7 +123,7 @@ private func waitUntil(_ condition: () -> Bool) async throws {
         deps.makeProxy = { _, _, _ in DyingProxy() }
         let runner = makeRunner(
             host: FreshBlockingProvisioner(inner: host), network: deps, run: "sleep-forever-marker",
-            policy: NetworkConfig(selection: .profile(.github), maxEnforcementFailures: 2), stopAfter: nil
+            policy: NetworkConfig(selection: .profile(.github), backend: .hostOnly, maxEnforcementFailures: 2), stopAfter: nil
         )
         var thrown: Error?
         do { try await runner.run() } catch { thrown = error }
@@ -160,9 +160,12 @@ private func waitUntil(_ condition: () -> Bool) async throws {
         let pinned = try await preflight.compile(auto, sshPort: 22, pinnedBackend: .softnet)
         #expect(pinned.backend == .softnet)
         let failures = NetworkPreflight.failures(await preflight.perVM(policy: pinned))
-        #expect(failures.map(\.name) == ["P3 softnet privilege"])
+        // The pinned softnet's path is now user-writable: fail closed, never run it.
+        #expect(failures.map(\.name) == [NetworkPreflight.pathCheckName])
         // An explicit backend is never overridden by the pin.
-        #expect(try await preflight.compile(.secureDefault, sshPort: 22, pinnedBackend: .softnet).backend == .hostOnly)
+        #expect(try await preflight.compile(NetworkConfig(selection: .profile(.github), backend: .hostOnly), sshPort: 22, pinnedBackend: .softnet).backend == .hostOnly)
+        // The default is auto, so it follows the pin.
+        #expect(try await preflight.compile(.secureDefault, sshPort: 22, pinnedBackend: .softnet).backend == .softnet)
     }
 }
 
@@ -255,7 +258,7 @@ private func waitUntil(_ condition: () -> Bool) async throws {
         let recorder = AuditRecorder()
         var deps = dependencies(host: host, proxy: FakeProxy(), recorder: recorder)
         deps.ipForwarding = { IPForwardingState(ipv4: 1, ipv6: 0) }
-        let runner = makeRunner(host: host, network: deps, policy: NetworkConfig(selection: .profile(.github), maxEnforcementFailures: 1))
+        let runner = makeRunner(host: host, network: deps, policy: NetworkConfig(selection: .profile(.github), backend: .hostOnly, maxEnforcementFailures: 1))
         await #expect(throws: NetworkEnforcementError.self) { try await runner.run() }
         #expect(recorder.events.contains { $0.name == "network.host.forwarding" && $0.fields["result"] == "denied" })
         #expect(!host.lock.withLock { host.started }.contains { $0.contains("provisioned-marker") })
@@ -267,7 +270,7 @@ private func waitUntil(_ condition: () -> Bool) async throws {
         let recorder = AuditRecorder()
         var deps = dependencies(host: host, proxy: FakeProxy(), recorder: recorder)
         deps.ipForwarding = { IPForwardingState(ipv4: 1, ipv6: 1) }
-        try await makeRunner(host: host, network: deps, policy: NetworkConfig(selection: .profile(.github), ipForwarding: .accept)).run()
+        try await makeRunner(host: host, network: deps, policy: NetworkConfig(selection: .profile(.github), backend: .hostOnly, ipForwarding: .accept)).run()
         #expect(recorder.events.contains { $0.name == "network.host.forwarding" && $0.fields["result"] == "accepted" })
         let verified = try #require(recorder.events.first { $0.name == "network.guest.verified" })
         #expect(verified.fields["routed_reachable"]?.contains("100.100.100.100") == true)
@@ -278,7 +281,7 @@ private func waitUntil(_ condition: () -> Bool) async throws {
         let host = FakeVMHost()
         host.probeOverrides = ["R4": "OPEN 100.100.100.100"]
         let recorder = AuditRecorder()
-        let runner = makeRunner(host: host, network: dependencies(host: host, proxy: FakeProxy(), recorder: recorder), policy: NetworkConfig(selection: .profile(.github), maxEnforcementFailures: 1))
+        let runner = makeRunner(host: host, network: dependencies(host: host, proxy: FakeProxy(), recorder: recorder), policy: NetworkConfig(selection: .profile(.github), backend: .hostOnly, maxEnforcementFailures: 1))
         await #expect(throws: NetworkEnforcementError.self) { try await runner.run() }
         #expect(recorder.events.contains { $0.name == "network.guest.verify" && $0.fields["failed"] == "R4:OPEN" })
     }

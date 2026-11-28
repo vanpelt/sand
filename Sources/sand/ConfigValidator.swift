@@ -195,6 +195,24 @@ final class ConfigValidator {
                 error("vm.run.network hostListeners, acceptedHostListeners, tlsInspection and ipForwarding require a profile, not mode.")
             }
         }
+        if let path = network.softnetPath {
+            if !path.hasPrefix("/") || (path as NSString).lastPathComponent != "softnet" {
+                error("vm.run.network.softnetPath must be an absolute path to a binary named softnet (tart execs `softnet` from PATH), e.g. \(SoftnetDiscovery.managedPath).")
+            }
+            if path.hasPrefix("/opt/homebrew/") || path.hasPrefix("/usr/local/Cellar/") || path.hasPrefix("/usr/local/Homebrew/") {
+                warning("vm.run.network.softnetPath \(path) is a Homebrew location, which your user can write; preflight P12 refuses a privileged softnet there. Install it with deploy/jamf/install-managed-softnet.sh instead.")
+            }
+        }
+        if let digest = network.softnetSHA256, !SoftnetDiscovery.isSHA256(digest) {
+            error("vm.run.network.softnetSHA256 must be 64 hex digits (shasum -a 256 of the softnet binary).")
+        }
+        if network.softnetPath != nil || network.softnetSHA256 != nil {
+            if network.mode == .shared {
+                error("vm.run.network softnetPath/softnetSHA256 do not apply to mode: shared.")
+            } else if network.backendChoice == .hostOnly {
+                warning("vm.run.network softnetPath/softnetSHA256 have no effect with backend: hostOnly.")
+            }
+        }
         if network.profile == .offline, network.tlsInspection != nil {
             error("vm.run.network.tlsInspection applies to profile: github only (offline has no proxy).")
         }

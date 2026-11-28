@@ -36,6 +36,25 @@ struct NetworkPolicy: Sendable, Equatable {
         case offline
     }
 
+    /// How this policy is bound to this host. Set by `NetworkPreflight.compile`;
+    /// not part of `policyHash`, which depends on the config alone.
+    struct HostBinding: Sendable, Equatable {
+        /// The softnet tart must exec (backend softnet only).
+        var softnet: SoftnetLocation?
+        /// `vm.run.network.softnetPath` / `softnetSHA256`, for the per-VM checks.
+        var softnetPath: String?
+        var softnetSHA256: String?
+        /// Why `backend: auto` did not choose softnet on this host.
+        var autoFallback: AutoFallback?
+    }
+
+    struct AutoFallback: Sendable, Equatable {
+        let reason: String
+        /// A softnet was installed but rejected (for example setuid root in a
+        /// user-writable directory): warn loudly and audit, not just note it.
+        let loud: Bool
+    }
+
     /// Port the guest sees the egress proxy on (forwarded by the SSH reverse tunnel).
     static let guestProxyPort = 3128
 
@@ -46,6 +65,7 @@ struct NetworkPolicy: Sendable, Equatable {
     /// nil only for shared NAT.
     let backend: EnforcementBackend?
     let options: Options
+    var host = HostBinding()
 
     init(kind: Kind, softnet: SoftnetRuleSet?, verify: VerifyLevel = .off, backend: EnforcementBackend? = nil, options: Options = Options()) {
         self.kind = kind
@@ -159,8 +179,14 @@ struct NetworkPolicy: Sendable, Equatable {
             lines.append("note: hostOnly does not guarantee peer-VM isolation; VMs that share a host-only bridge can reach each other (use backend: softnet for that)")
         case .softnet:
             lines.append("enforcement backend: softnet (privileged softnet binary required)")
+            if let softnet = host.softnet {
+                lines.append("softnet binary: \(softnet.summary) (tart is launched with \(softnet.directory) first on PATH)")
+            }
         case nil:
             break
+        }
+        if let fallback = host.autoFallback {
+            lines.append("backend auto chose hostOnly: \(fallback.reason)")
         }
         if isIsolated {
             lines.append("max consecutive enforcement failures before exit 78: \(options.maxEnforcementFailures)")

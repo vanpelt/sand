@@ -48,12 +48,45 @@ struct FakeFileSystem: PreflightFileSystem {
     var owner: (uid: UInt32, mode: UInt16)? = (0, UInt16(S_ISUID) | 0o755)
     var free: Int64? = 100_000_000_000
     var sysctls: [String: Int] = [IPForwardingState.ipv4Name: 0, IPForwardingState.ipv6Name: 0]
+    /// Per-path overrides of `owner` (binaries and ancestor directories).
+    var owners: [String: (uid: UInt32, mode: UInt16)] = [:]
+    /// Paths that exist besides what `which` returns (e.g. the managed softnet).
+    var existing: Set<String> = []
+    var files: [String: String] = [:]
+    var digests: [String: String] = [:]
 
     func which(_ command: String) -> String? { paths[command] }
     func realpath(_ path: String) -> String { path.replacingOccurrences(of: "/opt/homebrew/bin", with: "/opt/homebrew/Cellar/softnet/0.26.0/bin") }
-    func ownerAndMode(_ path: String) -> (uid: UInt32, mode: UInt16)? { owner }
+    func ownerAndMode(_ path: String) -> (uid: UInt32, mode: UInt16)? { owners[path] ?? owner }
     func freeBytes(atPath path: String) -> Int64? { free }
     func sysctlInt(_ name: String) -> Int? { sysctls[name] }
+    func fileExists(_ path: String) -> Bool { existing.contains(path) || files[path] != nil || paths.values.contains(path) }
+    func readFile(_ path: String) -> String? { files[path] }
+    func sha256(ofFile path: String) -> String? { digests[path] }
+
+    /// The real layout of this Mac's Homebrew: everything under /opt/homebrew belongs to the user.
+    static func homebrewOwnedByUser(binary: (uid: UInt32, mode: UInt16)) -> FakeFileSystem {
+        var fileSystem = FakeFileSystem()
+        fileSystem.owner = (0, 0o755)
+        for directory in ["/opt/homebrew", "/opt/homebrew/Cellar", "/opt/homebrew/Cellar/softnet", "/opt/homebrew/Cellar/softnet/0.26.0", "/opt/homebrew/Cellar/softnet/0.26.0/bin"] {
+            fileSystem.owners[directory] = (501, 0o755)
+        }
+        fileSystem.owners["/opt/homebrew/Cellar"] = (501, 0o775)
+        fileSystem.owners["/opt/homebrew/Cellar/softnet/0.26.0/bin/softnet"] = binary
+        return fileSystem
+    }
+
+    /// What deploy/jamf/install-managed-softnet.sh leaves behind.
+    static func managed(mode: UInt16 = UInt16(S_ISUID) | 0o555, digest: String = String(repeating: "ab", count: 32), manifest: String? = nil) -> FakeFileSystem {
+        var fileSystem = homebrewOwnedByUser(binary: (501, 0o555))
+        fileSystem.existing.insert(SoftnetDiscovery.managedPath)
+        fileSystem.owners[SoftnetDiscovery.managedPath] = (0, mode)
+        fileSystem.digests[SoftnetDiscovery.managedPath] = digest
+        let manifestPath = SoftnetDiscovery.managedDirectory + "/" + SoftnetDiscovery.manifestName
+        fileSystem.files[manifestPath] = manifest ?? "\(digest)  \(SoftnetDiscovery.managedPath)\n"
+        fileSystem.owners[manifestPath] = (0, 0o444)
+        return fileSystem
+    }
 }
 
 struct FakeHostProbe: HostEgressProbing {
@@ -101,12 +134,14 @@ func makePreflight(runner: ScriptedProcessRunner, fileSystem: FakeFileSystem = F
     }
 
     @Test func softnetWithoutPrivilegeFailsWithRemediation() async {
+        // Safe root-owned path, but neither setuid nor sudo-allowed.
         var fileSystem = FakeFileSystem()
-        fileSystem.owner = (501, 0o755)
+        fileSystem.owner = (0, 0o755)
         let runner = ScriptedProcessRunner(responder: currentToolHelp)
         let failures = NetworkPreflight.failures(await makePreflight(runner: runner, fileSystem: fileSystem).run(policy: github))
         let privilege = failures.first { $0.name == "P3 softnet privilege" }
-        #expect(privilege?.remediation?.contains("chmod u+s") == true)
+        #expect(privilege?.remediation?.contains("install-managed-softnet.sh") == true)
+        #expect(privilege?.remediation?.contains("chmod u+s") == false)
         // Only ever non-interactive sudo.
         #expect(runner.calls.filter { $0.executable == "sudo" }.allSatisfy { $0.arguments.first == "-n" })
         #expect(!runner.calls.filter { $0.executable == "sudo" }.isEmpty)
@@ -114,13 +149,15 @@ func makePreflight(runner: ScriptedProcessRunner, fileSystem: FakeFileSystem = F
 
     @Test func passwordlessSudoIsAccepted() async {
         var fileSystem = FakeFileSystem()
-        fileSystem.owner = (501, 0o755)
+        fileSystem.owner = (0, 0o555)
         let runner = ScriptedProcessRunner { executable, arguments in
             if executable == "sudo" { return ProcessResult(stdout: "", stderr: "", exitCode: 0) }
             return try currentToolHelp(executable, arguments)
         }
-        let check = await makePreflight(runner: runner, fileSystem: fileSystem).checkSoftnetPrivilege()
+        let location = SoftnetLocation(path: SoftnetDiscovery.managedPath, resolved: SoftnetDiscovery.managedPath, source: .managed)
+        let check = await makePreflight(runner: runner, fileSystem: fileSystem).checkSoftnetPrivilege(location)
         #expect(check.status == .ok)
+        #expect(runner.calls.contains { $0.executable == "sudo" && $0.arguments == ["-n", SoftnetDiscovery.managedPath, "--help"] })
     }
 
     @Test func oldTartOrSoftnetFails() async {
@@ -146,7 +183,11 @@ func makePreflight(runner: ScriptedProcessRunner, fileSystem: FakeFileSystem = F
         var fileSystem = FakeFileSystem()
         fileSystem.owner = (501, 0o755)
         let failures = NetworkPreflight.failures(await makePreflight(runner: ScriptedProcessRunner(responder: currentToolHelp), fileSystem: fileSystem, resolver: StaticHostResolver(table: [:])).perVM(policy: github))
-        #expect(failures.map(\.name) == ["P3 softnet privilege", "P4 resolve github.com"])
+        #expect(failures.map(\.name) == [NetworkPreflight.pathCheckName, "P4 resolve github.com"])
+        var unprivileged = FakeFileSystem()
+        unprivileged.owner = (0, 0o755)
+        let privilege = NetworkPreflight.failures(await makePreflight(runner: ScriptedProcessRunner(responder: currentToolHelp), fileSystem: unprivileged).perVM(policy: github))
+        #expect(privilege.map(\.name) == ["P3 softnet privilege"])
     }
 }
 

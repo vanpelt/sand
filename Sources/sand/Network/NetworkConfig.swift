@@ -3,8 +3,9 @@ import Foundation
 /// `vm.run.network`: either a profile (secure defaults, the proxy-based egress
 /// allowlist) or a legacy explicit softnet mode.
 ///
-/// Profiles are enforced by a backend: `hostOnly` (tart `--net-host`, no root,
-/// the default) or `softnet` (needs a privileged softnet binary).
+/// Profiles are enforced by a backend: `auto` (the default: softnet when a
+/// safely installed privileged softnet exists, otherwise hostOnly), `hostOnly`
+/// (tart `--net-host`, no root) or `softnet` (needs a privileged softnet binary).
 ///
 /// An omitted `network` key means `profile: github`. Unrestricted shared NAT is
 /// only available by writing `mode: shared` explicitly.
@@ -84,8 +85,12 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
     let verify: VerifyLevel?
     let allowGitHubSSH: Bool
     let transport: Transport
-    /// nil means the default (`hostOnly`) for profiles; modes always use softnet.
+    /// nil means the default (`auto`) for profiles; modes always use softnet.
     let backend: BackendChoice?
+    /// Explicit softnet binary (absolute). nil: the managed location, then PATH.
+    let softnetPath: String?
+    /// Expected SHA-256 of the softnet binary, checked before every VM.
+    let softnetSHA256: String?
     let hostListeners: HostListenerPolicy?
     /// `tcp/7000`, `udp/5353`, `udp/*`: host listeners accepted under `hostListeners: deny`.
     let acceptedHostListeners: [String]
@@ -109,6 +114,8 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
         allowGitHubSSH: Bool = false,
         transport: Transport = .tunnel,
         backend: BackendChoice? = nil,
+        softnetPath: String? = nil,
+        softnetSHA256: String? = nil,
         hostListeners: HostListenerPolicy? = nil,
         acceptedHostListeners: [String] = [],
         tlsInspection: TLSInspectionMode? = nil,
@@ -124,6 +131,8 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
         self.allowGitHubSSH = allowGitHubSSH
         self.transport = transport
         self.backend = backend
+        self.softnetPath = softnetPath
+        self.softnetSHA256 = softnetSHA256
         self.hostListeners = hostListeners
         self.acceptedHostListeners = acceptedHostListeners
         self.tlsInspection = tlsInspection
@@ -194,6 +203,8 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
             self.transport = .tunnel
         }
         backend = try Self.decodeEnum(BackendChoice.self, key: .backend, in: container)
+        softnetPath = try container.decodeIfPresent(String.self, forKey: .softnetPath)
+        softnetSHA256 = try container.decodeIfPresent(String.self, forKey: .softnetSHA256)?.lowercased()
         hostListeners = try Self.decodeEnum(HostListenerPolicy.self, key: .hostListeners, in: container)
         acceptedHostListeners = try container.decodeIfPresent([String].self, forKey: .acceptedHostListeners) ?? []
         tlsInspection = try Self.decodeEnum(TLSInspectionMode.self, key: .tlsInspection, in: container)
@@ -214,7 +225,7 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case profile, mode, presets, allowedDomains, allowedCIDRs, allowCIDRs, verify, allowGitHubSSH, transport
-        case backend, hostListeners, acceptedHostListeners, tlsInspection, ipForwarding, maxEnforcementFailures
+        case backend, softnetPath, softnetSHA256, hostListeners, acceptedHostListeners, tlsInspection, ipForwarding, maxEnforcementFailures
     }
 
     var profile: Profile? {
@@ -236,7 +247,7 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
     var backendChoice: BackendChoice {
         switch selection {
         case .profile:
-            return backend ?? .hostOnly
+            return backend ?? .auto
         case .mode:
             return .softnet
         }
@@ -263,7 +274,8 @@ struct NetworkConfig: Decodable, Sendable, Equatable {
     /// rule the validator would reject, so an invalid policy can never boot a VM.
     ///
     /// `autoBackend` is what `backend: auto` resolved to on this host (see
-    /// `NetworkPreflight.resolveBackend`); without it, auto means hostOnly.
+    /// `NetworkPreflight.resolveBackend`); without it, auto means hostOnly
+    /// (the root-free backend), which is what host-independent callers get.
     func compile(sshPort: Int = 22, autoBackend: EnforcementBackend = .hostOnly) throws -> NetworkPolicy {
         let ssh = SoftnetRule.sshFromHost(port: sshPort)
         let backend: EnforcementBackend

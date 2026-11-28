@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 import Network
@@ -39,6 +40,11 @@ protocol PreflightFileSystem: Sendable {
     func freeBytes(atPath path: String) -> Int64?
     /// An integer sysctl (readable without root), nil when it cannot be read.
     func sysctlInt(_ name: String) -> Int?
+    /// Exists (following symlinks).
+    func fileExists(_ path: String) -> Bool
+    func readFile(_ path: String) -> String?
+    /// Lowercase hex SHA-256 of a file's contents.
+    func sha256(ofFile path: String) -> String?
 }
 
 /// The host's IPv4/IPv6 forwarding switches (nil: unreadable).
@@ -101,6 +107,27 @@ struct SystemPreflightFileSystem: PreflightFileSystem {
 
     func sysctlInt(_ name: String) -> Int? {
         Self.sysctlInt(name)
+    }
+
+    func fileExists(_ path: String) -> Bool {
+        FileManager.default.fileExists(atPath: path)
+    }
+
+    func readFile(_ path: String) -> String? {
+        guard let data = FileManager.default.contents(atPath: path), data.count <= 64 * 1024 else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    func sha256(ofFile path: String) -> String? {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while true {
+            guard let chunk = try? handle.read(upToCount: 1 << 20) else { return nil }
+            if chunk.isEmpty { break }
+            hasher.update(data: chunk)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     static func sysctlInt(_ name: String) -> Int? {
@@ -171,12 +198,16 @@ private final class PreflightOnce: @unchecked Sendable {
 /// remediation text is for the user to run.
 struct NetworkPreflight: Sendable {
     static let softnetRemediation = """
-    The softnet backend needs a privileged softnet. Either drop `backend: softnet`
-    (the default hostOnly backend needs no root), or do this one-time setup in your own terminal (sand never does this):
-      sudo chown root:wheel "$(realpath "$(which softnet)")" && sudo chmod u+s "$(realpath "$(which softnet)")"
-    `brew upgrade softnet` resets this; re-run it after upgrades. Alternative: a sudoers NOPASSWD rule
-    for both /opt/homebrew/bin/softnet and its Cellar path. Softnet runs its setup as root and rewrites the
-    system bootpd prefs (DHCPLeaseTimeSecs=600). To opt out of isolation instead: vm.run.network: { mode: shared }.
+    The softnet backend needs a privileged softnet that only root can replace: root-owned, in directories that are
+    root-owned and not group/world-writable all the way up to /. On a managed Mac IT installs it at
+    \(SoftnetDiscovery.managedPath) (deploy/jamf/install-managed-softnet.sh). To do it yourself, once, in your own
+    terminal from a sand checkout (sand never runs sudo):
+      sudo deploy/jamf/install-managed-softnet.sh
+    (downloads the pinned softnet release, verifies its SHA-256, installs it setuid root and writes a SHA-256 manifest).
+    Never make the Homebrew softnet setuid root or sudoers-allowed: /opt/homebrew is writable by your user, so anything
+    running as you could replace the binary and get root. Softnet runs its setup as root and rewrites the system bootpd
+    prefs (DHCPLeaseTimeSecs=600). Without it, backend: auto (the default) uses hostOnly, which needs no root.
+    To opt out of isolation instead: vm.run.network: { mode: shared }.
     """
 
     let processRunner: ProcessRunning
@@ -229,9 +260,16 @@ struct NetworkPreflight: Sendable {
         }
         var checks: [PreflightCheck] = []
         var inspection: TLSInspectionReport?
+        if let fallback = policy.host.autoFallback {
+            checks.append(PreflightCheck(
+                "P0 backend auto", fallback.loud ? .warning : .ok,
+                "using hostOnly: \(fallback.reason)",
+                remediation: fallback.loud ? Self.softnetRemediation : nil
+            ))
+        }
         checks.append(contentsOf: await checkTart(backend: policy.backend ?? .softnet))
         if policy.usesSoftnet {
-            checks.append(contentsOf: await checkSoftnet())
+            checks.append(contentsOf: await checkSoftnet(locateSoftnet(policy), pin: policy.host.softnetSHA256))
         } else {
             checks.append(PreflightCheck("P3 softnet privilege", .ok, "not needed: the hostOnly backend runs without root"))
             checks.append(checkIPForwarding(policy))
@@ -298,27 +336,65 @@ struct NetworkPreflight: Sendable {
         return checks
     }
 
-    /// What `backend: auto` means on this host: softnet when it is installed,
-    /// new enough and privileged; otherwise hostOnly (which needs no root).
+    /// What `backend: auto` means on this host: softnet when a safely installed
+    /// (root-owned path), new enough, privileged softnet exists; otherwise hostOnly
+    /// (which needs no root). A privileged softnet in a user-writable location
+    /// is never used: auto falls back loudly. A SHA-256 pin mismatch is not a
+    /// reason to fall back: auto keeps softnet so the preflight fails closed.
     func resolveBackend(_ config: NetworkConfig) async -> EnforcementBackend {
+        await resolveBackendWithReason(config).backend
+    }
+
+    func resolveBackendWithReason(_ config: NetworkConfig) async -> (backend: EnforcementBackend, fallback: NetworkPolicy.AutoFallback?) {
         switch config.backendChoice {
-        case .hostOnly: return .hostOnly
-        case .softnet: return .softnet
+        case .hostOnly: return (.hostOnly, nil)
+        case .softnet: return (.softnet, nil)
         case .auto:
+            let location: SoftnetLocation
+            switch SoftnetDiscovery.locate(configuredPath: config.softnetPath, fileSystem: fileSystem) {
+            case let .missing(reason):
+                return (.hostOnly, .init(reason: reason, loud: config.softnetPath != nil))
+            case let .found(found):
+                location = found
+            }
             let tart = await checkTart(backend: .softnet)
-            let softnet = await checkSoftnet()
-            let ready = (tart + softnet).allSatisfy { $0.status != .failed }
-            return ready ? .softnet : .hostOnly
+            let softnet = await checkSoftnet(.found(location), pin: config.softnetSHA256)
+            let failures = Self.failures(tart + softnet)
+            if failures.isEmpty || failures.allSatisfy({ $0.name == Self.pinCheckName }) {
+                return (.softnet, nil)
+            }
+            let rejectedPrivileged = failures.contains { $0.name == Self.pathCheckName } && SoftnetDiscovery.isSetuidRoot(location.resolved, fileSystem: fileSystem)
+            let reason = "softnet (\(location.summary)) not usable: " + failures.map { "\($0.name): \($0.detail)" }.joined(separator: "; ")
+            return (.hostOnly, .init(reason: reason, loud: rejectedPrivileged || location.source != .path))
         }
     }
 
     /// Compiles a runner's policy, resolving `backend: auto` on this host unless
-    /// a backend was already pinned (at startup) for this runner.
+    /// a backend was already pinned (at startup) for this runner, and binds it to
+    /// the softnet binary tart will exec.
     func compile(_ config: NetworkConfig, sshPort: Int, pinnedBackend: EnforcementBackend? = nil) async throws -> NetworkPolicy {
+        let backend: EnforcementBackend
+        var fallback: NetworkPolicy.AutoFallback?
         if let pinnedBackend, config.backendChoice == .auto {
-            return try config.compile(sshPort: sshPort, autoBackend: pinnedBackend)
+            backend = pinnedBackend
+        } else {
+            (backend, fallback) = await resolveBackendWithReason(config)
         }
-        return try config.compile(sshPort: sshPort, autoBackend: await resolveBackend(config))
+        var policy = try config.compile(sshPort: sshPort, autoBackend: backend)
+        policy.host.softnetPath = config.softnetPath
+        policy.host.softnetSHA256 = config.softnetSHA256
+        policy.host.autoFallback = policy.isHostOnly ? fallback : nil
+        if policy.usesSoftnet, case let .found(location) = SoftnetDiscovery.locate(configuredPath: config.softnetPath, fileSystem: fileSystem) {
+            policy.host.softnet = location
+        }
+        return policy
+    }
+
+    /// The softnet a policy is bound to, or (for a policy compiled without a
+    /// host) the one discovery finds now.
+    func locateSoftnet(_ policy: NetworkPolicy) -> SoftnetDiscovery.Outcome {
+        if let location = policy.host.softnet { return .found(location) }
+        return SoftnetDiscovery.locate(configuredPath: policy.host.softnetPath, fileSystem: fileSystem)
     }
 
     /// Cheap re-check before every clone: privilege can be reset by `brew upgrade`.
@@ -326,7 +402,19 @@ struct NetworkPreflight: Sendable {
         guard policy.isIsolated else { return [] }
         var checks: [PreflightCheck] = []
         if policy.usesSoftnet {
-            checks.append(await checkSoftnetPrivilege())
+            // Not `--help` again; but the path, privilege and pin, since the
+            // binary tart is about to exec must still be the one that was checked.
+            switch locateSoftnet(policy) {
+            case let .missing(reason):
+                checks.append(PreflightCheck("P2 softnet", .failed, reason, remediation: Self.softnetRemediation))
+            case let .found(location):
+                let path = checkSoftnetPath(location)
+                checks.append(path)
+                if path.status != .failed {
+                    checks.append(await checkSoftnetPrivilege(location))
+                    checks.append(checkSoftnetPin(location, configured: policy.host.softnetSHA256))
+                }
+            }
         }
         if policy.isHostOnly {
             // VPN clients and Internet Sharing toggle forwarding at runtime.
@@ -365,31 +453,90 @@ struct NetworkPreflight: Sendable {
         }
     }
 
-    func checkSoftnet() async -> [PreflightCheck] {
-        guard let path = fileSystem.which("softnet") else {
-            return [PreflightCheck("P2 softnet", .failed, "softnet not found in PATH", remediation: "brew install openai/tools/softnet\n" + Self.softnetRemediation)]
+    static let pathCheckName = "P12 softnet path"
+    static let pinCheckName = "P13 softnet pin"
+
+    /// P2 (found, new enough), P12 (path safety), P3 (privilege), P13 (pin).
+    /// Nothing is executed from an unsafe path: not `--help`, not `sudo -n`.
+    func checkSoftnet(_ outcome: SoftnetDiscovery.Outcome, pin: String?) async -> [PreflightCheck] {
+        let location: SoftnetLocation
+        switch outcome {
+        case let .missing(reason):
+            return [PreflightCheck("P2 softnet", .failed, reason, remediation: Self.softnetRemediation)]
+        case let .found(found):
+            location = found
         }
-        let help = (try? await processRunner.run(executable: path, arguments: ["--help"], wait: true))?.stdout ?? ""
+        let path = checkSoftnetPath(location)
+        guard path.status != .failed else { return [path] }
+        let help = (try? await processRunner.run(executable: location.resolved, arguments: ["--help"], wait: true))?.stdout ?? ""
         guard help.contains("proto"), help.contains("@host") else {
-            return [PreflightCheck("P2 softnet", .failed, "softnet too old for stateful rules (needs 'proto' and '@host')", remediation: "brew upgrade openai/tools/softnet")]
+            return [path, PreflightCheck("P2 softnet", .failed, "softnet (\(location.summary)) too old for stateful rules (needs 'proto' and '@host')", remediation: "Install softnet 0.26 or newer: " + Self.softnetRemediation)]
         }
-        return [PreflightCheck("P2 softnet", .ok, "softnet supports stateful rules"), await checkSoftnetPrivilege()]
+        return [
+            path,
+            PreflightCheck("P2 softnet", .ok, "\(location.summary) supports stateful rules"),
+            await checkSoftnetPrivilege(location),
+            checkSoftnetPin(location, configured: pin)
+        ]
     }
 
-    /// Same rule tart applies: SUID root, or passwordless `sudo -n`.
-    func checkSoftnetPrivilege() async -> PreflightCheck {
-        guard let path = fileSystem.which("softnet") else {
-            return PreflightCheck("P3 softnet privilege", .failed, "softnet not found in PATH", remediation: Self.softnetRemediation)
+    /// P12: a softnet that runs as root must not be replaceable by a non-root user.
+    func checkSoftnetPath(_ location: SoftnetLocation) -> PreflightCheck {
+        let problems = SoftnetDiscovery.pathProblems(location, fileSystem: fileSystem)
+        guard !problems.isEmpty else {
+            return PreflightCheck(Self.pathCheckName, .ok, "\(location.summary): root-owned, no group/world-writable component up to /")
         }
-        let real = fileSystem.realpath(path)
-        if let (uid, mode) = fileSystem.ownerAndMode(real), uid == 0, mode & UInt16(S_ISUID) != 0 {
+        let setuid = SoftnetDiscovery.isSetuidRoot(location.resolved, fileSystem: fileSystem)
+        let lead = setuid
+            ? "softnet \(location.summary) is setuid root but a non-root user can replace it (local privilege escalation); sand refuses to use it"
+            : "softnet \(location.summary) is not installed where only root can replace it; sand never runs a privileged softnet from such a path"
+        return PreflightCheck(Self.pathCheckName, .failed, lead + ": " + problems.joined(separator: "; "), remediation: Self.softnetRemediation)
+    }
+
+    /// P3, same rule softnet applies: setuid root, or passwordless `sudo -n`.
+    /// Only ever called for a path that passed P12.
+    func checkSoftnetPrivilege(_ location: SoftnetLocation) async -> PreflightCheck {
+        if SoftnetDiscovery.isSetuidRoot(location.resolved, fileSystem: fileSystem) {
             return PreflightCheck("P3 softnet privilege", .ok, "softnet is setuid root")
         }
-        // Non-interactive only: -n never prompts.
-        if (try? await processRunner.run(executable: "sudo", arguments: ["-n", real, "--help"], wait: true)) != nil {
-            return PreflightCheck("P3 softnet privilege", .ok, "passwordless sudo is configured for softnet")
+        // Non-interactive only: -n never prompts. softnet re-execs itself via
+        // `sudo -n <its own path>`, which is `resolved` because tart execs it from there.
+        if (try? await processRunner.run(executable: "sudo", arguments: ["-n", location.resolved, "--help"], wait: true)) != nil {
+            return PreflightCheck("P3 softnet privilege", .ok, "passwordless sudo is configured for \(location.resolved)")
         }
-        return PreflightCheck("P3 softnet privilege", .failed, "softnet is neither setuid root nor allowed by passwordless sudo; tart would fail to boot isolated VMs", remediation: Self.softnetRemediation)
+        return PreflightCheck("P3 softnet privilege", .failed, "softnet (\(location.resolved)) is neither setuid root nor allowed by passwordless sudo; tart would fail to boot isolated VMs", remediation: Self.softnetRemediation)
+    }
+
+    /// P13: `softnetSHA256` and/or the installer's manifest next to the binary.
+    /// Any pin that is present must match; a bad manifest fails closed.
+    func checkSoftnetPin(_ location: SoftnetLocation, configured: String?) -> PreflightCheck {
+        let remediation = "Reinstall softnet with deploy/jamf/install-managed-softnet.sh, or review the binary and update vm.run.network.softnetSHA256."
+        var expected: [(source: String, digest: String)] = []
+        if let configured {
+            expected.append(("vm.run.network.softnetSHA256", configured.lowercased()))
+        }
+        let manifest = (location.directory as NSString).appendingPathComponent(SoftnetDiscovery.manifestName)
+        if fileSystem.fileExists(manifest) {
+            guard let info = fileSystem.ownerAndMode(manifest), info.uid == 0, info.mode & UInt16(S_IWGRP | S_IWOTH) == 0 else {
+                return PreflightCheck(Self.pinCheckName, .failed, "\(manifest) is not root-owned or is group/world-writable", remediation: remediation)
+            }
+            guard let text = fileSystem.readFile(manifest), let digest = SoftnetDiscovery.parseManifest(text) else {
+                return PreflightCheck(Self.pinCheckName, .failed, "\(manifest) is unreadable or not a SHA-256 manifest", remediation: remediation)
+            }
+            expected.append((manifest, digest))
+        }
+        guard !expected.isEmpty else {
+            return PreflightCheck(Self.pinCheckName, location.source == .managed ? .warning : .ok, "no SHA-256 pin for \(location.resolved) (set vm.run.network.softnetSHA256, or install with the managed installer, which writes \(SoftnetDiscovery.manifestName))")
+        }
+        guard let actual = fileSystem.sha256(ofFile: location.resolved) else {
+            return PreflightCheck(Self.pinCheckName, .failed, "cannot read \(location.resolved) to hash it", remediation: remediation)
+        }
+        let mismatched = expected.filter { $0.digest != actual }
+        guard mismatched.isEmpty else {
+            let detail = mismatched.map { "expected \($0.digest) (\($0.source))" }.joined(separator: ", ")
+            return PreflightCheck(Self.pinCheckName, .failed, "SHA-256 of \(location.resolved) is \(actual); \(detail)", remediation: remediation)
+        }
+        return PreflightCheck(Self.pinCheckName, .ok, "SHA-256 \(actual.prefix(16))... matches \(expected.map(\.source).joined(separator: " and "))")
     }
 
     func checkHostEgress() async -> [PreflightCheck] {
