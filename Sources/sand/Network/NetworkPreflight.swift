@@ -364,7 +364,7 @@ struct NetworkPreflight: Sendable {
                 return (.softnet, nil)
             }
             let rejectedPrivileged = failures.contains { $0.name == Self.pathCheckName } && SoftnetDiscovery.isSetuidRoot(location.resolved, fileSystem: fileSystem)
-            let reason = "softnet (\(location.summary)) not usable: " + failures.map { "\($0.name): \($0.detail)" }.joined(separator: "; ")
+            let reason = "softnet not usable: " + failures.map { "\($0.name): \($0.detail)" }.joined(separator: "; ")
             return (.hostOnly, .init(reason: reason, loud: rejectedPrivileged || location.source != .path))
         }
     }
@@ -488,8 +488,8 @@ struct NetworkPreflight: Sendable {
         }
         let setuid = SoftnetDiscovery.isSetuidRoot(location.resolved, fileSystem: fileSystem)
         let lead = setuid
-            ? "softnet \(location.summary) is setuid root but a non-root user can replace it (local privilege escalation); sand refuses to use it"
-            : "softnet \(location.summary) is not installed where only root can replace it; sand never runs a privileged softnet from such a path"
+            ? "\(location.summary) is setuid root but a non-root user can replace it (local privilege escalation); sand refuses to use it"
+            : "\(location.summary) is not installed where only root can replace it; sand never runs a privileged softnet from such a path"
         return PreflightCheck(Self.pathCheckName, .failed, lead + ": " + problems.joined(separator: "; "), remediation: Self.softnetRemediation)
     }
 

@@ -23,9 +23,15 @@ struct SoftnetLocation: Sendable, Equatable {
 
     var directory: String { (resolved as NSString).deletingLastPathComponent }
 
-    /// `managed /usr/local/libexec/sand/softnet`
+    /// `/usr/local/libexec/sand/softnet (managed)`, `/opt/homebrew/bin/softnet -> /opt/homebrew/Cellar/... (from PATH)`
     var summary: String {
-        resolved == path ? "\(source.rawValue) \(path)" : "\(source.rawValue) \(path) -> \(resolved)"
+        let label: String
+        switch source {
+        case .config: label = "from softnetPath"
+        case .managed: label = "managed"
+        case .path: label = "from PATH"
+        }
+        return (resolved == path ? path : "\(path) -> \(resolved)") + " (\(label))"
     }
 }
 

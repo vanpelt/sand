@@ -115,7 +115,7 @@ private func networkIssues(_ network: NetworkConfig) -> [ConfigValidationIssue] 
         #expect(NetworkPreflight.failures(checks).isEmpty, "\(checks.map(\.line))")
         #expect(checks.contains { $0.name == NetworkPreflight.pinCheckName && $0.status == .ok && $0.detail.contains(managedManifest) })
         #expect(NetworkPreflight.failures(await preflight.perVM(policy: policy)).isEmpty)
-        #expect(policy.explain().contains { $0.contains("softnet binary: managed /usr/local/libexec/sand/softnet") })
+        #expect(policy.explain().contains { $0.contains("softnet binary: /usr/local/libexec/sand/softnet (managed)") })
     }
 
     @Test func homebrewSetuidSoftnetMakesAutoFallBackLoudly() async throws {
