@@ -563,7 +563,7 @@ struct FakeTrustStore: HostTrustStore {
 @Suite struct NetworkFixtureTests {
     @Test func everyFixtureNetworkBlockValidates() throws {
         let fixtures = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("fixtures")
-        for file in try FileManager.default.contentsOfDirectory(atPath: fixtures.path) where file.hasSuffix(".yml") {
+        for file in try FileManager.default.contentsOfDirectory(atPath: fixtures.path) where file.hasSuffix(".yml") && !file.hasPrefix("broker_mock") {
             let config = try Config.load(path: fixtures.appendingPathComponent(file).path)
             let networkErrors = ConfigValidator().validate(config).filter { $0.severity == .error && $0.message.contains("vm.run.network") }
             #expect(networkErrors.isEmpty, "\(file): \(networkErrors.map(\.message))")

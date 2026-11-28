@@ -3,7 +3,7 @@ import Foundation
 actor VMShutdownCoordinator {
     private var activeName: String?
     private var cleanupTask: Task<Void, Never>?
-    private var deregistration: (@Sendable () async -> Void)?
+    private var deregistration: (@Sendable (_ reason: String) async -> Void)?
     private let destroyer: VMDestroyer
     private let logger: Logger
 
@@ -25,6 +25,12 @@ actor VMShutdownCoordinator {
     }
 
     func setDeregistration(_ action: @escaping @Sendable () async -> Void) {
+        deregistration = { _ in await action() }
+    }
+
+    /// Like `setDeregistration`, but the action learns the cleanup reason
+    /// (for example "signal shutdown"), which broker mode reports on release.
+    func setDeregistration(withReason action: @escaping @Sendable (_ reason: String) async -> Void) {
         deregistration = action
     }
 
@@ -42,7 +48,7 @@ actor VMShutdownCoordinator {
         logger.info("cleanup start for VM \(name) (reason: \(reasonLabel))")
         let task = Task { [destroyer, deregistration] in
             _ = try? await destroyer.destroy(name: name)
-            await deregistration?()
+            await deregistration?(reasonLabel)
         }
         cleanupTask = task
         await task.value

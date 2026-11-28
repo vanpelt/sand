@@ -6,7 +6,7 @@ import Foundation
 @available(macOS 15.0, *)
 struct Sand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        subcommands: [Run.self, Destroy.self, Doctor.self, Validate.self, NetworkCommand.self]
+        subcommands: [Run.self, Destroy.self, Doctor.self, Validate.self, NetworkCommand.self, BrokerCommand.self]
     )
 }
 
@@ -150,6 +150,10 @@ struct Run: AsyncParsableCommand {
             cleanupTargets.append(shutdownCoordinator)
             runnerControls.append(runnerControl)
             let github = try githubService(for: runnerConfig.provisioner)
+            let broker = try brokerRuntime(
+                for: runnerConfig.provisioner,
+                audit: AdmissionAudit.logging(Logger(label: "admission.\(logLabel)", minimumLevel: level, sink: logSink), file: auditFile)
+            )
             let runner = Runner(
                 tart: tart,
                 github: github,
@@ -165,7 +169,8 @@ struct Run: AsyncParsableCommand {
                 logSink: logSink,
                 audit: NetworkAudit(logger: Logger(label: "network.\(logLabel)", minimumLevel: level, sink: logSink), file: auditFile),
                 inspectionCAs: inspectionCAs[policies[index].1.policyHash] ?? [],
-                pinnedBackend: policies[index].1.backend
+                pinnedBackend: policies[index].1.backend,
+                broker: broker
             )
             runners.append(runner)
         }
@@ -217,11 +222,13 @@ struct Run: AsyncParsableCommand {
     }
 
     private func githubService(for provisioner: Config.Provisioner?) throws -> GitHubService? {
-        guard let provisioner, provisioner.type == .github, let githubConfig = provisioner.github else {
+        guard let provisioner, provisioner.type == .github, let githubConfig = provisioner.github,
+              githubConfig.broker == nil, let appId = githubConfig.appId else {
+            // Broker mode holds no GitHub App key.
             return nil
         }
         let auth = try GitHubAuth(
-            appId: githubConfig.appId,
+            appId: appId,
             privateKeyPath: githubConfig.privateKeyPath,
             privateKeyKeychainLabel: githubConfig.privateKeyKeychainLabel
         )
@@ -231,5 +238,16 @@ struct Run: AsyncParsableCommand {
             organization: githubConfig.organization,
             repository: githubConfig.repository
         )
+    }
+
+    private func brokerRuntime(for provisioner: Config.Provisioner?, audit: AdmissionAudit) throws -> BrokerRuntime? {
+        guard let provisioner, provisioner.type == .github, let broker = provisioner.github?.broker else {
+            return nil
+        }
+        guard let url = URL(string: broker.url) else {
+            throw ValidationError("provisioner.config.broker.url is not a valid URL")
+        }
+        let key = try DeviceKey.load(path: broker.deviceKeyPath)
+        return BrokerRuntime(client: BrokerClient(baseURL: url, deviceId: broker.deviceId, key: key), deviceId: broker.deviceId, audit: audit)
     }
 }

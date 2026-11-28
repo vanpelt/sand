@@ -57,6 +57,8 @@ struct NetworkPolicy: Sendable, Equatable {
 
     /// Port the guest sees the egress proxy on (forwarded by the SSH reverse tunnel).
     static let guestProxyPort = 3128
+    /// Guest loopback port of the per-VM job admission relay (ADR 0001), an SSH reverse tunnel like the proxy's.
+    static let guestAdmissionPort = 3129
 
     let kind: Kind
     let softnet: SoftnetRuleSet?

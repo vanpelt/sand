@@ -331,31 +331,16 @@ final class ConfigValidator {
                 issues.append(.init(severity: .error, message: "provisioner.config is required for github provisioner."))
                 return
             }
-            if github.appId <= 0 {
-                issues.append(.init(severity: .error, message: "provisioner.config.appId must be greater than 0."))
-            }
             if github.organization.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 issues.append(.init(severity: .error, message: "provisioner.config.organization must not be empty."))
             }
             if github.runnerName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 issues.append(.init(severity: .error, message: "provisioner.config.runnerName must not be empty."))
             }
-            switch (github.privateKeyPath, github.privateKeyKeychainLabel) {
-            case (let path?, nil):
-                if path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    issues.append(.init(severity: .error, message: "provisioner.config.privateKeyPath must not be empty."))
-                } else if !FileManager.default.fileExists(atPath: path) {
-                    issues.append(.init(severity: .error, message: "Private key not found at \(path)."))
-                }
-            case (nil, let label?):
-                if label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    issues.append(.init(severity: .error, message: "provisioner.config.privateKeyKeychainLabel must not be empty."))
-                }
-            default:
-                issues.append(.init(
-                    severity: .error,
-                    message: "provisioner.config requires exactly one of privateKeyPath or privateKeyKeychainLabel."
-                ))
+            if let broker = github.broker {
+                validateBroker(broker, github: github, issues: &issues)
+            } else {
+                validateLocalKey(github, issues: &issues)
             }
             if let repository = github.repository, repository.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 issues.append(.init(severity: .warning, message: "provisioner.config.repository is set but empty."))
@@ -368,6 +353,57 @@ final class ConfigValidator {
                     issues.append(.init(severity: .error, message: "provisioner.config.runnerGroup requires organization-level registration; remove provisioner.config.repository."))
                 }
             }
+        }
+    }
+
+    /// Exactly one of privateKeyPath, privateKeyKeychainLabel or broker.
+    private func validateLocalKey(_ github: GitHubProvisionerConfig, issues: inout [ConfigValidationIssue]) {
+        if (github.appId ?? 0) <= 0 {
+            issues.append(.init(severity: .error, message: "provisioner.config.appId must be greater than 0."))
+        }
+        switch (github.privateKeyPath, github.privateKeyKeychainLabel) {
+        case (let path?, nil):
+            if path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                issues.append(.init(severity: .error, message: "provisioner.config.privateKeyPath must not be empty."))
+            } else if !FileManager.default.fileExists(atPath: path) {
+                issues.append(.init(severity: .error, message: "Private key not found at \(path)."))
+            }
+        case (nil, let label?):
+            if label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                issues.append(.init(severity: .error, message: "provisioner.config.privateKeyKeychainLabel must not be empty."))
+            }
+        default:
+            issues.append(.init(
+                severity: .error,
+                message: "provisioner.config requires exactly one of privateKeyPath, privateKeyKeychainLabel or broker."
+            ))
+        }
+    }
+
+    private func validateBroker(_ broker: BrokerConfig, github: GitHubProvisionerConfig, issues: inout [ConfigValidationIssue]) {
+        if github.privateKeyPath != nil || github.privateKeyKeychainLabel != nil {
+            issues.append(.init(severity: .error, message: "provisioner.config requires exactly one of privateKeyPath, privateKeyKeychainLabel or broker; broker mode holds no App key."))
+        }
+        if github.appId != nil {
+            issues.append(.init(severity: .warning, message: "provisioner.config.appId is ignored in broker mode."))
+        }
+        if (github.repository ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            issues.append(.init(severity: .error, message: "provisioner.config.broker requires provisioner.config.repository (only repository scope is supported)."))
+        }
+        if github.runnerGroup != nil {
+            issues.append(.init(severity: .error, message: "provisioner.config.runnerGroup is not allowed with broker; the broker policy owns the runner group."))
+        }
+        if github.extraLabels != nil {
+            issues.append(.init(severity: .error, message: "provisioner.config.extraLabels is not allowed with broker; the broker policy owns the labels."))
+        }
+        if let problem = BrokerConfig.urlProblem(broker.url) {
+            issues.append(.init(severity: .error, message: problem))
+        }
+        if !BrokerConfig.isValidDeviceId(broker.deviceId) {
+            issues.append(.init(severity: .error, message: "provisioner.config.broker.deviceId must match ^[a-z0-9][a-z0-9-]{0,62}$."))
+        }
+        if !FileManager.default.fileExists(atPath: broker.deviceKeyPath) {
+            issues.append(.init(severity: .error, message: "Device key not found at \(broker.deviceKeyPath) (create one with sand broker keygen)."))
         }
     }
 

@@ -1,0 +1,35 @@
+# sand broker mock --config fixtures/broker_mock.yml   (DEVELOPMENT ONLY)
+# Not a `sand run` config. Placeholder values throughout: copy it, then fill in
+# your own App id, Keychain label, owner and ids. Never commit real values.
+listen:
+  host: 127.0.0.1
+  port: 8787
+github:
+  appId: 123456
+  privateKeyKeychainLabel: example-github-app-key
+  owner: example-org
+  repository: example-repo
+devices:
+  - id: dev-laptop
+    publicKeyPath: ~/.sand/broker/dev-laptop.pub.pem
+    owner:
+      login: example-user
+      id: 1000001
+policy:
+  version: pilot-1
+  # self-hosted, macOS and ARM64 are listed explicitly (JIT default labels are unverified, E5a).
+  labels: [self-hosted, macOS, ARM64, sand]
+  events: [push, workflow_dispatch]
+  workflows: [.github/workflows/self-hosted-smoke.yml]
+  branches: [main, "feature/*"]
+  allowReusableWorkflows: false
+  requireQueuedJob: true
+  requireOIDC: false
+  cancelDeniedRuns: false
+  admissionWaitSeconds: 15
+  admissionDeadlineSeconds: 30
+  idleTTLSeconds: 900
+limits:
+  allocationsPerHour: 30
+  deniesPerHourBeforeCircuitOpen: 6
+  circuitOpenSeconds: 3600

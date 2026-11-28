@@ -235,6 +235,58 @@ Common pitfalls:
 - `vm.cache` is ignored unless the provisioner type is `github`.
 - `scp` must be available on the host.
 
+### Broker mode and job admission (pilot)
+
+In broker mode Sand holds no GitHub App key. It authenticates to the Sand
+registration broker as a device, receives a single-use JIT runner, and every
+job that runner acquires must be admitted by the broker before any workflow
+code runs. The broker decides from GitHub REST (which job our `runner_id`
+holds, its actor and triggering actor, event, workflow path and branch), never
+from values the guest reports. See `docs/adr/0001-job-admission.md` and the
+API contract in `docs/broker-api.md` (`docs/broker/openapi.yaml`).
+
+```yaml
+provisioner:
+  type: github
+  config:
+    organization: my-org
+    repository: my-repo          # required: repository scope only
+    runnerName: laptop-runner    # sent as the broker's runner_name_prefix
+    broker:
+      url: https://broker.example.com   # http only for a loopback mock
+      deviceId: dev-laptop
+      deviceKeyPath: ~/.sand/broker/dev-laptop.key.pem
+```
+
+`appId`, `privateKeyPath`, `privateKeyKeychainLabel`, `extraLabels` and
+`runnerGroup` are not allowed with `broker`; the broker's policy owns labels.
+
+How a job is gated:
+
+- Sand writes a read-only hook to `~/.sand/hooks/job-started.sh` and points
+  `ACTIONS_RUNNER_HOOK_JOB_STARTED` at it in the runner's `.env` (job `env:`
+  cannot override it).
+- The hook calls a per-VM relay on the host (guest `127.0.0.1:3129`, an SSH
+  reverse tunnel), which asks the broker. Only an explicit allow lets the job
+  continue; anything else kills the runner, blocks the hook, and the host
+  destroys the VM. The hook never exits non-zero (that would fail open).
+- A host-side assignment verifier also polls the broker and destroys the VM if
+  a job runs without an admission or a different job runs.
+- A denied job is consumed and fails (or times out); it is not requeued.
+  Pilot scope is Tier A only: repositories without secrets.
+
+Development tools:
+
+```bash
+sand broker keygen --device-id dev-laptop --out ~/.sand/broker
+sand broker mock --config my-broker-mock.yml --audit-log ~/sand-broker.audit.jsonl
+```
+
+`sand broker mock` implements the API on 127.0.0.1 only (see
+`fixtures/broker_mock.yml`). It signs with a GitHub App key on your own Mac
+(Keychain label or PEM) and is for development only; never point enterprise
+devices or production credentials at it.
+
 ### Custom provisioner script
 
 ```

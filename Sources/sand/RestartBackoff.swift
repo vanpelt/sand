@@ -6,6 +6,7 @@ enum RestartReason: Equatable, CustomStringConvertible {
     case sshNotReady
     case stageFailed(String)
     case provisionerExited
+    case admissionDenied
 
     var description: String {
         switch self {
@@ -19,6 +20,8 @@ enum RestartReason: Equatable, CustomStringConvertible {
             return "\(stage) failed"
         case .provisionerExited:
             return "provisioner exited"
+        case .admissionDenied:
+            return "job admission denied"
         }
     }
 }

@@ -98,6 +98,9 @@ runners:
         runnerName: runner-2
         extraLabels: null
         runnerGroup: null
+        # Broker mode (ADR 0001) replaces appId/privateKey*/extraLabels/runnerGroup and
+        # is mutually exclusive with them; see fixtures/sample_broker_config.yml.
+        broker: null
     healthCheck:
       command: "pgrep -fl /Users/admin/actions-runner/run.sh"
       interval: 30

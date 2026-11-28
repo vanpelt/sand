@@ -60,8 +60,13 @@ struct GuestEgressEnv: Sendable, Equatable {
 
     /// Writes the runner's `.env`, which the runner loads at startup and passes to job steps.
     /// The runner does not expand variables there, so `$HOME` is expanded when writing.
-    func runnerDotEnvCommand(directory: String = "~/actions-runner") -> String {
-        let lines = variables.map { Self.quoteAssignment($0.0, $0.1) }.joined(separator: " ")
+    func runnerDotEnvCommand(directory: String = "~/actions-runner", extra: [(String, String)] = []) -> String {
+        Self.dotEnvCommand(variables: variables + extra, directory: directory)
+    }
+
+    /// `printf` of quoted `NAME=value` lines into `<directory>/.env` (overwrites).
+    static func dotEnvCommand(variables: [(String, String)], directory: String = "~/actions-runner") -> String {
+        let lines = variables.map { quoteAssignment($0.0, $0.1) }.joined(separator: " ")
         return "printf '%s\\n' \(lines) > \(directory)/.env"
     }
 

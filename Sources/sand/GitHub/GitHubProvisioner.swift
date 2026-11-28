@@ -1,5 +1,6 @@
 struct GitHubProvisionerConfig: Decodable, Sendable {
-    let appId: Int
+    /// Required in local mode only; broker mode holds no App key.
+    let appId: Int?
     let organization: String
     let repository: String?
     let privateKeyPath: String?
@@ -7,16 +8,18 @@ struct GitHubProvisionerConfig: Decodable, Sendable {
     let runnerName: String
     let extraLabels: [String]?
     let runnerGroup: String?
+    let broker: BrokerConfig?
 
     init(
-        appId: Int,
+        appId: Int?,
         organization: String,
         repository: String?,
         privateKeyPath: String? = nil,
         privateKeyKeychainLabel: String? = nil,
         runnerName: String,
         extraLabels: [String]?,
-        runnerGroup: String? = nil
+        runnerGroup: String? = nil,
+        broker: BrokerConfig? = nil
     ) {
         self.appId = appId
         self.organization = organization
@@ -26,6 +29,7 @@ struct GitHubProvisionerConfig: Decodable, Sendable {
         self.runnerName = runnerName
         self.extraLabels = extraLabels
         self.runnerGroup = runnerGroup
+        self.broker = broker
     }
 }
 
@@ -64,6 +68,35 @@ struct GitHubProvisioner: Sendable {
         }
         commands.append("echo \"Runner configured, starting ~/actions-runner/run.sh\"")
         commands.append("~/actions-runner/run.sh")
+        return commands
+    }
+
+    /// Broker mode (ADR 0001): a JIT runner (no config.sh, no registration token)
+    /// with Sand's job-started admission hook installed read-only outside
+    /// `actions-runner` and wired through `.env`, which the workflow cannot
+    /// override. The `.env` is written whether or not egress isolation is on.
+    /// The JIT config reaches the runner only via `ACTIONS_RUNNER_INPUT_JITCONFIG`.
+    func brokerScript(allocation: Allocation, jitConfig: String, egress: GuestEgressEnv?, relayPort: Int = NetworkPolicy.guestAdmissionPort) throws -> [String] {
+        let hook = try AdmissionHook.script(allocationId: allocation.allocationId, nonce: allocation.nonce, relayPort: relayPort)
+        var commands = [
+            "rm -rf ~/actions-runner && mkdir ~/actions-runner",
+            "tar xzf ~/\(Self.tarballRemotePath) -C ~/actions-runner",
+            "echo \"Runner extracted\""
+        ]
+        commands += AdmissionHook.installCommands(script: hook)
+        let hookVariable = [("ACTIONS_RUNNER_HOOK_JOB_STARTED", AdmissionHook.guestPath)]
+        if let egress {
+            commands.append(egress.runnerDotEnvCommand(extra: hookVariable))
+        } else {
+            commands.append(GuestEgressEnv.dotEnvCommand(variables: hookVariable))
+        }
+        commands.append("echo \"Runner configured (JIT, admission hook installed), starting ~/actions-runner/run.sh\"")
+        let jit = "env \(Self.shellQuote("ACTIONS_RUNNER_INPUT_JITCONFIG=\(jitConfig)"))"
+        if let egress {
+            commands.append("\(egress.envPrefix) \(jit) ~/actions-runner/run.sh")
+        } else {
+            commands.append("\(jit) ~/actions-runner/run.sh")
+        }
         return commands
     }
 
