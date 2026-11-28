@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 import Testing
@@ -124,6 +125,17 @@ private func networkIssues(_ network: NetworkConfig) -> [ConfigValidationIssue] 
         #expect(problems.contains { $0.hasPrefix(realDirectory + "/softnet is owned by uid") })
         #expect(problems.contains { $0.hasPrefix(realDirectory + " is owned by uid") })
         #expect(!problems.contains { $0.contains("link-dir") })
+    }
+
+    @Test(arguments: [0, 5, (1 << 20) + 3])
+    func systemFileSystemHashesRealFiles(size: Int) throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("sand-sha-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: file) }
+        let bytes = Data((0..<size).map { UInt8(truncatingIfNeeded: $0) })
+        try bytes.write(to: file)
+        let expected = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        #expect(SystemPreflightFileSystem().sha256(ofFile: file.path) == expected)
+        #expect(SystemPreflightFileSystem().sha256(ofFile: file.path + "-missing") == nil)
     }
 
     @Test func binaryMustBeNamedSoftnetAndNotWritable() {
